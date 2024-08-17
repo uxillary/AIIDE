@@ -10,16 +10,52 @@
 
 # OS-generated files
 .DS_Store
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Local env files
-.env.local
-.env.*.local
+Thumbs.db
 
 # Log files
 logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local env files
+.env
+.env.local
+.env.production
+.env.development
+.env.test
+.env.*.local
+
+# Vue.js specific
+.vuepress/dist/
+public/
+*.local
+
+# React.js specific
+/.next/
+/.cache/
+/.eslintcache/
+/.pnp/
+/.pnp.js
+/coverage/
+/build/
 
 # Vuetify specific
 node_modules/vuetify/dist/*
+
+# Editor-specific files
+*.swp
+*~
+.sass-cache/
+
+# System files
+stacktrace.txt
+
+# Exclude all VS Code settings except for essential config files
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
