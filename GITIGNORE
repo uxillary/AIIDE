@@ -1,0 +1,25 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules/
+/dist/
+
+# IDE-specific files
+.idea/
+.vscode/
+
+# OS-generated files
+.DS_Store
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local env files
+.env.local
+.env.*.local
+
+# Log files
+logs/
+
+# Vuetify specific
+node_modules/vuetify/dist/*
