@@ -3,6 +3,7 @@
 # dependencies
 /node_modules/
 /dist/
+/node_modules/.bin
 
 # IDE-specific files
 .idea/
