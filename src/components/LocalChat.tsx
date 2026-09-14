@@ -17,6 +17,7 @@ export function LocalChat({ projectOpen }: { projectOpen: boolean }) {
   const [loading, setLoading] = useState(false)
   const [checking, setChecking] = useState(false)
   const [activeSteps, setActiveSteps] = useState<string[]>([])
+  const [retrying, setRetrying] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
   const checkingRef = useRef(false)
@@ -40,7 +41,8 @@ export function LocalChat({ projectOpen }: { projectOpen: boolean }) {
   }
 
   useEffect(() => { void refresh() }, [])
-  useEffect(() => { const subscription = listen<{ label: string }>('repository-activity', event => setActiveSteps(current => [...current, event.payload.label])); return () => { void subscription.then(unlisten => unlisten()) } }, [])
+  useEffect(() => { const subscription = listen<{ label: string }>('repository-activity', event => { setRetrying(false); setActiveSteps(current => [...current, event.payload.label]) }); return () => { void subscription.then(unlisten => unlisten()) } }, [])
+  useEffect(() => { const subscription = listen('repository-retry', () => setRetrying(true)); return () => { void subscription.then(unlisten => unlisten()) } }, [])
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, loading])
 
   async function send() {
@@ -52,6 +54,7 @@ export function LocalChat({ projectOpen }: { projectOpen: boolean }) {
     setPrompt('')
     setLoading(true)
     setActiveSteps([])
+    setRetrying(false)
     setError(null)
     try {
       const response = await ollamaProvider.chat({ model, messages: nextMessages.slice(-39).map(({ role, content }) => ({ role, content })) })
@@ -80,7 +83,7 @@ export function LocalChat({ projectOpen }: { projectOpen: boolean }) {
       {connected && !status.models.length && <div className="chat-empty"><h2>No local models installed</h2><p>Ollama is connected, but no local models are installed. Pull a model with the Ollama CLI, then select Retry.</p></div>}
       {ready && messages.length === 0 && <div className="chat-empty"><h2>Your local AI coding workspace.</h2><p>{projectOpen ? 'Ask Elma about the opened project.' : 'Ask a general question to start a local conversation.'}</p></div>}
       {messages.map((message, index) => <div className="chat-message" key={index}><div className="chat-speaker">{message.role === 'user' ? 'YOU' : `ELMA · ${message.model}`}</div>{Boolean(message.activity?.length) && <details className="mb-3 text-xs text-stone-500"><summary>Inspected {message.activity?.length} items</summary><ul className="mt-2 space-y-1">{message.activity?.map((item, step) => <li key={step}>✓ {item.label}</li>)}</ul></details>}<div className="whitespace-pre-wrap break-words text-sm leading-6 text-stone-200">{message.content}</div></div>)}
-      {loading && <div className="chat-message text-xs text-stone-500"><div>Elma is {activeSteps.length ? 'preparing an answer…' : 'inspecting the request…'}</div>{activeSteps.map((step, index) => <div key={index}>✓ {step}</div>)}</div>}
+      {loading && <div className="chat-message text-xs text-stone-500"><div>{retrying ? 'Elma is retrying the local model…' : activeSteps.length ? 'Elma is preparing an answer…' : 'Elma is inspecting the request…'}</div>{activeSteps.map((step, index) => <div key={index}>✓ {step}</div>)}</div>}
       <div ref={endRef} />
     </div>
     <div className="chat-composer">{error && <div role="alert" className="mb-2 text-xs text-red-400">{error}</div>}<div className="flex items-end gap-3"><textarea aria-label="Prompt" className="prompt-input" value={prompt} disabled={!ready || loading} maxLength={12000} placeholder={ready ? 'Ask a question…' : 'Connect Ollama and select a model to chat'} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() } }} /><button className="primary-button" onClick={() => void send()} disabled={!ready || !prompt.trim() || loading}>Send</button></div><p className="mt-2 text-[11px] text-stone-600">Enter to send · Shift+Enter for a new line · Chat stays in this session</p></div>

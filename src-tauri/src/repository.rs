@@ -138,6 +138,9 @@ fn read_file(root: &Path, path: &str) -> Result<String, String> {
 
 fn search_files(root: &Path, query: &str) -> Result<String, String> {
     if query.trim().is_empty() || query.len() > 120 { return Err("Search query must be 1–120 characters.".into()); }
+    if query.trim().starts_with("*.") || (query.contains('*') && query.split_whitespace().count() > 1) {
+        return Err("Search uses one literal text query, not filename globs. Use list_files to find filenames.".into());
+    }
     let mut files = Vec::new();
     let scan_truncated = walk(root, root, &mut files, MAX_SCAN_FILES)?;
     let mut matches = Vec::new();
@@ -190,6 +193,7 @@ mod tests {
         let root = fixture();
         fs::write(root.join("many.txt"), "match\n".repeat(100)).unwrap();
         assert!(search_files(&root, "match").unwrap().contains("Results truncated"));
+        assert!(search_files(&root, "*.html *.css").unwrap_err().contains("globs"));
         for index in 0..MAX_LIST + 5 { fs::write(root.join(format!("{index}.txt")), "x").unwrap(); }
         assert!(list_files(&root, "").unwrap().contains("Listing truncated"));
         fs::remove_dir_all(root).unwrap();

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::time::Duration;
 use std::collections::HashSet;
 use tauri::{Emitter, State};
@@ -36,19 +37,141 @@ struct TaggedModel { name: String }
 pub struct ChatMessage { role: String, content: String }
 
 #[derive(Serialize)]
-struct ChatPayload<'a> { model: &'a str, messages: &'a [ChatMessage], stream: bool }
+struct ChatPayload<'a> { model: &'a str, messages: &'a [ChatMessage], stream: bool, format: Value, options: ChatOptions }
+
+#[derive(Serialize)]
+struct ChatOptions { temperature: f32, num_predict: u16 }
 
 #[derive(Deserialize)]
-struct ChatPayloadResponse { model: String, message: ChatMessage, done: bool }
+struct ChatPayloadResponse { model: String, message: ChatMessage, done: bool, done_reason: Option<String> }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatResponse { model: String, content: String, activity: Vec<Activity> }
 
-const SYSTEM: &str = "You are Elma, a local-first AI coding companion inside AIIDE. Your underlying model is the selected Ollama model. You may inspect only the opened project through AIIDE's read-only tools. Never claim to have inspected a file unless its contents were returned by read_file. Do not invent files, code, Git state, tool results, or commands. You cannot modify files, execute commands, commit, or push. Inspect relevant context before repository-specific answers. Respond with exactly one JSON object: {\"tool\":\"list_files\",\"path\":\"\"}, {\"tool\":\"search_files\",\"query\":\"text\"}, {\"tool\":\"read_file\",\"path\":\"relative/path\"}, or {\"answer\":\"your answer\"}. Do not include markdown fences or other text outside the JSON object. When enough evidence is available, answer directly.";
+const SYSTEM: &str = "You are Elma, a local-first AI coding companion inside AIIDE. Your underlying model is the selected Ollama model. You may inspect only the opened project through AIIDE's read-only tools. Never claim to have inspected a file unless read_file returned its contents. Do not invent files, code, Git state, tool results, or commands. You cannot modify files, execute commands, commit, or push. For questions about this project's behavior, structure, or changes, inspect relevant context before answering, even if the user does not say 'project'. General knowledge questions can be answered directly. list_files returns exact project-relative paths; copy them exactly into read_file. search_files searches one literal substring, not globs. A failed tool or no matches is not evidence that a file is absent. For website or UI reviews, read relevant markup, styles, and scripts when listed. For behavior bugs, read the relevant script and markup before diagnosing. Return exactly one JSON object with action list_files, search_files, read_file, or answer and the corresponding path, query, or answer string. When enough evidence is gathered, answer directly.";
 
-#[derive(Deserialize)]
-struct AgentReply { tool: Option<String>, path: Option<String>, query: Option<String>, answer: Option<String> }
+const MAX_REPAIRS: usize = 2;
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AgentReply { action: String, path: Option<String>, query: Option<String>, answer: Option<String> }
+
+#[derive(Debug, PartialEq)]
+enum AgentAction { List(String), Search(String), Read(String), Answer(String) }
+
+fn agent_schema() -> Value {
+    json!({"type":"object","properties":{
+        "action":{"type":"string","enum":["list_files","search_files","read_file","answer"]},
+        "path":{"type":"string"},"query":{"type":"string"},"answer":{"type":"string"}
+    },"required":["action"],"additionalProperties":false})
+}
+
+fn scope_schema() -> Value {
+    json!({"type":"object","properties":{"scope":{"type":"string","enum":["general","repository"]}},"required":["scope"],"additionalProperties":false})
+}
+
+fn answer_schema() -> Value {
+    json!({"type":"object","properties":{
+        "action":{"type":"string","enum":["answer"]},"answer":{"type":"string"}
+    },"required":["action","answer"],"additionalProperties":false})
+}
+
+fn parse_action(raw: &str) -> Result<AgentAction, &'static str> {
+    let reply: AgentReply = serde_json::from_str(raw.trim()).map_err(|_| "invalid JSON object")?;
+    match reply.action.as_str() {
+        "list_files" if reply.answer.is_none() && reply.query.is_none() => Ok(AgentAction::List(reply.path.unwrap_or_default())),
+        "list_files" => Err("list_files accepts path, not query or answer; use {\"action\":\"list_files\",\"path\":\"src\"}"),
+        "search_files" if reply.answer.is_none() && reply.path.is_none() && reply.query.as_ref().is_some_and(|query| !query.trim().is_empty()) => Ok(AgentAction::Search(reply.query.unwrap())),
+        "search_files" => Err("search_files requires a nonempty query and no path or answer"),
+        "read_file" if reply.answer.is_none() && reply.query.is_none() && reply.path.as_ref().is_some_and(|path| !path.trim().is_empty()) => Ok(AgentAction::Read(reply.path.unwrap())),
+        "read_file" => Err("read_file requires a nonempty path and no query or answer"),
+        "answer" if reply.path.is_none() && reply.query.is_none() && reply.answer.as_ref().is_some_and(|answer| !answer.trim().is_empty()) => Ok(AgentAction::Answer(reply.answer.unwrap())),
+        "answer" => Err("answer requires nonempty answer text and no path or query"),
+        _ => Err("invalid or ambiguous action fields"),
+    }
+}
+
+fn trace(message: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("AIIDE_TRACE_AGENT").is_some() { eprintln!("[agent] {message}"); }
+    #[cfg(not(debug_assertions))]
+    let _ = message;
+}
+
+async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessage], format: Value) -> Result<ChatPayloadResponse, String> {
+    let response = client.post(format!("{BASE}/api/chat"))
+        .json(&ChatPayload { model, messages, stream: false, format, options: ChatOptions { temperature: 0.0, num_predict: 640 } })
+        .send().await.map_err(request_error)?;
+    if !response.status().is_success() { return Err("Ollama could not complete the chat request. Try again.".into()); }
+    let result = response.json::<ChatPayloadResponse>().await.map_err(|_| "Ollama returned an invalid chat response.".to_owned())?;
+    if !result.done || result.message.role != "assistant" || result.model.is_empty() { return Err("Ollama returned an incomplete chat response.".into()); }
+    trace(&format!("Ollama done_reason: {:?}", result.done_reason));
+    Ok(result)
+}
+
+async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<ChatMessage>, app: Option<&tauri::AppHandle>) -> Result<(ChatPayloadResponse, AgentAction), String> {
+    for attempt in 0..=MAX_REPAIRS {
+        let result = chat_turn(client, model, exchange, agent_schema()).await?;
+        trace(&format!("raw model response: {}", result.message.content.chars().take(2_000).collect::<String>()));
+        let parsed = if result.done_reason.as_deref() == Some("length") { Err("response exceeded the model output limit") }
+            else { parse_action(&result.message.content) };
+        match parsed {
+            Ok(action) => { trace(&format!("parse success: {}", action_name(&action))); return Ok((result, action)); }
+            Err(reason) => {
+                trace(&format!("parse failure: {reason}; repair attempt {attempt}"));
+                if attempt == MAX_REPAIRS { break; }
+                if let Some(app) = app { let _ = app.emit("repository-retry", ()); }
+                exchange.push(ChatMessage { role: "user".into(), content: format!("Your previous response was invalid ({reason}). Return exactly one JSON object matching the provided schema. Use action list_files, search_files, read_file, or answer with its required nonempty field. No prose or markdown.") });
+            }
+        }
+    }
+    Err("The local model could not produce a valid structured response after two retries.".into())
+}
+
+fn action_name(action: &AgentAction) -> &'static str {
+    match action { AgentAction::List(_) => "list_files", AgentAction::Search(_) => "search_files", AgentAction::Read(_) => "read_file", AgentAction::Answer(_) => "answer" }
+}
+
+async fn requires_inspection(client: &reqwest::Client, model: &str, prompt: &str) -> Result<bool, String> {
+    let mut messages = vec![
+        ChatMessage { role: "system".into(), content: "Classify whether answering this user prompt requires inspecting the currently opened project. Use repository for questions about this project's behavior, structure, UI, bugs, or improvements, including indirect references like 'the menu'. Use general for conceptual questions such as 'What is a JavaScript closure?'. Return only a JSON object with scope general or repository.".into() },
+        ChatMessage { role: "user".into(), content: prompt.into() },
+    ];
+    for attempt in 0..=MAX_REPAIRS {
+        let result = chat_turn(client, model, &messages, scope_schema()).await?;
+        if let Some(needed) = parse_scope(&result.message.content) { return Ok(needed); }
+        trace(&format!("scope parse failure; repair attempt {attempt}"));
+        if attempt == MAX_REPAIRS { break; }
+        messages.push(ChatMessage { role: "user".into(), content: "Return exactly one JSON object: {\"scope\":\"repository\"} or {\"scope\":\"general\"}.".into() });
+    }
+    Ok(true)
+}
+
+fn parse_scope(raw: &str) -> Option<bool> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Scope { scope: String }
+    let scope: Scope = serde_json::from_str(raw.trim()).ok()?;
+    match scope.scope.as_str() { "repository" => Some(true), "general" => Some(false), _ => None }
+}
+
+async fn final_turn(client: &reqwest::Client, model: &str, prompt: &str, project_info: &str, evidence: &[(String, String)], read_paths: &[String]) -> Result<String, String> {
+    let mut exchange = vec![
+        ChatMessage { role: "system".into(), content: format!("You are Elma inside AIIDE. {project_info} Answer the user's original question using only the repository evidence below. Do not respond to a prior tool search or infer missing files from a failed tool. Do not invent filenames: HTML sections are not separate files. Do not list inspected filenames in your answer; the application appends the verified list. No more tools are available. Keep the answer under 120 words and address every part of the user's request. Avoid quoted code snippets or HTML attributes. Return only a JSON object with action answer and answer text.") },
+        ChatMessage { role: "user".into(), content: format!("Files actually read: {}\n\nRepository evidence:\n{}\n\nOriginal user request: {prompt}\n\nAnswer this original request directly, using the evidence above. If it asks for a review, give exactly three concrete improvements. For each, say what to change, which of the actual files would be affected, and why. Avoid speculative claims, generic advice, invented files, code snippets, and unverified accessibility findings. The app separately reports inspected files.", read_paths.join(", "), evidence.iter().map(|(name, value)| format!("[{name}]\n{value}")).collect::<Vec<_>>().join("\n\n")) },
+    ];
+    for attempt in 0..=MAX_REPAIRS {
+        let result = chat_turn(client, model, &exchange, answer_schema()).await?;
+        trace(&format!("final raw model response: {}", result.message.content.chars().take(2_000).collect::<String>()));
+        if result.done_reason.as_deref() != Some("length") {
+            if let Ok(AgentAction::Answer(answer)) = parse_action(&result.message.content) { return Ok(answer); }
+        }
+        if attempt == MAX_REPAIRS { break; }
+        exchange[1].content.push_str("\n\nYour previous response was invalid or too long. Answer the ORIGINAL REQUEST above in at most 90 words. For a review, give three short numbered improvements with actual affected files and reasons. Return only the JSON answer object.");
+    }
+    Err("The local model could not produce a final structured answer after two retries.".into())
+}
 
 fn client(timeout: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder().no_proxy().timeout(timeout).build()
@@ -83,6 +206,11 @@ pub async fn ollama_status() -> ProviderStatus {
 
 #[tauri::command]
 pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project: State<'_, OpenProject>, app: tauri::AppHandle) -> Result<ChatResponse, String> {
+    let root = open_project.0.lock().map_err(|_| "Project state unavailable")?.clone();
+    run_agent(model, messages, root, Some(&app)).await
+}
+
+async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::path::PathBuf>, app: Option<&tauri::AppHandle>) -> Result<ChatResponse, String> {
     if model.is_empty() || messages.is_empty() || messages.len() > MAX_MESSAGES || messages.iter().any(|message| {
         !matches!(message.role.as_str(), "user" | "assistant") || message.content.is_empty() || message.content.chars().count() > MAX_MESSAGE_CHARS
     }) || messages.last().is_none_or(|message| message.role != "user") {
@@ -93,8 +221,7 @@ pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project
     if !tags.status().is_success() { return Err("Could not verify installed models. Retry the connection.".to_owned()); }
     let tags = tags.json::<TagsResponse>().await.map_err(|_| "Ollama returned an invalid model list.".to_owned())?;
     if !tags.models.iter().any(|item| item.name == model) { return Err("This model is no longer installed. Retry to refresh the model list.".to_owned()); }
-    let root = open_project.0.lock().map_err(|_| "Project state unavailable")?.clone();
-    let last_prompt = messages.last().map_or("", |message| message.content.trim());
+    let last_prompt = messages.last().map_or("", |message| message.content.trim()).to_owned();
     if last_prompt.eq_ignore_ascii_case("what is your name?") || last_prompt.eq_ignore_ascii_case("what is your name") {
         return Ok(ChatResponse { model, content: "I'm Elma, your local coding companion in AIIDE. My responses are generated by the selected Ollama model.".into(), activity: vec![] });
     }
@@ -110,47 +237,180 @@ pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project
         exchange.push(ChatMessage { role: "system".into(), content: "No project is open. Repository tools are unavailable; answer normal chat directly.".into() });
     }
     exchange.extend(messages.into_iter().rev().take(12).collect::<Vec<_>>().into_iter().rev());
-    let repository_question = root.is_some() && exchange.last().is_some_and(|message| {
-        let prompt = message.content.to_ascii_lowercase();
-        !prompt.contains("do you have access") && !prompt.contains("what is your name")
-            && ["project", "repository", "website", "front-end", "frontend", "source code", "files", "codebase"].iter().any(|term| prompt.contains(term))
-    });
     let mut activity = Vec::new();
     let mut seen = HashSet::new();
     let mut context_bytes = 0;
+    let mut successful_inspections = 0;
+    let mut successful_reads = 0;
+    let mut read_paths = Vec::new();
+    let mut evidence: Vec<(String, String)> = Vec::new();
+    let mut consecutive_repeats = 0;
+    let mut unresolved_failure = false;
+    let mut known_paths = String::new();
+    let mut known_file_paths: Vec<String> = Vec::new();
+    let mut needs_inspection: Option<bool> = None;
+    let mut inspection_reminders = 0;
     for iteration in 0..=repository::MAX_TOOL_CALLS {
-        let response = client.post(format!("{BASE}/api/chat"))
-            .json(&ChatPayload { model: &model, messages: &exchange, stream: false })
-            .send().await.map_err(request_error)?;
-        if !response.status().is_success() { return Err("Ollama could not complete the chat request. Try again.".into()); }
-        let result = response.json::<ChatPayloadResponse>().await.map_err(|_| "Ollama returned an invalid chat response.".to_owned())?;
-        if !result.done || result.message.role != "assistant" || result.model.is_empty() { return Err("Ollama returned an incomplete chat response.".into()); }
-        let reply: AgentReply = serde_json::from_str(result.message.content.trim()).map_err(|_| "The model did not return a valid structured response. Try again or choose another model.".to_owned())?;
-        if let Some(answer) = reply.answer.filter(|answer| !answer.trim().is_empty()) {
-            if repository_question && activity.is_empty() {
-                if iteration == 0 {
+        let (result, action) = agent_turn(&client, &model, &mut exchange, app).await?;
+        if let AgentAction::Answer(answer) = action {
+            if root.is_some() && successful_reads == 0 {
+                let needed = match needs_inspection {
+                    Some(needed) => needed,
+                    None => {
+                        let needed = requires_inspection(&client, &model, &last_prompt).await?;
+                        trace(&format!("repository intent: {needed}"));
+                        needs_inspection = Some(needed);
+                        needed
+                    }
+                };
+                if needed {
+                    if inspection_reminders < 2 {
+                        inspection_reminders += 1;
+                        exchange.push(result.message);
+                        exchange.push(ChatMessage { role: "user".into(), content: "This question needs evidence from the opened project. Use list_files to find exact paths, then read_file on relevant files before answering. A failed tool or no matches does not prove files are absent.".into() });
+                        continue;
+                    }
+                    return Ok(ChatResponse { model: result.model, content: "I couldn't inspect the opened project, so I can't give a file-based answer. Please try again.".into(), activity });
+                }
+            }
+            if unresolved_failure && successful_inspections > 0 {
+                if inspection_reminders < 2 {
+                    inspection_reminders += 1;
                     exchange.push(result.message);
-                    exchange.push(ChatMessage { role: "user".into(), content: "A project is open. Your answer must be based on actual project inspection. Request list_files, search_files, or read_file in the required JSON format before answering.".into() });
+                    exchange.push(ChatMessage { role: "user".into(), content: "Your last repository tool did not provide evidence. Inspect another relevant file or correct the path before answering. Use exact paths from list_files.".into() });
                     continue;
                 }
-                return Ok(ChatResponse { model: result.model, content: "I couldn't inspect the opened project, so I can't give a file-based answer. Please try again.".into(), activity });
+                return Ok(ChatResponse { model: result.model, content: "I couldn't verify the relevant project files, so I can't give a grounded answer. Please try again.".into(), activity });
             }
-            return Ok(ChatResponse { model: result.model, content: answer, activity });
+            trace("final answer");
+            let content = if !read_paths.is_empty() {
+                let info = root.as_ref().map(|path| super::project::inspect_metadata(path)).unwrap_or_default();
+                let answer = final_turn(&client, &model, &last_prompt, &info, &evidence, &read_paths).await?;
+                format!("{answer}\n\nFiles actually inspected: {}", read_paths.join(", "))
+            } else { answer };
+            return Ok(ChatResponse { model: result.model, content, activity });
         }
         if root.is_none() { return Ok(ChatResponse { model: result.model, content: "Open a project to use repository tools.".into(), activity }); }
         if iteration == repository::MAX_TOOL_CALLS { break; }
-        let request = ToolRequest { tool: reply.tool.unwrap_or_default(), path: reply.path.unwrap_or_default(), query: reply.query.unwrap_or_default() };
+        let request = match action {
+            AgentAction::List(path) => ToolRequest { tool: "list_files".into(), path, query: String::new() },
+            AgentAction::Search(query) => ToolRequest { tool: "search_files".into(), path: String::new(), query },
+            AgentAction::Read(path) => ToolRequest { tool: "read_file".into(), path, query: String::new() },
+            AgentAction::Answer(_) => unreachable!(),
+        };
+        trace(&format!("tool selected: {}", request.tool));
         let key = format!("{}|{}|{}", request.tool, request.path, request.query);
+        let repeated = seen.contains(&key);
         let (output, event) = if seen.insert(key) { repository::execute(root.as_deref().unwrap(), &request) }
             else { ("This tool request was already answered in this turn; use the earlier result.".into(), Activity { label: "Repeated inspection skipped".into() }) };
-        let _ = app.emit("repository-activity", &event);
         let remaining = repository::MAX_CONTEXT_BYTES.saturating_sub(context_bytes);
         if remaining == 0 { break; }
-        let output = output.chars().take(remaining).collect::<String>();
+        let output = output.chars().scan(0_usize, |used, character| {
+            let next = *used + character.len_utf8();
+            if next > remaining { None } else { *used = next; Some(character) }
+        }).collect::<String>();
         context_bytes += output.len();
+        if repeated { consecutive_repeats += 1; } else { consecutive_repeats = 0; }
+        let useful = !output.starts_with("Error:") && output != "No matches." && event.label != "Repeated inspection skipped";
+        if request.tool == "list_files" && useful && (request.path.is_empty() || request.path == ".") {
+            known_paths = output.lines().take(120).map(|line| line.split(" (").next().unwrap_or(line)).collect::<Vec<_>>().join(", ");
+            known_file_paths = output.lines().filter_map(|line| line.strip_suffix(" (file)").filter(|path| !std::path::Path::new(path).file_name().is_some_and(|name| name.to_string_lossy().starts_with('.'))).map(str::to_owned)).collect();
+        }
+        if useful {
+            successful_inspections += 1;
+            if request.tool == "read_file" { successful_reads += 1; read_paths.push(request.path.clone()); }
+            evidence.push((format!("{} {}", request.tool, request.path), output.clone()));
+            unresolved_failure = false;
+        } else { unresolved_failure = true; }
+        trace(&format!("tool result: {} bytes; error={}", output.len(), output.starts_with("Error:")));
+        if let Some(app) = app { let _ = app.emit("repository-activity", &event); }
         activity.push(event);
         exchange.push(result.message);
-        exchange.push(ChatMessage { role: "user".into(), content: format!("Tool result for {}:\n{}\nContinue with another JSON tool request or final JSON answer.", request.tool, output) });
+        let unread = known_file_paths.iter().filter(|path| !read_paths.contains(path)).cloned().collect::<Vec<_>>().join(", ");
+        exchange.push(ChatMessage { role: "user".into(), content: format!("Tool result for {} ({}):\n{}\n{}{}{}", request.tool, if useful { "success" } else { "no evidence" }, output,
+            if useful { "Continue with another structured tool request or a grounded final answer. Use exact listed paths." }
+            else { "This result does not establish that files are absent. Try list_files or another exact project-relative path before answering. If this request was repeated, choose an unread listed file." },
+            if !known_paths.is_empty() { format!("\nExact paths from the project listing: {known_paths}") } else { String::new() },
+            if !unread.is_empty() { format!("\nListed files not yet read: {unread}") } else { String::new() }) });
+        if consecutive_repeats >= 2 { break; }
     }
-    Ok(ChatResponse { model, content: "I reached the repository inspection limit for this request. Please ask a narrower question.".into(), activity })
+    if !read_paths.is_empty() {
+        let info = root.as_ref().map(|path| super::project::inspect_metadata(path)).unwrap_or_default();
+        let answer = final_turn(&client, &model, &last_prompt, &info, &evidence, &read_paths).await?;
+        let content = format!("{answer}\n\nFiles actually inspected: {}", read_paths.join(", "));
+        return Ok(ChatResponse { model, content, activity });
+    }
+    Ok(ChatResponse { model, content: "I reached the repository inspection limit before I could read a relevant file. Please ask a narrower question.".into(), activity })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_actions() {
+        assert_eq!(parse_action(r#"{"action":"list_files"}"#), Ok(AgentAction::List(String::new())));
+        assert_eq!(parse_action(r#"{"action":"list_files","path":"src"}"#), Ok(AgentAction::List("src".into())));
+        assert_eq!(parse_action(r#"{"action":"search_files","query":"menu"}"#), Ok(AgentAction::Search("menu".into())));
+        assert_eq!(parse_action(r#"{"action":"read_file","path":"src/index.html"}"#), Ok(AgentAction::Read("src/index.html".into())));
+        assert_eq!(parse_action(r#"{"action":"answer","answer":"A direct response."}"#), Ok(AgentAction::Answer("A direct response.".into())));
+    }
+
+    #[test]
+    fn rejects_invalid_actions() {
+        for raw in [
+            "not json",
+            "Here is the answer: {\"action\":\"answer\",\"answer\":\"yes\"}",
+            r#"{"action":"execute_command","path":"dir"}"#,
+            r#"{"action":"search_files"}"#,
+            r#"{"action":"search_files","query":" "}"#,
+            r#"{"action":"read_file"}"#,
+            r#"{"action":"read_file","path":""}"#,
+            r#"{"action":"answer","answer":"yes","path":"x"}"#,
+            r#"{"action":"answer","answer":""}"#,
+            r#"{"action":"answer","answer":"yes","tool":"read_file"}"#,
+        ] { assert!(parse_action(raw).is_err(), "accepted: {raw}"); }
+    }
+
+    #[test]
+    fn scope_validation() {
+        assert_eq!(parse_scope(r#"{"scope":"repository"}"#), Some(true));
+        assert_eq!(parse_scope(r#"{"scope":"general"}"#), Some(false));
+        assert_eq!(parse_scope(r#"{"scope":"unknown"}"#), None);
+        assert_eq!(parse_scope("general"), None);
+        assert_eq!(parse_scope(r#"{"scope":"general","tool":"read_file"}"#), None);
+    }
+
+    #[test]
+    #[ignore = "requires local Ollama with qwen2.5-coder:7b and aiide-sandbox"]
+    fn local_acceptance() {
+        let root = std::fs::canonicalize(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../aiide-sandbox"))
+            .expect("aiide-sandbox must exist beside AIIDE");
+        let prompts = [
+            "What files are in this project and what does the project appear to be?",
+            "Review this website as a front-end developer. Identify 3-5 meaningful UX, accessibility or code-quality improvements. Do not modify anything. Tell me which files you inspected.",
+            "Why doesn't the navigation work on mobile?",
+            "What is a JavaScript closure?",
+        ];
+        for (index, prompt) in prompts.iter().enumerate() {
+            if let Ok(selected) = std::env::var("AIIDE_ACCEPTANCE_CASE") {
+                if selected != (index + 1).to_string() { continue; }
+            }
+            let response = tauri::async_runtime::block_on(run_agent(
+                "qwen2.5-coder:7b".into(),
+                vec![ChatMessage { role: "user".into(), content: (*prompt).into() }],
+                Some(root.clone()), None,
+            )).expect("agent request should complete");
+            println!("case {} activity: {:?}; answer: {}", index + 1,
+                response.activity.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(), response.content);
+            if index < 3 { assert!(!response.activity.is_empty(), "case {} did not inspect the repository", index + 1); }
+            else { assert!(response.activity.is_empty(), "general question unnecessarily inspected repository"); }
+            if index == 1 || index == 2 {
+                for path in ["src/index.html", "styles.css", "script.js"] {
+                    assert!(response.activity.iter().any(|item| item.label == format!("Read: {path}")), "case {} did not read {path}", index + 1);
+                }
+            }
+            assert!(!response.content.contains("inspection limit"));
+        }
+    }
 }
