@@ -2,10 +2,15 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use tauri::State;
 
 const MAX_DEPTH: usize = 3;
 const MAX_ENTRIES: usize = 500;
-const IGNORED: &[&str] = &[".git", "node_modules", "dist", "build", ".next", ".cache", "target"];
+pub(crate) const IGNORED: &[&str] = &[".git", "node_modules", "dist", "build", ".next", ".cache", "target", "coverage"];
+
+#[derive(Default)]
+pub struct OpenProject(pub Mutex<Option<PathBuf>>);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +64,13 @@ fn repository(path: &Path) -> Option<RepositoryInfo> {
     })
 }
 
+pub fn inspect_metadata(path: &Path) -> String {
+    let repo = repository(path);
+    format!("Opened project: {}. Branch: {}. Working tree: {}. Repository tools are available with a bounded read-only scope.",
+        name_of(path), repo.as_ref().map_or("unknown", |r| r.branch.as_str()),
+        repo.as_ref().map_or("unknown".into(), |r| if r.changed_files == 0 { "clean".into() } else { format!("{} changed files", r.changed_files) }))
+}
+
 fn read_tree(root: &Path, folder: &Path, depth: usize, remaining: &mut usize, any_truncated: &mut bool) -> Result<Vec<TreeEntry>, String> {
     let mut items: Vec<(PathBuf, bool)> = fs::read_dir(folder)
         .map_err(|error| format!("Cannot read {}: {error}", folder.display()))?
@@ -95,12 +107,13 @@ fn read_tree(root: &Path, folder: &Path, depth: usize, remaining: &mut usize, an
 }
 
 #[tauri::command]
-pub fn inspect_project(path: String) -> Result<ProjectInfo, String> {
+pub fn inspect_project(path: String, open_project: State<'_, OpenProject>) -> Result<ProjectInfo, String> {
     let path = fs::canonicalize(path).map_err(|error| format!("Cannot open folder: {error}"))?;
     if !path.is_dir() { return Err("Selected path is not a folder".to_owned()); }
     let mut remaining = MAX_ENTRIES;
     let mut tree_truncated = false;
     let tree = read_tree(&path, &path, 0, &mut remaining, &mut tree_truncated)?;
+    *open_project.0.lock().map_err(|_| "Project state unavailable")? = Some(path.clone());
     Ok(ProjectInfo {
         name: name_of(&path),
         path: path.display().to_string(),

@@ -5,6 +5,6 @@ export interface ProviderStatus {
   models: AIModel[]
   error: ProviderError | null
 }
-export interface ChatMessage { role: 'user' | 'assistant'; content: string; model?: string }
+export interface ChatMessage { role: 'user' | 'assistant'; content: string; model?: string; activity?: { label: string }[] }
 export interface ChatRequest { model: string; messages: ChatMessage[] }
-export interface ChatResponse { model: string; content: string }
+export interface ChatResponse { model: string; content: string; activity: { label: string }[] }
