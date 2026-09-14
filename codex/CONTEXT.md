@@ -1,0 +1,7 @@
+# Durable AIIDE context
+
+AIIDE is the current repository/application name. **Elma** is the local coding-companion personality and candidate product identity. The product is a Windows-first, local-first desktop companion for working with software projects, not a full IDE. Its intended workflow is **Open → Ask → Inspect → Edit → Review → Test → Commit**, with later steps still in development. See [PROJECT.md](../PROJECT.md) for product vision and roadmap rather than treating that plan as proof of current features.
+
+The current stack is React, TypeScript, Vite, and Tailwind CSS in the frontend; Tauri 2 and Rust in the desktop backend; and local Ollama inference, primarily tested with `qwen2.5-coder:7b`. The architecture should remain provider/model agnostic as it grows. The UI aims for a restrained developer-tool layout with visible, reviewable activity.
+
+The Rust/Tauri backend is the trusted boundary for project and filesystem operations. Model-generated tool arguments are untrusted. Repository context is retrieved progressively through controlled read-only tools rather than sending the entire project automatically; inspection is bounded and protects paths and sensitive files. Editing, command execution, and Git mutations are not part of the current read-only agent stage. Preserve local-first operation, safe defaults, and user reviewability when adding capabilities. Refer to [REPO-MAP.md](REPO-MAP.md) for current file ownership and to `src-tauri/src/repository.rs` for implementation-specific limits.
