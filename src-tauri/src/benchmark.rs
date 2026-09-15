@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::ollama::{self, BenchmarkAgentOutput};
+use crate::model_provider::{OLLAMA_PROVIDER_ID, OPENROUTER_PROVIDER_ID};
 
 const EXPECTED_PATH: &str = "src/index.html";
 const OLD_HEADING: &str = "<h1>OrbitNote</h1>";
@@ -89,13 +90,15 @@ fn fixture_root() -> Result<PathBuf, String> {
     std::fs::canonicalize(root).map_err(|_| "Benchmark fixture is missing.".to_owned())
 }
 
-fn parse_args() -> Result<(String, Option<Case>, bool), String> {
+fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<(String, String, Option<Case>, bool), String> {
+    let mut provider = OLLAMA_PROVIDER_ID.to_owned();
     let mut model = None;
     let mut case = None;
     let mut json = false;
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--provider" => provider = args.next().ok_or("--provider requires ollama or openrouter")?,
             "--model" => model = args.next(),
             "--case" => case = Some(match args.next().as_deref() {
                 Some("answer") => Case::Answer, Some("lookup") => Case::Lookup, Some("edit") => Case::Edit,
@@ -105,11 +108,21 @@ fn parse_args() -> Result<(String, Option<Case>, bool), String> {
             _ => return Err(format!("Unknown argument: {arg}")),
         }
     }
-    Ok((model.filter(|value| !value.trim().is_empty()).ok_or("Usage: agent-benchmark --model <ollama-model> [--case answer|lookup|edit] [--json]")?, case, json))
+    if !matches!(provider.as_str(), OLLAMA_PROVIDER_ID | OPENROUTER_PROVIDER_ID) {
+        return Err("Unknown model provider. Use 'ollama' or 'openrouter'.".into());
+    }
+    let model = model.filter(|value| !value.trim().is_empty()).ok_or(
+        "Usage: agent-benchmark [--provider ollama|openrouter] --model <model-id> [--case answer|lookup|edit] [--json]"
+    )?;
+    Ok((provider, model, case, json))
+}
+
+fn parse_args() -> Result<(String, String, Option<Case>, bool), String> {
+    parse_args_from(std::env::args().skip(1))
 }
 
 pub fn run_cli() -> Result<(), String> {
-    let (model, selected, json) = parse_args()?;
+    let (provider, model, selected, json) = parse_args()?;
     let root = fixture_root()?;
     let cases = selected.map_or_else(|| vec![Case::Answer, Case::Lookup, Case::Edit], |value| vec![value]);
     let mut results = Vec::new();
@@ -117,7 +130,7 @@ pub fn run_cli() -> Result<(), String> {
         let target = root.join(EXPECTED_PATH);
         let before = std::fs::read_to_string(&target).map_err(|_| "Benchmark fixture target is missing.".to_owned())?;
         let started = Instant::now();
-        let outcome = tauri::async_runtime::block_on(ollama::run_benchmark_agent(&model, root.clone(), case.prompt()));
+        let outcome = tauri::async_runtime::block_on(ollama::run_benchmark_agent(&provider, &model, root.clone(), case.prompt()));
         let after = std::fs::read_to_string(&target).map_err(|_| "Benchmark fixture target is missing.".to_owned())?;
         results.push(classify(&model, case, started.elapsed().as_millis(), outcome, &before, &after));
     }
@@ -168,5 +181,24 @@ mod tests {
         }), &before, &before);
         assert!(result.passed);
         assert_eq!(result.final_action, "propose_change");
+    }
+
+    #[test]
+    fn benchmark_defaults_to_ollama_and_accepts_explicit_openrouter() {
+        let (provider, model, _, _) = parse_args_from(["--model", "local-model"].into_iter().map(str::to_owned)).unwrap();
+        assert_eq!(provider, "ollama");
+        assert_eq!(model, "local-model");
+
+        let (provider, model, _, _) = parse_args_from(
+            ["--provider", "openrouter", "--model", "vendor/model:free"].into_iter().map(str::to_owned)
+        ).unwrap();
+        assert_eq!(provider, "openrouter");
+        assert_eq!(model, "vendor/model:free");
+    }
+
+    #[test]
+    fn benchmark_rejects_unknown_providers() {
+        let error = parse_args_from(["--provider", "cloud", "--model", "m"].into_iter().map(str::to_owned)).unwrap_err();
+        assert_eq!(error, "Unknown model provider. Use 'ollama' or 'openrouter'.");
     }
 }

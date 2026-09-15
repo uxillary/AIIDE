@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, State};
 use crate::model_profiles;
-use crate::model_provider::{InferenceRequest, InferenceResponse, ModelMessage, ModelProvider, OllamaProvider};
+use crate::model_provider::{InferenceRequest, InferenceResponse, ModelMessage, ModelProvider, OllamaProvider, ProviderErrorKind, SelectedProvider, OLLAMA_PROVIDER_ID};
 use crate::project::OpenProject;
 use crate::repository::{self, Activity, PendingChanges, PendingProposal, ProposedReplacement, ToolRequest};
 
@@ -176,6 +176,10 @@ fn repair_instruction(reason: &str, edit_intent: bool, has_read_evidence: bool) 
     } else { format!("Your previous response was invalid ({reason}). Return exactly one JSON object matching the schema. No prose or markdown.") }
 }
 
+fn provider_error(provider: &impl ModelProvider, ollama: &'static str, remote: &'static str) -> String {
+    if provider.metadata().id == OLLAMA_PROVIDER_ID { ollama } else { remote }.to_owned()
+}
+
 async fn chat_turn(provider: &impl ModelProvider, model: &str, messages: &[ChatMessage], format: Value, temperature: f32, stage: &str, trace: Option<&Trace>) -> Result<ChatPayloadResponse, String> {
     let turn = trace_turn(trace);
     debug_log(trace, "protocol", format!("Turn {turn} — {stage}\nTemperature: {temperature}\nStructured format supplied: yes\nMessage count: {}\nMessage roles: {}\nSchema/format: {}", messages.len(), messages.iter().map(|message| message.role.as_str()).collect::<Vec<_>>().join(", "), format));
@@ -186,9 +190,10 @@ async fn chat_turn(provider: &impl ModelProvider, model: &str, messages: &[ChatM
     }
     let started = Instant::now();
     let provider_id = provider.metadata().id;
+    let response_label = provider_id.to_ascii_uppercase();
     debug_log(trace, provider_id, format!("Turn {turn} request started"));
-    let result = provider.infer(InferenceRequest { model, messages, format, temperature }).await?;
-    debug_log(trace, provider_id, format!("Turn {turn} response received in {}ms\n--- RAW OLLAMA RESPONSE START ---\n{}\n--- RAW OLLAMA RESPONSE END ---\nMetadata: model={}, done={}, done_reason={:?}", started.elapsed().as_millis(), result.message.content, result.model, result.done, result.done_reason));
+    let result = provider.infer(InferenceRequest { model, messages, format, temperature }).await.map_err(|error| error.to_string())?;
+    debug_log(trace, provider_id, format!("Turn {turn} response received in {}ms\n--- RAW {response_label} RESPONSE START ---\n{}\n--- RAW {response_label} RESPONSE END ---\nMetadata: model={}, done={}, done_reason={:?}", started.elapsed().as_millis(), result.message.content, result.model, result.done, result.done_reason));
     Ok(result)
 }
 
@@ -218,7 +223,9 @@ async fn agent_turn(provider: &impl ModelProvider, model: &str, exchange: &mut V
             }
         }
     }
-    Err("The local model could not produce a valid structured response after two retries.".into())
+    Err(provider_error(provider,
+        "The local model could not produce a valid structured response after two retries.",
+        "The selected model could not produce a valid structured response after two retries."))
 }
 
 fn action_name(action: &AgentAction) -> &'static str {
@@ -283,7 +290,9 @@ async fn final_turn(provider: &impl ModelProvider, model: &str, prompt: &str, pr
         if attempt == MAX_REPAIRS { break; }
         exchange.last_mut().unwrap().content.push_str("\n\nYour previous response was invalid or too long. Answer the ORIGINAL REQUEST above in at most 90 words. For a review, give three short numbered improvements with actual affected files and reasons. Return only the JSON answer object.");
     }
-    Err("The local model could not produce a final structured answer after two retries.".into())
+    Err(provider_error(provider,
+        "The local model could not produce a final structured answer after two retries.",
+        "The selected model could not produce a final structured answer after two retries."))
 }
 
 async fn conversational_turn(provider: &impl ModelProvider, model: &str, prompt: &str, draft: &str, trace: Option<&Trace>) -> Result<String, String> {
@@ -300,7 +309,9 @@ async fn conversational_turn(provider: &impl ModelProvider, model: &str, prompt:
         if attempt == MAX_REPAIRS { break; }
         exchange.last_mut().unwrap().content.push_str("\n\nReturn one valid JSON answer object in at most 80 words.");
     }
-    Err("The local model could not produce a concise conversational answer after two retries.".into())
+    Err(provider_error(provider,
+        "The local model could not produce a concise conversational answer after two retries.",
+        "The selected model could not produce a concise conversational answer after two retries."))
 }
 
 #[tauri::command]
@@ -310,7 +321,7 @@ pub async fn ollama_status() -> ProviderStatus {
     if !provider.is_available().await { return offline(); }
     match provider.installed_models().await {
         Ok(models) => ProviderStatus { state: "connected", models: models.into_iter().filter(|model| !model.is_empty()).map(|model| ModelInfo { id: model.clone(), profile: model_profiles::resolve(&model), name: model }).collect(), error: None },
-        Err(error) if error == "Ollama returned an invalid model list." => ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "malformed_response", message: "Ollama returned an invalid model list." }) },
+        Err(error) if error.kind == ProviderErrorKind::MalformedResponse => ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "malformed_response", message: "Ollama returned an invalid model list." }) },
         Err(_) => ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "model_list_failed", message: "Ollama is connected, but its model list could not be loaded." }) },
     }
 }
@@ -330,7 +341,7 @@ pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project
         let started_at = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0);
         debug_log(Some(trace), "agent", format!("==================================================\nAIIDE AGENT DEBUG TRACE\nTrace version: 1\nRequest: #{request}\nStarted at Unix ms: {started_at}\nModel: {model}\nProject: {}\nCore agent instructions: included on agent turns\nDefault personality: included only on final conversational turns\n==================================================", root.as_ref().and_then(|path| path.file_name()).map(|name| name.to_string_lossy()).unwrap_or_else(|| "none".into())));
     }
-    let result = run_agent(model, messages, root, Some(&pending), Some(&app), trace.as_ref()).await;
+    let result = run_agent(OLLAMA_PROVIDER_ID, model, messages, root, Some(&pending), Some(&app), trace.as_ref()).await;
     if let Some(trace) = trace {
         if let Err(error) = &result { debug_log(Some(&trace), "final", format!("FAILED\n{error}")); }
         debug_log(Some(&trace), "final", format!("Result: {}\nTotal duration: {}ms\n==================================================", if result.is_ok() { "SUCCESS" } else { "FAILED" }, started.elapsed().as_millis()));
@@ -341,8 +352,8 @@ pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project
     result
 }
 
-async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::path::PathBuf>, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>, debug_trace: Option<&Trace>) -> Result<ChatResponse, String> {
-    let provider = OllamaProvider::new(Duration::from_secs(120))?;
+async fn run_agent(provider_id: &str, model: String, messages: Vec<ChatMessage>, root: Option<std::path::PathBuf>, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>, debug_trace: Option<&Trace>) -> Result<ChatResponse, String> {
+    let provider = SelectedProvider::from_id(provider_id, Duration::from_secs(120)).map_err(|error| error.to_string())?;
     run_agent_with_provider(&provider, model, messages, root, pending, app, debug_trace).await
 }
 
@@ -352,11 +363,16 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
     }) || messages.last().is_none_or(|message| message.role != "user") {
         return Err("The chat request is invalid or too long.".to_owned());
     }
-    let installed_models = provider.installed_models().await?;
-    if !installed_models.iter().any(|item| item == &model) { return Err("This model is no longer installed. Retry to refresh the model list.".to_owned()); }
+    let installed_models = provider.installed_models().await.map_err(|error| error.to_string())?;
+    if !installed_models.iter().any(|item| item == &model) {
+        return Err(provider_error(provider,
+            "This model is no longer installed. Retry to refresh the model list.",
+            "The selected OpenRouter model is unavailable or invalid."));
+    }
     let last_prompt = messages.last().map_or("", |message| message.content.trim()).to_owned();
     if last_prompt.eq_ignore_ascii_case("what is your name?") || last_prompt.eq_ignore_ascii_case("what is your name") {
-        return Ok(ChatResponse { model, content: "I'm Elma, your local coding companion in AIIDE. My responses are generated by the selected Ollama model.".into(), activity: vec![], proposal: None });
+        let provider_name = if provider.metadata().id == OLLAMA_PROVIDER_ID { "Ollama" } else { "OpenRouter" };
+        return Ok(ChatResponse { model, content: format!("I'm Elma, your local coding companion in AIIDE. My responses are generated by the selected {provider_name} model."), activity: vec![], proposal: None });
     }
     if last_prompt.eq_ignore_ascii_case("do you have access to my files?") || last_prompt.eq_ignore_ascii_case("do you have access to my files") {
         return Ok(ChatResponse { model, content: if root.is_some() { "I can inspect this project and prepare focused changes for your review. Only the Apply button can write them." } else { "No project is open, so I cannot inspect or propose changes to files." }.into(), activity: vec![], proposal: None });
@@ -507,9 +523,9 @@ pub(crate) struct BenchmarkAgentOutput {
     pub trace: String,
 }
 
-pub(crate) async fn run_benchmark_agent(model: &str, root: std::path::PathBuf, prompt: &str) -> Result<BenchmarkAgentOutput, String> {
+pub(crate) async fn run_benchmark_agent(provider: &str, model: &str, root: std::path::PathBuf, prompt: &str) -> Result<BenchmarkAgentOutput, String> {
     let trace = Arc::new(Mutex::new(TraceBuffer::default()));
-    let response = run_agent(
+    let response = run_agent(provider,
         model.to_owned(),
         vec![ChatMessage { role: "user".into(), content: prompt.to_owned() }],
         Some(root), None, None, Some(&trace),
@@ -526,7 +542,7 @@ pub(crate) async fn run_benchmark_agent(model: &str, root: std::path::PathBuf, p
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_provider::{ProviderLocality, ProviderMetadata};
+    use crate::model_provider::{ProviderFailure, ProviderLocality, ProviderMetadata};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -553,16 +569,16 @@ mod tests {
 
     impl ModelProvider for StubProvider {
         fn metadata(&self) -> ProviderMetadata {
-            ProviderMetadata { id: "stub", locality: ProviderLocality::Local }
+            ProviderMetadata { id: OLLAMA_PROVIDER_ID, locality: ProviderLocality::Local }
         }
 
         async fn is_available(&self) -> bool { true }
 
-        async fn installed_models(&self) -> Result<Vec<String>, String> { Ok(self.models.clone()) }
+        async fn installed_models(&self) -> Result<Vec<String>, ProviderFailure> { Ok(self.models.clone()) }
 
-        async fn infer(&self, _request: InferenceRequest<'_>) -> Result<InferenceResponse, String> {
+        async fn infer(&self, _request: InferenceRequest<'_>) -> Result<InferenceResponse, ProviderFailure> {
             self.inference_calls.fetch_add(1, Ordering::SeqCst);
-            self.responses.lock().unwrap().pop_front().ok_or_else(|| "No stub response configured.".to_owned())
+            self.responses.lock().unwrap().pop_front().ok_or_else(|| ProviderFailure::new(ProviderErrorKind::Api, "No stub response configured."))
         }
     }
 
@@ -793,7 +809,7 @@ mod tests {
                 if selected != (index + 1).to_string() { continue; }
             }
             let debug_trace = Arc::new(Mutex::new(TraceBuffer::default()));
-            let response = tauri::async_runtime::block_on(run_agent(
+            let response = tauri::async_runtime::block_on(run_agent(OLLAMA_PROVIDER_ID,
                 "qwen2.5-coder:7b".into(),
                 vec![ChatMessage { role: "user".into(), content: (*prompt).into() }],
                 Some(root.clone()), None, None, Some(&debug_trace),
@@ -819,7 +835,7 @@ mod tests {
         let root = std::fs::canonicalize(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../aiide-sandbox"))
             .expect("aiide-sandbox must exist beside AIIDE");
         let before = std::fs::read_to_string(root.join("src/index.html")).expect("sandbox signup page must exist");
-        let response = tauri::async_runtime::block_on(run_agent(
+        let response = tauri::async_runtime::block_on(run_agent(OLLAMA_PROVIDER_ID,
             "qwen2.5-coder:7b".into(),
             vec![ChatMessage { role: "user".into(), content: "Improve the signup form accessibility. Make a focused change and let me review it before anything is applied.".into() }],
             Some(root.clone()), None, None, None,
@@ -839,7 +855,7 @@ mod tests {
         let before = std::fs::read_to_string(&path).unwrap();
         let first_prompt = "tell me about this project and describe one change you'd make";
         let first_trace = Arc::new(Mutex::new(TraceBuffer::default()));
-        let first = tauri::async_runtime::block_on(run_agent(
+        let first = tauri::async_runtime::block_on(run_agent(OLLAMA_PROVIDER_ID,
             "qwen2.5-coder:7b".into(),
             vec![ChatMessage { role: "user".into(), content: first_prompt.into() }],
             Some(root.clone()), None, None, Some(&first_trace),
@@ -851,7 +867,7 @@ mod tests {
 
         let second_prompt = "change the main heading to \"Welcome to the AIIDE Sandbox\". make only that change and prepare it for review";
         let second_trace = Arc::new(Mutex::new(TraceBuffer::default()));
-        let second = tauri::async_runtime::block_on(run_agent(
+        let second = tauri::async_runtime::block_on(run_agent(OLLAMA_PROVIDER_ID,
             "qwen2.5-coder:7b".into(),
             vec![
                 ChatMessage { role: "user".into(), content: first_prompt.into() },
