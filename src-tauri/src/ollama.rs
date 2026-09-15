@@ -114,15 +114,34 @@ struct AgentReply { action: String, path: Option<String>, query: Option<String>,
 #[derive(Debug, PartialEq)]
 enum AgentAction { List(String), Search(String), Read(String), Answer(String), Propose(String, Vec<ProposedReplacement>) }
 
-fn agent_schema(project_open: bool, allow_proposal: bool) -> Value {
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RequestScope { General, Repository, Unknown }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RequestIntent { Answer, Edit }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RequestPlan { scope: RequestScope, intent: RequestIntent }
+
+fn classify_current_request(prompt: &str) -> RequestPlan {
+    let text = prompt.trim().to_ascii_lowercase();
+    let descriptive = ["describe a change", "change you'd make", "change you would make", "recommend", "suggest", "review", "tell me one improvement", "tell me about"].iter().any(|phrase| text.contains(phrase));
+    let edit = !descriptive && ["change ", "edit ", "fix ", "implement ", "add ", "remove ", "rename ", "update ", "refactor "].iter().any(|verb| text.starts_with(verb) || text.contains(&format!("please {verb}")) || text.contains(&format!("can you {verb}")));
+    let repository = edit || ["this project", "the project", "look at the css", "look at the code", "mobile menu", "main heading", "signup form", "repository"].iter().any(|phrase| text.contains(phrase));
+    let general = text.starts_with("what is ") || text.starts_with("what's ") || text.starts_with("explain ");
+    RequestPlan { scope: if repository { RequestScope::Repository } else if general { RequestScope::General } else { RequestScope::Unknown }, intent: if edit { RequestIntent::Edit } else { RequestIntent::Answer } }
+}
+
+fn agent_schema(project_open: bool, edit_intent: bool, has_read_evidence: bool) -> Value {
     let actions = if !project_open { json!(["answer"]) }
-        else if allow_proposal { json!(["list_files","search_files","read_file","answer","propose_change"]) }
+        else if edit_intent && has_read_evidence { json!(["list_files","search_files","read_file","propose_change"]) }
+        else if edit_intent { json!(["list_files","search_files","read_file"]) }
         else { json!(["list_files","search_files","read_file","answer"]) };
     json!({"type":"object","properties":{
         "action":{"type":"string","enum":actions,"description":"Choose answer for conversational responses. For action=answer, use the answer field and never summary."},
         "path":{"type":"string","description":"For list_files, a project-relative directory such as '' or 'src', never a glob. For read_file, an exact file path returned by list_files."},"query":{"type":"string"},
         "answer":{"type":"string","description":"Required conversational response text when action is answer."},
-        "summary":{"type":"string","description":"A concise change summary for propose_change only. Never use this for action=answer."},
+        "summary":{"type":"string","maxLength":160,"description":"For propose_change only: one short sentence describing the edit. Never include rationale or repeat text. Never use this for action=answer."},
         "changes":{"type":"array","maxItems":4,"items":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}}
     },"required":["action"],"additionalProperties":false})
 }
@@ -148,10 +167,16 @@ fn parse_action(raw: &str) -> Result<AgentAction, &'static str> {
         "read_file" => Err("read_file requires a nonempty path and no query or answer"),
         "answer" if reply.path.is_none() && reply.query.is_none() && reply.summary.is_none() && reply.changes.is_none() && reply.answer.as_ref().is_some_and(|answer| !answer.trim().is_empty()) => Ok(AgentAction::Answer(reply.answer.unwrap())),
         "answer" => Err("For action='answer', put the response text in the 'answer' field. Do not put it in 'summary', path, query, or changes."),
-        "propose_change" if reply.path.is_none() && reply.query.is_none() && reply.answer.is_none() && reply.summary.as_ref().is_some_and(|value| !value.trim().is_empty()) && reply.changes.as_ref().is_some_and(|value| !value.is_empty()) => Ok(AgentAction::Propose(reply.summary.unwrap(), reply.changes.unwrap())),
-        "propose_change" => Err("propose_change requires summary and one or more exact changes"),
+        "propose_change" if reply.path.is_none() && reply.query.is_none() && reply.answer.is_none() && reply.summary.as_ref().is_some_and(|value| !value.trim().is_empty() && value.chars().count() <= 160) && reply.changes.as_ref().is_some_and(|value| !value.is_empty()) => Ok(AgentAction::Propose(reply.summary.unwrap(), reply.changes.unwrap())),
+        "propose_change" => Err("For action='propose_change', include changes; each change needs path, old_text, and new_text. Copy old_text exactly from inspected content and keep summary to one short sentence."),
         _ => Err("invalid or ambiguous action fields"),
     }
+}
+
+fn repair_instruction(reason: &str, edit_intent: bool, has_read_evidence: bool) -> String {
+    if edit_intent && has_read_evidence && (reason.contains("propose_change") || reason.contains("output limit")) {
+        format!("Your previous response was invalid ({reason}). Return one minimal propose_change object. Include changes; each change needs path, old_text copied exactly from inspected content, and new_text. Keep summary to one short sentence. Do not repeat rationale. No prose or markdown.")
+    } else { format!("Your previous response was invalid ({reason}). Return exactly one JSON object matching the schema. No prose or markdown.") }
 }
 
 async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessage], format: Value, temperature: f32, stage: &str, trace: Option<&Trace>) -> Result<ChatPayloadResponse, String> {
@@ -174,10 +199,10 @@ async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessag
     Ok(result)
 }
 
-async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<ChatMessage>, project_open: bool, allow_proposal: bool, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<(ChatPayloadResponse, AgentAction), String> {
+async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<ChatMessage>, project_open: bool, edit_intent: bool, has_read_evidence: bool, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<(ChatPayloadResponse, AgentAction), String> {
     for attempt in 0..=MAX_REPAIRS {
         let stage = if attempt == 0 { "STRUCTURED".to_owned() } else { format!("REPAIR {attempt}/{MAX_REPAIRS}") };
-        let result = chat_turn(client, model, exchange, agent_schema(project_open, allow_proposal), PROTOCOL_TEMPERATURE, &stage, trace).await?;
+        let result = chat_turn(client, model, exchange, agent_schema(project_open, edit_intent, has_read_evidence), PROTOCOL_TEMPERATURE, &stage, trace).await?;
         let parsed = if result.done_reason.as_deref() == Some("length") { Err("response exceeded the model output limit") }
             else { parse_action(&result.message.content) };
         match parsed {
@@ -193,7 +218,7 @@ async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<Ch
                 debug_log(trace, "protocol", diagnostic);
                 if attempt == MAX_REPAIRS { break; }
                 if let Some(app) = app { let _ = app.emit("repository-retry", ()); }
-                let repair = format!("Your previous response was invalid ({reason}). Return exactly one JSON object matching the schema. No prose or markdown.");
+                let repair = repair_instruction(reason, edit_intent, has_read_evidence);
                 debug_log(trace, "repair", format!("Attempt {}/{}\nOriginal failure: {reason}\n--- REPAIR INSTRUCTION START ---\n{repair}\n--- REPAIR INSTRUCTION END ---", attempt + 1, MAX_REPAIRS));
                 exchange.push(ChatMessage { role: "user".into(), content: repair });
             }
@@ -359,6 +384,8 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
     if last_prompt.eq_ignore_ascii_case("do you have access to my files?") || last_prompt.eq_ignore_ascii_case("do you have access to my files") {
         return Ok(ChatResponse { model, content: if root.is_some() { "I can inspect this project and prepare focused changes for your review. Only the Apply button can write them." } else { "No project is open, so I cannot inspect or propose changes to files." }.into(), activity: vec![], proposal: None });
     }
+    let plan = classify_current_request(&last_prompt);
+    debug_log(debug_trace, "agent", format!("Current request plan: scope={:?}, intent={:?}", plan.scope, plan.intent));
     let mut exchange = Vec::new();
     exchange.push(ChatMessage { role: "system".into(), content: CORE_AGENT_INSTRUCTIONS.into() });
     if let Some(ref root) = root {
@@ -367,6 +394,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
     } else {
         exchange.push(ChatMessage { role: "system".into(), content: "No project is open. Repository tools are unavailable; answer normal chat directly.".into() });
     }
+    exchange.push(ChatMessage { role: "system".into(), content: format!("The final user message is the authoritative current task. Current request intent: {}. {}", if plan.intent == RequestIntent::Edit { "edit" } else { "inspect/answer only" }, if plan.intent == RequestIntent::Edit && root.is_some() { "Inspect the relevant target, then return a focused propose_change. Do not claim completion without a validated proposal." } else if plan.intent == RequestIntent::Edit { "No project is open, so explain that the requested edit cannot be prepared yet." } else { "Do not propose or prepare a change; answer the current request after any required inspection." }) });
     exchange.extend(messages.into_iter().rev().take(12).collect::<Vec<_>>().into_iter().rev());
     let mut activity = Vec::new();
     let mut tool_cache: HashMap<String, (String, Activity)> = HashMap::new();
@@ -379,10 +407,10 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
     let mut unresolved_failure = false;
     let mut known_paths = String::new();
     let mut known_file_paths: Vec<String> = Vec::new();
-    let mut needs_inspection: Option<bool> = None;
+    let mut needs_inspection = match plan.scope { RequestScope::General => Some(false), RequestScope::Repository => Some(true), RequestScope::Unknown => None };
     let mut inspection_reminders = 0;
     for iteration in 0..=repository::MAX_TOOL_CALLS {
-        let (result, action) = agent_turn(&client, &model, &mut exchange, root.is_some(), successful_reads > 0, app, debug_trace).await?;
+        let (result, action) = agent_turn(&client, &model, &mut exchange, root.is_some(), plan.intent == RequestIntent::Edit, successful_reads > 0, app, debug_trace).await?;
         if let AgentAction::Propose(summary, edits) = action {
             let root = root.as_ref().ok_or_else(|| "Open a project before proposing changes.".to_owned())?;
             if edits.iter().any(|edit| !read_paths.contains(&edit.path)) {
@@ -400,6 +428,11 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
             return Ok(ChatResponse { model: result.model, content: "Done — have a wee look in Changes 👀".into(), activity, proposal: Some(proposal) });
         }
         if let AgentAction::Answer(answer) = action {
+            if plan.intent == RequestIntent::Edit && root.is_some() {
+                exchange.push(result.message);
+                exchange.push(ChatMessage { role: "user".into(), content: if successful_reads == 0 { "This edit request cannot finish with an answer. Inspect the relevant file first, then prepare a focused proposal.".into() } else { "This edit request cannot finish with an answer or claim review readiness. Return a minimal propose_change using the inspected file content.".into() } });
+                continue;
+            }
             if root.is_some() && successful_reads == 0 {
                 let needed = match needs_inspection {
                     Some(needed) => needed,
@@ -474,7 +507,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
         activity.push(event);
         exchange.push(result.message);
         let unread = known_file_paths.iter().filter(|path| !read_paths.contains(path)).cloned().collect::<Vec<_>>().join(", ");
-        exchange.push(ChatMessage { role: "user".into(), content: tool_result_message(&request, useful, &output, &known_paths, &unread) });
+        exchange.push(ChatMessage { role: "user".into(), content: format!("{}\nCurrent request intent: {}.", tool_result_message(&request, useful, &output, &known_paths, &unread), if plan.intent == RequestIntent::Edit { "edit — inspect, then propose the focused change" } else { "inspect/answer only — do not propose a change" }) });
         if consecutive_repeats >= 2 { break; }
     }
     if !read_paths.is_empty() {
@@ -542,17 +575,55 @@ mod tests {
         let error = parse_action(r#"{"action":"answer","summary":"Wrong field."}"#).unwrap_err();
         assert!(error.contains("put the response text in the 'answer' field"));
         assert!(error.contains("Do not put it in 'summary'"));
-        let schema = agent_schema(false, false);
+        let schema = agent_schema(false, false, false);
         assert!(schema["properties"]["answer"]["description"].as_str().unwrap().contains("Required conversational response"));
         assert!(schema["properties"]["summary"]["description"].as_str().unwrap().contains("Never use this for action=answer"));
     }
 
     #[test]
     fn agent_action_availability_matches_project_and_inspection_state() {
-        let actions = |project_open, allow_proposal| agent_schema(project_open, allow_proposal)["properties"]["action"]["enum"].as_array().unwrap().iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>();
-        assert_eq!(actions(false, false), vec!["answer"]);
-        assert!(!actions(true, false).contains(&"propose_change".to_owned()));
-        assert!(actions(true, true).contains(&"propose_change".to_owned()));
+        let actions = |project_open, edit, evidence| agent_schema(project_open, edit, evidence)["properties"]["action"]["enum"].as_array().unwrap().iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(actions(false, false, false), vec!["answer"]);
+        assert!(actions(true, false, true).contains(&"answer".to_owned()));
+        assert!(!actions(true, false, true).contains(&"propose_change".to_owned()));
+        assert!(!actions(true, true, false).contains(&"answer".to_owned()));
+        assert!(!actions(true, true, false).contains(&"propose_change".to_owned()));
+        assert!(actions(true, true, true).contains(&"propose_change".to_owned()));
+        assert!(!actions(true, true, true).contains(&"answer".to_owned()));
+    }
+
+    #[test]
+    fn current_request_scope_and_intent_are_separate() {
+        for prompt in ["what is a javascript closure"] {
+            assert_eq!(classify_current_request(prompt), RequestPlan { scope: RequestScope::General, intent: RequestIntent::Answer });
+        }
+        for prompt in ["tell me about this project", "look at the css and tell me one improvement", "tell me about this project and describe a change you'd make"] {
+            assert_eq!(classify_current_request(prompt), RequestPlan { scope: RequestScope::Repository, intent: RequestIntent::Answer }, "{prompt}");
+        }
+        for prompt in ["change the main heading to X", "fix the mobile menu", "add labels to the signup form", "implement dark mode"] {
+            assert_eq!(classify_current_request(prompt), RequestPlan { scope: RequestScope::Repository, intent: RequestIntent::Edit }, "{prompt}");
+        }
+        let previous = "change the main heading to X";
+        let current = "tell me about this project and describe a change you'd make";
+        assert_eq!(classify_current_request(current).intent, RequestIntent::Answer);
+        assert_eq!(classify_current_request(previous).intent, RequestIntent::Edit);
+    }
+
+    #[test]
+    fn malformed_or_oversized_proposals_get_minimal_guidance() {
+        for raw in [
+            r#"{"action":"propose_change","summary":"Update heading."}"#.to_owned(),
+            format!(r#"{{"action":"propose_change","summary":"{}","changes":[{{"path":"x","old_text":"a","new_text":"b"}}]}}"#, "x".repeat(161)),
+        ] {
+            let error = parse_action(&raw).unwrap_err();
+            assert!(error.contains("include changes"));
+            assert!(error.contains("old_text"));
+            assert!(error.contains("one short sentence"));
+        }
+        assert_eq!(agent_schema(true, true, true)["properties"]["summary"]["maxLength"], 160);
+        let repair = repair_instruction("response exceeded the model output limit", true, true);
+        assert!(repair.contains("minimal propose_change"));
+        assert!(repair.contains("Do not repeat rationale"));
     }
 
     #[test]
@@ -670,5 +741,42 @@ mod tests {
         assert_eq!(proposal.changes[0].path, "src/index.html");
         assert_ne!(proposal.changes[0].before, proposal.changes[0].after);
         assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), before, "proposal must not write");
+    }
+
+    #[test]
+    #[ignore = "requires local Ollama with qwen2.5-coder:7b and clean aiide-sandbox"]
+    fn local_intent_sequence_acceptance() {
+        let root = std::fs::canonicalize(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../aiide-sandbox"))
+            .expect("aiide-sandbox must exist beside AIIDE");
+        let path = root.join("src/index.html");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let first_prompt = "tell me about this project and describe one change you'd make";
+        let first_trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let first = tauri::async_runtime::block_on(run_agent(
+            "qwen2.5-coder:7b".into(),
+            vec![ChatMessage { role: "user".into(), content: first_prompt.into() }],
+            Some(root.clone()), None, None, Some(&first_trace),
+        )).expect("inspect/answer request should complete");
+        println!("TEST A\n{}", first_trace.lock().unwrap().lines.join("\n\n"));
+        assert!(first.proposal.is_none());
+        assert!(!first.activity.is_empty());
+        assert!(first.content.to_ascii_lowercase().contains("orbitnote"));
+
+        let second_prompt = "change the main heading to \"Welcome to the AIIDE Sandbox\". make only that change and prepare it for review";
+        let second_trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let second = tauri::async_runtime::block_on(run_agent(
+            "qwen2.5-coder:7b".into(),
+            vec![
+                ChatMessage { role: "user".into(), content: first_prompt.into() },
+                ChatMessage { role: "assistant".into(), content: first.content },
+                ChatMessage { role: "user".into(), content: second_prompt.into() },
+            ],
+            Some(root), None, None, Some(&second_trace),
+        )).expect("edit request should complete");
+        println!("TEST B\n{}", second_trace.lock().unwrap().lines.join("\n\n"));
+        let proposal = second.proposal.expect("edit request should create a proposal");
+        assert!(proposal.summary.chars().count() <= 160);
+        assert_eq!(proposal.changes[0].path, "src/index.html");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before, "proposal must not write before Apply");
     }
 }
