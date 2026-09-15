@@ -301,6 +301,9 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
         trace(&format!("tool selected: {}", request.tool));
         let key = format!("{}|{}|{}", request.tool, request.path, request.query);
         let repeated = seen.contains(&key);
+        if !repeated {
+            if let Some(app) = app { let _ = app.emit("repository-inspection-start", ()); }
+        }
         let (output, event) = if seen.insert(key) { repository::execute(root.as_deref().unwrap(), &request) }
             else { ("This tool request was already answered in this turn; use the earlier result.".into(), Activity { label: "Repeated inspection skipped".into() }) };
         let remaining = repository::MAX_CONTEXT_BYTES.saturating_sub(context_bytes);
