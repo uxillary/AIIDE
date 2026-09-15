@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint .",
+    "benchmark": "cargo run --manifest-path src-tauri/Cargo.toml --bin agent-benchmark --",
     "tauri": "tauri"
   },
   "dependencies": {

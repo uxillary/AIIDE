@@ -1,5 +1,14 @@
 export interface ProviderError { code: string; message: string }
-export interface AIModel { id: string; name: string }
+export type ModelProfileStatus = 'unknown' | 'experimental' | 'compatible' | 'limited'
+export interface ModelProfile {
+  label: string
+  status: ModelProfileStatus
+  chat: 'unknown' | 'supported' | 'limited'
+  repositoryInspection: 'unknown' | 'supported' | 'limited'
+  structuredEdits: 'unknown' | 'supported' | 'limited'
+  resourceClass: string | null
+}
+export interface AIModel { id: string; name: string; profile: ModelProfile }
 export interface ProviderStatus {
   state: 'connected' | 'offline' | 'error'
   models: AIModel[]

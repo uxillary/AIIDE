@@ -1,6 +1,10 @@
 mod project;
 mod ollama;
 mod repository;
+mod model_profiles;
+mod benchmark;
+
+pub fn run_benchmark_cli() -> Result<(), String> { benchmark::run_cli() }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

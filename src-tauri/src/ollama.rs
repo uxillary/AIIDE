@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, State};
+use crate::model_profiles;
 use crate::project::OpenProject;
 use crate::repository::{self, Activity, PendingChanges, PendingProposal, ProposedReplacement, ToolRequest};
 
@@ -25,14 +26,16 @@ pub struct AgentDebug(Mutex<DebugData>);
 pub struct DebugStatus { enabled: bool, has_trace: bool }
 
 #[derive(Default)]
-struct TraceBuffer { lines: Vec<String>, next_turn: usize }
+struct TraceBuffer { lines: Vec<String>, next_turn: usize, echo: bool }
 type Trace = Arc<Mutex<TraceBuffer>>;
 
 fn debug_log(trace: Option<&Trace>, category: &str, message: impl AsRef<str>) {
     let Some(trace) = trace else { return };
     let line = format!("[AIIDE][{category}] {}", message.as_ref());
-    eprintln!("{line}");
-    if let Ok(mut buffer) = trace.lock() { buffer.lines.push(line); }
+    if let Ok(mut buffer) = trace.lock() {
+        if buffer.echo { eprintln!("{line}"); }
+        buffer.lines.push(line);
+    }
 }
 
 fn trace_turn(trace: Option<&Trace>) -> usize {
@@ -71,7 +74,7 @@ pub struct ProviderStatus {
 }
 
 #[derive(Serialize)]
-pub struct ModelInfo { id: String, name: String }
+pub struct ModelInfo { id: String, name: String, profile: model_profiles::ModelProfile }
 
 #[derive(Serialize)]
 pub struct ProviderError { code: &'static str, message: &'static str }
@@ -212,9 +215,10 @@ async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessag
 }
 
 async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<ChatMessage>, project_open: bool, edit_intent: bool, has_read_evidence: bool, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<(ChatPayloadResponse, AgentAction), String> {
+    let temperature = model_profiles::adaptation(model).protocol_temperature.unwrap_or(PROTOCOL_TEMPERATURE);
     for attempt in 0..=MAX_REPAIRS {
         let stage = if attempt == 0 { "STRUCTURED".to_owned() } else { format!("REPAIR {attempt}/{MAX_REPAIRS}") };
-        let result = chat_turn(client, model, exchange, agent_schema(project_open, edit_intent, has_read_evidence), PROTOCOL_TEMPERATURE, &stage, trace).await?;
+        let result = chat_turn(client, model, exchange, agent_schema(project_open, edit_intent, has_read_evidence), temperature, &stage, trace).await?;
         let parsed = if result.done_reason.as_deref() == Some("length") { Err("response exceeded the model output limit") }
             else { parse_action(&result.message.content) };
         match parsed {
@@ -347,7 +351,7 @@ pub async fn ollama_status() -> ProviderStatus {
         return ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "model_list_failed", message: "Ollama is connected, but its model list could not be loaded." }) };
     }
     match response.json::<TagsResponse>().await {
-        Ok(tags) => ProviderStatus { state: "connected", models: tags.models.into_iter().filter(|model| !model.name.is_empty()).map(|model| ModelInfo { id: model.name.clone(), name: model.name }).collect(), error: None },
+        Ok(tags) => ProviderStatus { state: "connected", models: tags.models.into_iter().filter(|model| !model.name.is_empty()).map(|model| ModelInfo { id: model.name.clone(), profile: model_profiles::resolve(&model.name), name: model.name }).collect(), error: None },
         Err(_) => ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "malformed_response", message: "Ollama returned an invalid model list." }) },
     }
 }
@@ -360,7 +364,7 @@ pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project
         let mut state = debug.0.lock().map_err(|_| "Debug state unavailable")?;
         if state.enabled {
             state.next_request += 1;
-            (state.next_request, Some(Arc::new(Mutex::new(TraceBuffer::default()))))
+            (state.next_request, Some(Arc::new(Mutex::new(TraceBuffer { echo: true, ..TraceBuffer::default() }))))
         } else { (0, None) }
     };
     if let Some(trace) = trace.as_ref() {
@@ -400,6 +404,10 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
     debug_log(debug_trace, "agent", format!("Current request plan: scope={:?}, intent={:?}", plan.scope, plan.intent));
     let mut exchange = Vec::new();
     exchange.push(ChatMessage { role: "system".into(), content: CORE_AGENT_INSTRUCTIONS.into() });
+    if let Some(hint) = model_profiles::adaptation(&model).protocol_hint {
+        exchange.push(ChatMessage { role: "system".into(), content: format!("Model protocol adaptation: {hint}") });
+        debug_log(debug_trace, "agent", "Model protocol adaptation included; repository validation remains unchanged");
+    }
     if let Some(ref root) = root {
         let info = super::project::inspect_metadata(root);
         exchange.push(ChatMessage { role: "system".into(), content: info });
@@ -529,6 +537,29 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
         return Ok(ChatResponse { model, content, activity, proposal: None });
     }
     Ok(ChatResponse { model, content: "I reached the repository inspection limit before I could read a relevant file. Please ask a narrower question.".into(), activity, proposal: None })
+}
+
+pub(crate) struct BenchmarkAgentOutput {
+    pub content: String,
+    pub activity: Vec<String>,
+    pub proposal: Option<PendingProposal>,
+    pub trace: String,
+}
+
+pub(crate) async fn run_benchmark_agent(model: &str, root: std::path::PathBuf, prompt: &str) -> Result<BenchmarkAgentOutput, String> {
+    let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+    let response = run_agent(
+        model.to_owned(),
+        vec![ChatMessage { role: "user".into(), content: prompt.to_owned() }],
+        Some(root), None, None, Some(&trace),
+    ).await?;
+    let report = trace.lock().map(|buffer| buffer.lines.join("\n\n")).unwrap_or_default();
+    Ok(BenchmarkAgentOutput {
+        content: response.content,
+        activity: response.activity.into_iter().map(|item| item.label).collect(),
+        proposal: response.proposal,
+        trace: report,
+    })
 }
 
 #[cfg(test)]
