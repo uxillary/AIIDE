@@ -19,11 +19,11 @@ const animation: Record<ElmaState, { sprite: string; duration: string }> = {
 
 type ElmaStyle = CSSProperties & { '--elma-duration': string }
 
-export function Elma({ state }: { state: ElmaState }) {
+export function Elma({ state, size = 'compact', className = '' }: { state: ElmaState; size?: 'tiny' | 'compact' | 'presence' | 'hero'; className?: string }) {
   const { sprite, duration } = animation[state]
   return <span
     aria-hidden="true"
-    className="elma-sprite"
+    className={`elma-sprite elma-sprite-${size}${className ? ` ${className}` : ''}`}
     data-state={state}
     style={{ backgroundImage: `url(${sprite})`, '--elma-duration': duration } as ElmaStyle}
   />
