@@ -123,10 +123,22 @@ enum RequestIntent { Answer, Edit }
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RequestPlan { scope: RequestScope, intent: RequestIntent }
 
+fn is_edit_clause(clause: &str) -> bool {
+    let mut clause = clause.trim();
+    loop {
+        let stripped = ["please ", "can you ", "could you ", "okay ", "ok ", "now "]
+            .iter().find_map(|prefix| clause.strip_prefix(prefix));
+        if let Some(value) = stripped { clause = value.trim_start(); } else { break; }
+    }
+    ["change", "edit", "modify", "fix", "implement", "add", "remove", "rename", "update", "replace", "refactor"]
+        .iter().any(|verb| clause == *verb || clause.starts_with(&format!("{verb} ")))
+        || ["make this change", "make only that change", "prepare this change for review", "prepare it for review"]
+            .iter().any(|phrase| clause.starts_with(phrase))
+}
+
 fn classify_current_request(prompt: &str) -> RequestPlan {
     let text = prompt.trim().to_ascii_lowercase();
-    let descriptive = ["describe a change", "change you'd make", "change you would make", "recommend", "suggest", "review", "tell me one improvement", "tell me about"].iter().any(|phrase| text.contains(phrase));
-    let edit = !descriptive && ["change ", "edit ", "fix ", "implement ", "add ", "remove ", "rename ", "update ", "refactor "].iter().any(|verb| text.starts_with(verb) || text.contains(&format!("please {verb}")) || text.contains(&format!("can you {verb}")));
+    let edit = text.split(['.', '!', '?', ';', '\n']).any(is_edit_clause);
     let repository = edit || ["this project", "the project", "look at the css", "look at the code", "mobile menu", "main heading", "signup form", "repository"].iter().any(|phrase| text.contains(phrase));
     let general = text.starts_with("what is ") || text.starts_with("what's ") || text.starts_with("explain ");
     RequestPlan { scope: if repository { RequestScope::Repository } else if general { RequestScope::General } else { RequestScope::Unknown }, intent: if edit { RequestIntent::Edit } else { RequestIntent::Answer } }
@@ -600,13 +612,29 @@ mod tests {
         for prompt in ["tell me about this project", "look at the css and tell me one improvement", "tell me about this project and describe a change you'd make"] {
             assert_eq!(classify_current_request(prompt), RequestPlan { scope: RequestScope::Repository, intent: RequestIntent::Answer }, "{prompt}");
         }
-        for prompt in ["change the main heading to X", "fix the mobile menu", "add labels to the signup form", "implement dark mode"] {
+        for prompt in ["describe one change you'd make", "what would you change here?", "review this page and suggest an improvement", "tell me how you'd fix this"] {
+            assert_eq!(classify_current_request(prompt).intent, RequestIntent::Answer, "{prompt}");
+        }
+        for prompt in [
+            "change the main heading to Welcome",
+            "fix the heading",
+            "rename this button to Save",
+            "add a footer",
+            "remove the old paragraph",
+            "implement that",
+            "make only that change and prepare it for review",
+            "change the main heading to \"Welcome to the AIIDE Sandbox\". make only that change and prepare it for review",
+        ] {
             assert_eq!(classify_current_request(prompt), RequestPlan { scope: RequestScope::Repository, intent: RequestIntent::Edit }, "{prompt}");
         }
-        let previous = "change the main heading to X";
-        let current = "tell me about this project and describe a change you'd make";
-        assert_eq!(classify_current_request(current).intent, RequestIntent::Answer);
-        assert_eq!(classify_current_request(previous).intent, RequestIntent::Edit);
+        let earlier_edit = "change the heading";
+        let current_answer = "actually just tell me what you'd change";
+        assert_eq!(classify_current_request(current_answer).intent, RequestIntent::Answer);
+        assert_eq!(classify_current_request(earlier_edit).intent, RequestIntent::Edit);
+        let earlier_answer = "tell me what you'd change";
+        let current_edit = "okay implement that";
+        assert_eq!(classify_current_request(current_edit).intent, RequestIntent::Edit);
+        assert_eq!(classify_current_request(earlier_answer).intent, RequestIntent::Answer);
     }
 
     #[test]
