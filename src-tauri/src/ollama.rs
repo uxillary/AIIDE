@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, State};
@@ -101,7 +101,7 @@ struct ChatPayloadResponse { model: String, message: ChatMessage, done: bool, do
 #[serde(rename_all = "camelCase")]
 pub struct ChatResponse { model: String, content: String, activity: Vec<Activity>, proposal: Option<PendingProposal> }
 
-const CORE_AGENT_INSTRUCTIONS: &str = "You are Elma, a local-first AI coding companion inside AIIDE. You may inspect the opened project through AIIDE's bounded tools and propose focused replacements to existing text files. You cannot apply changes, write files, execute commands, commit, or push. Inspect every target file with read_file before proposing a change. Preserve its style and avoid unrelated cleanup or whole-file rewrites. For a conversational response, return exactly {\"action\":\"answer\",\"answer\":\"<response>\"}; never put conversational answer text in summary. A propose_change action needs a concise summary and changes containing project-relative path, exact old_text copied from file content without the displayed line-number prefix, and replacement new_text. AIIDE validates and previews it; only the user's Apply button can write it. Never claim a proposal was applied. Questions and reviews may be answered without proposing changes. Never invent files, code, Git state, tool results, or commands. list_files returns exact paths; search_files searches one literal substring. Failed tools do not prove absence. Return exactly one JSON object matching the provided schema.";
+const CORE_AGENT_INSTRUCTIONS: &str = "You are Elma, a local-first AI coding companion inside AIIDE. You may inspect the opened project through AIIDE's bounded tools and propose focused replacements to existing text files. You cannot apply changes, write files, execute commands, commit, or push. Inspect every target file with read_file before proposing a change. Preserve its style and avoid unrelated cleanup or whole-file rewrites. For a conversational response, return exactly {\"action\":\"answer\",\"answer\":\"<response>\"}; never put conversational answer text in summary. list_files.path is a project-relative directory, never a glob: use path=\"\" for the project root, then copy exact returned paths into read_file. A propose_change action needs a concise summary and changes containing project-relative path, exact old_text copied from file content without the displayed line-number prefix, and replacement new_text. AIIDE validates and previews it; only the user's Apply button can write it. Never claim a proposal was applied. Questions and reviews may be answered without proposing changes. Never invent files, code, Git state, tool results, or commands. search_files searches one literal substring. Failed tools do not prove absence. Return exactly one JSON object matching the provided schema.";
 
 const DEFAULT_PERSONALITY: &str = "Elma is calm, clever, trustworthy, and down-to-earth, with a cute exterior and a dry sense of humour. Sound moderately casual and task-focused. Occasional mild sarcasm, playful comments, and natural emoji are welcome when they do not obscure technical facts or errors. Lightly mirror the user's casual language without forcing slang or caricature. Be concise by default: give the shortest complete answer, usually a few sentences for simple questions. Start with the answer; do not restate the question or add generic introductions, conclusions, or unnecessary headings. Assume normal software-development basics, explain important details briefly, and expand only when useful or requested.";
 
@@ -120,7 +120,7 @@ fn agent_schema(project_open: bool, allow_proposal: bool) -> Value {
         else { json!(["list_files","search_files","read_file","answer"]) };
     json!({"type":"object","properties":{
         "action":{"type":"string","enum":actions,"description":"Choose answer for conversational responses. For action=answer, use the answer field and never summary."},
-        "path":{"type":"string"},"query":{"type":"string"},
+        "path":{"type":"string","description":"For list_files, a project-relative directory such as '' or 'src', never a glob. For read_file, an exact file path returned by list_files."},"query":{"type":"string"},
         "answer":{"type":"string","description":"Required conversational response text when action is answer."},
         "summary":{"type":"string","description":"A concise change summary for propose_change only. Never use this for action=answer."},
         "changes":{"type":"array","maxItems":4,"items":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}}
@@ -204,6 +204,27 @@ async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<Ch
 
 fn action_name(action: &AgentAction) -> &'static str {
     match action { AgentAction::List(_) => "list_files", AgentAction::Search(_) => "search_files", AgentAction::Read(_) => "read_file", AgentAction::Answer(_) => "answer", AgentAction::Propose(_, _) => "propose_change" }
+}
+
+fn tool_key(request: &ToolRequest) -> String { format!("{}|{}|{}", request.tool, request.path, request.query) }
+
+fn useful_tool_result(output: &str) -> bool { !output.starts_with("Error:") && output != "No matches." }
+
+fn execute_cached(root: &std::path::Path, request: &ToolRequest, cache: &mut HashMap<String, (String, Activity)>) -> (String, Activity, bool) {
+    let key = tool_key(request);
+    if let Some((output, activity)) = cache.get(&key) { return (output.clone(), activity.clone(), true); }
+    let (output, activity) = repository::execute(root, request);
+    if useful_tool_result(&output) { cache.insert(key, (output.clone(), activity.clone())); }
+    (output, activity, false)
+}
+
+fn tool_result_message(request: &ToolRequest, useful: bool, output: &str, known_paths: &str, unread: &str) -> String {
+    format!("Tool result for {} ({}):\n{}\n{}{}{}", request.tool, if useful { "success" } else { "no evidence" }, output,
+        if useful && request.tool == "read_file" { "The target file is now inspected. If the original request asks you to implement, fix, add, remove, or otherwise change code, use propose_change with focused exact old_text/new_text now. Otherwise continue inspection or answer. Use exact listed paths." }
+        else if useful { "Continue with another structured tool request or a grounded final answer. Use the actual result above." }
+        else { "This result does not establish that files are absent. Correct the request using the actionable error above, or use list_files with path='' to discover exact project-relative paths." },
+        if !known_paths.is_empty() { format!("\nExact paths from the project listing: {known_paths}") } else { String::new() },
+        if !unread.is_empty() { format!("\nListed files not yet read: {unread}") } else { String::new() })
 }
 
 async fn requires_inspection(client: &reqwest::Client, model: &str, prompt: &str, trace: Option<&Trace>) -> Result<bool, String> {
@@ -348,7 +369,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
     }
     exchange.extend(messages.into_iter().rev().take(12).collect::<Vec<_>>().into_iter().rev());
     let mut activity = Vec::new();
-    let mut seen = HashSet::new();
+    let mut tool_cache: HashMap<String, (String, Activity)> = HashMap::new();
     let mut context_bytes = 0;
     let mut successful_inspections = 0;
     let mut successful_reads = 0;
@@ -422,15 +443,13 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
             AgentAction::Read(path) => ToolRequest { tool: "read_file".into(), path, query: String::new() },
             AgentAction::Answer(_) | AgentAction::Propose(_, _) => unreachable!(),
         };
-        let key = format!("{}|{}|{}", request.tool, request.path, request.query);
-        let repeated = seen.contains(&key);
+        let repeated = tool_cache.contains_key(&tool_key(&request));
         if !repeated {
             if let Some(app) = app { let _ = app.emit("repository-inspection-start", ()); }
         }
         let tool_started = Instant::now();
         debug_log(debug_trace, "tool", format!("{} requested\nPath: {}\nQuery: {}", request.tool, request.path, request.query));
-        let (output, event) = if seen.insert(key) { repository::execute(root.as_deref().unwrap(), &request) }
-            else { ("This tool request was already answered in this turn; use the earlier result.".into(), Activity { label: "Repeated inspection skipped".into() }) };
+        let (output, event, reused) = execute_cached(root.as_deref().unwrap(), &request, &mut tool_cache);
         let remaining = repository::MAX_CONTEXT_BYTES.saturating_sub(context_bytes);
         if remaining == 0 { break; }
         let output = output.chars().scan(0_usize, |used, character| {
@@ -439,7 +458,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
         }).collect::<String>();
         context_bytes += output.len();
         if repeated { consecutive_repeats += 1; } else { consecutive_repeats = 0; }
-        let useful = !output.starts_with("Error:") && output != "No matches." && event.label != "Repeated inspection skipped";
+        let useful = useful_tool_result(&output);
         if request.tool == "list_files" && useful && (request.path.is_empty() || request.path == ".") {
             known_paths = output.lines().take(120).map(|line| line.split(" (").next().unwrap_or(line)).collect::<Vec<_>>().join(", ");
             known_file_paths = output.lines().filter_map(|line| line.strip_suffix(" (file)").filter(|path| !std::path::Path::new(path).file_name().is_some_and(|name| name.to_string_lossy().starts_with('.'))).map(str::to_owned)).collect();
@@ -450,17 +469,12 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
             evidence.push((format!("{} {}", request.tool, request.path), output.clone()));
             unresolved_failure = false;
         } else { unresolved_failure = true; }
-        debug_log(debug_trace, "tool", format!("{}\nValidation/execution: {}\nReturned: {} bytes\nDuration: {}ms\nNext stage: agent turn", request.tool, if output.starts_with("Error:") { &output } else { "passed" }, output.len(), tool_started.elapsed().as_millis()));
+        debug_log(debug_trace, "tool", format!("{}\nValidation/execution: {}\nCache: {}\nReturned: {} bytes\nDuration: {}ms\nNext stage: agent turn", request.tool, if output.starts_with("Error:") { &output } else { "passed" }, if reused { "reused successful result" } else { "executed" }, output.len(), tool_started.elapsed().as_millis()));
         if let Some(app) = app { let _ = app.emit("repository-activity", &event); }
         activity.push(event);
         exchange.push(result.message);
         let unread = known_file_paths.iter().filter(|path| !read_paths.contains(path)).cloned().collect::<Vec<_>>().join(", ");
-        exchange.push(ChatMessage { role: "user".into(), content: format!("Tool result for {} ({}):\n{}\n{}{}{}", request.tool, if useful { "success" } else { "no evidence" }, output,
-            if useful && request.tool == "read_file" { "The target file is now inspected. If the original request asks you to implement, fix, add, remove, or otherwise change code, use propose_change with focused exact old_text/new_text now. Otherwise continue inspection or answer. Use exact listed paths." }
-            else if useful { "Continue with another structured tool request or a grounded final answer. Use exact listed paths." }
-            else { "This result does not establish that files are absent. Try list_files or another exact project-relative path before answering. If this request was repeated, choose an unread listed file." },
-            if !known_paths.is_empty() { format!("\nExact paths from the project listing: {known_paths}") } else { String::new() },
-            if !unread.is_empty() { format!("\nListed files not yet read: {unread}") } else { String::new() }) });
+        exchange.push(ChatMessage { role: "user".into(), content: tool_result_message(&request, useful, &output, &known_paths, &unread) });
         if consecutive_repeats >= 2 { break; }
     }
     if !read_paths.is_empty() {
@@ -542,6 +556,44 @@ mod tests {
     }
 
     #[test]
+    fn tool_results_are_delivered_and_only_successes_are_cached() {
+        let root = std::env::temp_dir().join(format!("aiide-tool-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("styles.css"), "body { color: red; }").unwrap();
+        let root = root.canonicalize().unwrap();
+        let mut cache = HashMap::new();
+
+        let missing = ToolRequest { tool: "list_files".into(), path: "src".into(), query: String::new() };
+        let (failed, _, reused) = execute_cached(&root, &missing, &mut cache);
+        assert!(failed.starts_with("Error:"));
+        assert!(!reused);
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.css"), "main {}").unwrap();
+        let (recovered, _, reused) = execute_cached(&root, &missing, &mut cache);
+        assert!(recovered.contains("src/app.css"));
+        assert!(!reused, "failed calls must not be cached");
+        let (cached, _, reused) = execute_cached(&root, &missing, &mut cache);
+        assert!(reused);
+        assert_eq!(cached, recovered);
+
+        for request in [
+            ToolRequest { tool: "list_files".into(), path: String::new(), query: String::new() },
+            ToolRequest { tool: "read_file".into(), path: "styles.css".into(), query: String::new() },
+            ToolRequest { tool: "search_files".into(), path: String::new(), query: "color: red".into() },
+        ] {
+            let (output, _, _) = execute_cached(&root, &request, &mut cache);
+            assert!(useful_tool_result(&output));
+            let delivered = tool_result_message(&request, true, &output, "", "");
+            assert!(delivered.contains(&output), "actual bounded result must reach the next turn");
+            assert!(delivered.contains("(success)"));
+        }
+        let unsupported = tool_result_message(&missing, false, "Error: missing", "", "");
+        assert!(unsupported.contains("(no evidence)"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_invalid_actions() {
         for raw in [
             "not json",
@@ -576,6 +628,7 @@ mod tests {
             "Review this website as a front-end developer. Identify 3-5 meaningful UX, accessibility or code-quality improvements. Do not modify anything. Tell me which files you inspected.",
             "Why doesn't the navigation work on mobile?",
             "what is a javascript closure",
+            "have a look at the css and tell me the one thing you'd improve first",
         ];
         for (index, prompt) in prompts.iter().enumerate() {
             if let Ok(selected) = std::env::var("AIIDE_ACCEPTANCE_CASE") {
@@ -590,13 +643,14 @@ mod tests {
             println!("{}", debug_trace.lock().unwrap().lines.join("\n\n"));
             println!("case {} activity: {:?}; answer: {}", index + 1,
                 response.activity.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(), response.content);
-            if index < 3 { assert!(!response.activity.is_empty(), "case {} did not inspect the repository", index + 1); }
+            if index != 3 { assert!(!response.activity.is_empty(), "case {} did not inspect the repository", index + 1); }
             else { assert!(response.activity.is_empty(), "general question unnecessarily inspected repository"); }
             if index == 1 || index == 2 {
                 for path in ["src/index.html", "styles.css", "script.js"] {
                     assert!(response.activity.iter().any(|item| item.label == format!("Read: {path}")), "case {} did not read {path}", index + 1);
                 }
             }
+            if index == 4 { assert!(response.activity.iter().any(|item| item.label == "Read: styles.css"), "CSS review did not read styles.css"); }
             assert!(!response.content.contains("inspection limit"));
         }
     }

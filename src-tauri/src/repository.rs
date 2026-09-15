@@ -67,7 +67,7 @@ pub struct ToolRequest {
     #[serde(default)] pub query: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Activity { pub label: String }
 
 fn protected(path: &Path) -> bool {
@@ -187,6 +187,9 @@ pub fn execute(root: &Path, request: &ToolRequest) -> (String, Activity) {
 }
 
 fn list_files(root: &Path, path: &str) -> Result<String, String> {
+    if path.contains('*') || path.contains('?') {
+        return Err("list_files expects a project-relative directory, not a glob. Use path='' to list the project root, then use an exact returned path.".into());
+    }
     let folder = if path.is_empty() || path == "." { root.to_path_buf() } else { resolve(root, path)? };
     if !folder.is_dir() { return Err("Path is not a directory.".into()); }
     let mut lines = Vec::new();
@@ -292,6 +295,19 @@ mod tests {
         assert!(search_files(&root, "*.html *.css").unwrap_err().contains("globs"));
         for index in 0..MAX_LIST + 5 { fs::write(root.join(format!("{index}.txt")), "x").unwrap(); }
         assert!(list_files(&root, "").unwrap().contains("Listing truncated"));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn list_files_accepts_directories_and_rejects_globs() {
+        let root = fixture();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/site.css"), "body {}").unwrap();
+        assert!(list_files(&root, "").unwrap().contains("src/site.css (file)"));
+        assert!(list_files(&root, "src").unwrap().contains("src/site.css (file)"));
+        for glob in ["*.css", "**/*.css", "src/**/*.tsx"] {
+            let error = list_files(&root, glob).unwrap_err();
+            assert!(error.contains("directory, not a glob"));
+            assert!(error.contains("path=''"));
+        }
         fs::remove_dir_all(root).unwrap();
     }
     fn edit(path: &str, old_text: &str, new_text: &str) -> ProposedReplacement {
