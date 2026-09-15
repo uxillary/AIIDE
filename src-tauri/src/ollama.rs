@@ -9,6 +9,8 @@ use crate::repository::{self, Activity, PendingChanges, PendingProposal, Propose
 const BASE: &str = "http://127.0.0.1:11434";
 const MAX_MESSAGES: usize = 40;
 const MAX_MESSAGE_CHARS: usize = 12_000;
+const PROTOCOL_TEMPERATURE: f32 = 0.0;
+const CONVERSATIONAL_TEMPERATURE: f32 = 0.2;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,7 +51,9 @@ struct ChatPayloadResponse { model: String, message: ChatMessage, done: bool, do
 #[serde(rename_all = "camelCase")]
 pub struct ChatResponse { model: String, content: String, activity: Vec<Activity>, proposal: Option<PendingProposal> }
 
-const SYSTEM: &str = "You are Elma, a local-first AI coding companion inside AIIDE. You may inspect the opened project through AIIDE's bounded tools and propose focused replacements to existing text files. You cannot apply changes, write files, execute commands, commit, or push. Inspect every target file with read_file before proposing a change. Preserve its style and avoid unrelated cleanup or whole-file rewrites. A propose_change action needs a concise summary and changes containing project-relative path, exact old_text copied from file content without the displayed line-number prefix, and replacement new_text. AIIDE validates and previews it; only the user's Apply button can write it. Never claim a proposal was applied. Questions and reviews may be answered without proposing changes. Never invent files, code, Git state, tool results, or commands. list_files returns exact paths; search_files searches one literal substring. Failed tools do not prove absence. Be concise by default. Give the shortest answer that fully addresses the request. Do not restate the user's request or add generic introductions or conclusions. Expand when asked for detail. Return exactly one JSON object matching the provided schema.";
+const CORE_AGENT_INSTRUCTIONS: &str = "You are Elma, a local-first AI coding companion inside AIIDE. You may inspect the opened project through AIIDE's bounded tools and propose focused replacements to existing text files. You cannot apply changes, write files, execute commands, commit, or push. Inspect every target file with read_file before proposing a change. Preserve its style and avoid unrelated cleanup or whole-file rewrites. A propose_change action needs a concise summary and changes containing project-relative path, exact old_text copied from file content without the displayed line-number prefix, and replacement new_text. AIIDE validates and previews it; only the user's Apply button can write it. Never claim a proposal was applied. Questions and reviews may be answered without proposing changes. Never invent files, code, Git state, tool results, or commands. list_files returns exact paths; search_files searches one literal substring. Failed tools do not prove absence. Return exactly one JSON object matching the provided schema.";
+
+const DEFAULT_PERSONALITY: &str = "Elma is calm, clever, trustworthy, and down-to-earth, with a cute exterior and a dry sense of humour. Sound moderately casual and task-focused. Occasional mild sarcasm, playful comments, and natural emoji are welcome when they do not obscure technical facts or errors. Lightly mirror the user's casual language without forcing slang or caricature. Be concise by default: give the shortest complete answer, usually a few sentences for simple questions. Start with the answer; do not restate the question or add generic introductions, conclusions, or unnecessary headings. Assume normal software-development basics, explain important details briefly, and expand only when useful or requested.";
 
 const MAX_REPAIRS: usize = 2;
 
@@ -104,9 +108,9 @@ fn trace(message: &str) {
     let _ = message;
 }
 
-async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessage], format: Value) -> Result<ChatPayloadResponse, String> {
+async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessage], format: Value, temperature: f32) -> Result<ChatPayloadResponse, String> {
     let response = client.post(format!("{BASE}/api/chat"))
-        .json(&ChatPayload { model, messages, stream: false, format, options: ChatOptions { temperature: 0.0, num_predict: 2_048 } })
+        .json(&ChatPayload { model, messages, stream: false, format, options: ChatOptions { temperature, num_predict: 2_048 } })
         .send().await.map_err(request_error)?;
     if !response.status().is_success() { return Err("Ollama could not complete the chat request. Try again.".into()); }
     let result = response.json::<ChatPayloadResponse>().await.map_err(|_| "Ollama returned an invalid chat response.".to_owned())?;
@@ -117,7 +121,7 @@ async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessag
 
 async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<ChatMessage>, allow_proposal: bool, app: Option<&tauri::AppHandle>) -> Result<(ChatPayloadResponse, AgentAction), String> {
     for attempt in 0..=MAX_REPAIRS {
-        let result = chat_turn(client, model, exchange, agent_schema(allow_proposal)).await?;
+        let result = chat_turn(client, model, exchange, agent_schema(allow_proposal), PROTOCOL_TEMPERATURE).await?;
         trace(&format!("raw model response: {}", result.message.content.chars().take(2_000).collect::<String>()));
         let parsed = if result.done_reason.as_deref() == Some("length") { Err("response exceeded the model output limit") }
             else { parse_action(&result.message.content) };
@@ -144,7 +148,7 @@ async fn requires_inspection(client: &reqwest::Client, model: &str, prompt: &str
         ChatMessage { role: "user".into(), content: prompt.into() },
     ];
     for attempt in 0..=MAX_REPAIRS {
-        let result = chat_turn(client, model, &messages, scope_schema()).await?;
+        let result = chat_turn(client, model, &messages, scope_schema(), PROTOCOL_TEMPERATURE).await?;
         if let Some(needed) = parse_scope(&result.message.content) { return Ok(needed); }
         trace(&format!("scope parse failure; repair attempt {attempt}"));
         if attempt == MAX_REPAIRS { break; }
@@ -164,18 +168,35 @@ fn parse_scope(raw: &str) -> Option<bool> {
 async fn final_turn(client: &reqwest::Client, model: &str, prompt: &str, project_info: &str, evidence: &[(String, String)], read_paths: &[String]) -> Result<String, String> {
     let mut exchange = vec![
         ChatMessage { role: "system".into(), content: format!("You are Elma inside AIIDE. {project_info} Answer the user's original question using only the repository evidence below. Do not respond to a prior tool search or infer missing files from a failed tool. Do not invent filenames: HTML sections are not separate files. Do not list inspected filenames in your answer; the application appends the verified list. No more tools are available. Keep the answer under 120 words and address every part of the user's request. Avoid quoted code snippets or HTML attributes. Return only a JSON object with action answer and answer text.") },
+        ChatMessage { role: "system".into(), content: DEFAULT_PERSONALITY.into() },
         ChatMessage { role: "user".into(), content: format!("Files actually read: {}\n\nRepository evidence:\n{}\n\nOriginal user request: {prompt}\n\nAnswer this original request directly, using the evidence above. If it asks for a review, give exactly three concrete improvements. For each, say what to change, which of the actual files would be affected, and why. Avoid speculative claims, generic advice, invented files, code snippets, and unverified accessibility findings. The app separately reports inspected files.", read_paths.join(", "), evidence.iter().map(|(name, value)| format!("[{name}]\n{value}")).collect::<Vec<_>>().join("\n\n")) },
     ];
     for attempt in 0..=MAX_REPAIRS {
-        let result = chat_turn(client, model, &exchange, answer_schema()).await?;
+        let result = chat_turn(client, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE).await?;
         trace(&format!("final raw model response: {}", result.message.content.chars().take(2_000).collect::<String>()));
         if result.done_reason.as_deref() != Some("length") {
             if let Ok(AgentAction::Answer(answer)) = parse_action(&result.message.content) { return Ok(answer); }
         }
         if attempt == MAX_REPAIRS { break; }
-        exchange[1].content.push_str("\n\nYour previous response was invalid or too long. Answer the ORIGINAL REQUEST above in at most 90 words. For a review, give three short numbered improvements with actual affected files and reasons. Return only the JSON answer object.");
+        exchange.last_mut().unwrap().content.push_str("\n\nYour previous response was invalid or too long. Answer the ORIGINAL REQUEST above in at most 90 words. For a review, give three short numbered improvements with actual affected files and reasons. Return only the JSON answer object.");
     }
     Err("The local model could not produce a final structured answer after two retries.".into())
+}
+
+async fn conversational_turn(client: &reqwest::Client, model: &str, prompt: &str, draft: &str) -> Result<String, String> {
+    let mut exchange = vec![
+        ChatMessage { role: "system".into(), content: format!("You are Elma inside AIIDE. {DEFAULT_PERSONALITY} Preserve the draft's factual meaning. Return only a JSON object with action answer and answer text.") },
+        ChatMessage { role: "user".into(), content: format!("Original question: {prompt}\n\nDraft answer: {draft}\n\nGive the shortest complete answer in Elma's natural voice. Do not add facts that are absent from the draft.") },
+    ];
+    for attempt in 0..=MAX_REPAIRS {
+        let result = chat_turn(client, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE).await?;
+        if result.done_reason.as_deref() != Some("length") {
+            if let Ok(AgentAction::Answer(answer)) = parse_action(&result.message.content) { return Ok(answer); }
+        }
+        if attempt == MAX_REPAIRS { break; }
+        exchange.last_mut().unwrap().content.push_str("\n\nReturn one valid JSON answer object in at most 80 words.");
+    }
+    Err("The local model could not produce a concise conversational answer after two retries.".into())
 }
 
 fn client(timeout: Duration) -> Result<reqwest::Client, String> {
@@ -234,7 +255,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
         return Ok(ChatResponse { model, content: if root.is_some() { "I can inspect this project and prepare focused changes for your review. Only the Apply button can write them." } else { "No project is open, so I cannot inspect or propose changes to files." }.into(), activity: vec![], proposal: None });
     }
     let mut exchange = Vec::new();
-    exchange.push(ChatMessage { role: "system".into(), content: SYSTEM.into() });
+    exchange.push(ChatMessage { role: "system".into(), content: CORE_AGENT_INSTRUCTIONS.into() });
     if let Some(ref root) = root {
         let info = super::project::inspect_metadata(root);
         exchange.push(ChatMessage { role: "system".into(), content: info });
@@ -269,7 +290,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
             if let Some(pending) = pending {
                 *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone());
             }
-            return Ok(ChatResponse { model: result.model, content: "A focused change is ready for review in the Changes panel.".into(), activity, proposal: Some(proposal) });
+            return Ok(ChatResponse { model: result.model, content: "Done — have a wee look in Changes 👀".into(), activity, proposal: Some(proposal) });
         }
         if let AgentAction::Answer(answer) = action {
             if root.is_some() && successful_reads == 0 {
@@ -306,7 +327,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
                 let info = root.as_ref().map(|path| super::project::inspect_metadata(path)).unwrap_or_default();
                 let answer = final_turn(&client, &model, &last_prompt, &info, &evidence, &read_paths).await?;
                 format!("{answer}\n\nFiles actually inspected: {}", read_paths.join(", "))
-            } else { answer };
+            } else { conversational_turn(&client, &model, &last_prompt, &answer).await? };
             return Ok(ChatResponse { model: result.model, content, activity, proposal: None });
         }
         if root.is_none() { return Ok(ChatResponse { model: result.model, content: "Open a project to use repository tools.".into(), activity, proposal: None }); }
@@ -369,6 +390,17 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn personality_is_separate_from_protocol_defaults() {
+        assert!(CORE_AGENT_INSTRUCTIONS.contains("cannot apply changes"));
+        assert!(CORE_AGENT_INSTRUCTIONS.contains("exact old_text"));
+        assert!(DEFAULT_PERSONALITY.contains("concise by default"));
+        assert!(DEFAULT_PERSONALITY.contains("dry sense of humour"));
+        assert!(!DEFAULT_PERSONALITY.contains("propose_change"));
+        assert_eq!(PROTOCOL_TEMPERATURE, 0.0);
+        assert_eq!(CONVERSATIONAL_TEMPERATURE, 0.2);
+    }
 
     #[test]
     fn valid_actions() {
