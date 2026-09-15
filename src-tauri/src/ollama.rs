@@ -101,7 +101,7 @@ struct ChatPayloadResponse { model: String, message: ChatMessage, done: bool, do
 #[serde(rename_all = "camelCase")]
 pub struct ChatResponse { model: String, content: String, activity: Vec<Activity>, proposal: Option<PendingProposal> }
 
-const CORE_AGENT_INSTRUCTIONS: &str = "You are Elma, a local-first AI coding companion inside AIIDE. You may inspect the opened project through AIIDE's bounded tools and propose focused replacements to existing text files. You cannot apply changes, write files, execute commands, commit, or push. Inspect every target file with read_file before proposing a change. Preserve its style and avoid unrelated cleanup or whole-file rewrites. A propose_change action needs a concise summary and changes containing project-relative path, exact old_text copied from file content without the displayed line-number prefix, and replacement new_text. AIIDE validates and previews it; only the user's Apply button can write it. Never claim a proposal was applied. Questions and reviews may be answered without proposing changes. Never invent files, code, Git state, tool results, or commands. list_files returns exact paths; search_files searches one literal substring. Failed tools do not prove absence. Return exactly one JSON object matching the provided schema.";
+const CORE_AGENT_INSTRUCTIONS: &str = "You are Elma, a local-first AI coding companion inside AIIDE. You may inspect the opened project through AIIDE's bounded tools and propose focused replacements to existing text files. You cannot apply changes, write files, execute commands, commit, or push. Inspect every target file with read_file before proposing a change. Preserve its style and avoid unrelated cleanup or whole-file rewrites. For a conversational response, return exactly {\"action\":\"answer\",\"answer\":\"<response>\"}; never put conversational answer text in summary. A propose_change action needs a concise summary and changes containing project-relative path, exact old_text copied from file content without the displayed line-number prefix, and replacement new_text. AIIDE validates and previews it; only the user's Apply button can write it. Never claim a proposal was applied. Questions and reviews may be answered without proposing changes. Never invent files, code, Git state, tool results, or commands. list_files returns exact paths; search_files searches one literal substring. Failed tools do not prove absence. Return exactly one JSON object matching the provided schema.";
 
 const DEFAULT_PERSONALITY: &str = "Elma is calm, clever, trustworthy, and down-to-earth, with a cute exterior and a dry sense of humour. Sound moderately casual and task-focused. Occasional mild sarcasm, playful comments, and natural emoji are welcome when they do not obscure technical facts or errors. Lightly mirror the user's casual language without forcing slang or caricature. Be concise by default: give the shortest complete answer, usually a few sentences for simple questions. Start with the answer; do not restate the question or add generic introductions, conclusions, or unnecessary headings. Assume normal software-development basics, explain important details briefly, and expand only when useful or requested.";
 
@@ -114,12 +114,15 @@ struct AgentReply { action: String, path: Option<String>, query: Option<String>,
 #[derive(Debug, PartialEq)]
 enum AgentAction { List(String), Search(String), Read(String), Answer(String), Propose(String, Vec<ProposedReplacement>) }
 
-fn agent_schema(allow_proposal: bool) -> Value {
-    let actions = if allow_proposal { json!(["list_files","search_files","read_file","answer","propose_change"]) }
+fn agent_schema(project_open: bool, allow_proposal: bool) -> Value {
+    let actions = if !project_open { json!(["answer"]) }
+        else if allow_proposal { json!(["list_files","search_files","read_file","answer","propose_change"]) }
         else { json!(["list_files","search_files","read_file","answer"]) };
     json!({"type":"object","properties":{
-        "action":{"type":"string","enum":actions},
-        "path":{"type":"string"},"query":{"type":"string"},"answer":{"type":"string"},"summary":{"type":"string"},
+        "action":{"type":"string","enum":actions,"description":"Choose answer for conversational responses. For action=answer, use the answer field and never summary."},
+        "path":{"type":"string"},"query":{"type":"string"},
+        "answer":{"type":"string","description":"Required conversational response text when action is answer."},
+        "summary":{"type":"string","description":"A concise change summary for propose_change only. Never use this for action=answer."},
         "changes":{"type":"array","maxItems":4,"items":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}}
     },"required":["action"],"additionalProperties":false})
 }
@@ -144,7 +147,7 @@ fn parse_action(raw: &str) -> Result<AgentAction, &'static str> {
         "read_file" if reply.answer.is_none() && reply.query.is_none() && reply.summary.is_none() && reply.changes.is_none() && reply.path.as_ref().is_some_and(|path| !path.trim().is_empty()) => Ok(AgentAction::Read(reply.path.unwrap())),
         "read_file" => Err("read_file requires a nonempty path and no query or answer"),
         "answer" if reply.path.is_none() && reply.query.is_none() && reply.summary.is_none() && reply.changes.is_none() && reply.answer.as_ref().is_some_and(|answer| !answer.trim().is_empty()) => Ok(AgentAction::Answer(reply.answer.unwrap())),
-        "answer" => Err("answer requires nonempty answer text and no path or query"),
+        "answer" => Err("For action='answer', put the response text in the 'answer' field. Do not put it in 'summary', path, query, or changes."),
         "propose_change" if reply.path.is_none() && reply.query.is_none() && reply.answer.is_none() && reply.summary.as_ref().is_some_and(|value| !value.trim().is_empty()) && reply.changes.as_ref().is_some_and(|value| !value.is_empty()) => Ok(AgentAction::Propose(reply.summary.unwrap(), reply.changes.unwrap())),
         "propose_change" => Err("propose_change requires summary and one or more exact changes"),
         _ => Err("invalid or ambiguous action fields"),
@@ -171,10 +174,10 @@ async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessag
     Ok(result)
 }
 
-async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<ChatMessage>, allow_proposal: bool, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<(ChatPayloadResponse, AgentAction), String> {
+async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<ChatMessage>, project_open: bool, allow_proposal: bool, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<(ChatPayloadResponse, AgentAction), String> {
     for attempt in 0..=MAX_REPAIRS {
         let stage = if attempt == 0 { "STRUCTURED".to_owned() } else { format!("REPAIR {attempt}/{MAX_REPAIRS}") };
-        let result = chat_turn(client, model, exchange, agent_schema(allow_proposal), PROTOCOL_TEMPERATURE, &stage, trace).await?;
+        let result = chat_turn(client, model, exchange, agent_schema(project_open, allow_proposal), PROTOCOL_TEMPERATURE, &stage, trace).await?;
         let parsed = if result.done_reason.as_deref() == Some("length") { Err("response exceeded the model output limit") }
             else { parse_action(&result.message.content) };
         match parsed {
@@ -358,7 +361,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
     let mut needs_inspection: Option<bool> = None;
     let mut inspection_reminders = 0;
     for iteration in 0..=repository::MAX_TOOL_CALLS {
-        let (result, action) = agent_turn(&client, &model, &mut exchange, successful_reads > 0, app, debug_trace).await?;
+        let (result, action) = agent_turn(&client, &model, &mut exchange, root.is_some(), successful_reads > 0, app, debug_trace).await?;
         if let AgentAction::Propose(summary, edits) = action {
             let root = root.as_ref().ok_or_else(|| "Open a project before proposing changes.".to_owned())?;
             if edits.iter().any(|edit| !read_paths.contains(&edit.path)) {
@@ -520,6 +523,25 @@ mod tests {
     }
 
     #[test]
+    fn answer_field_contract_and_repair_are_explicit() {
+        assert_eq!(parse_action(r#"{"action":"answer","answer":"A closure retains lexical scope."}"#), Ok(AgentAction::Answer("A closure retains lexical scope.".into())));
+        let error = parse_action(r#"{"action":"answer","summary":"Wrong field."}"#).unwrap_err();
+        assert!(error.contains("put the response text in the 'answer' field"));
+        assert!(error.contains("Do not put it in 'summary'"));
+        let schema = agent_schema(false, false);
+        assert!(schema["properties"]["answer"]["description"].as_str().unwrap().contains("Required conversational response"));
+        assert!(schema["properties"]["summary"]["description"].as_str().unwrap().contains("Never use this for action=answer"));
+    }
+
+    #[test]
+    fn agent_action_availability_matches_project_and_inspection_state() {
+        let actions = |project_open, allow_proposal| agent_schema(project_open, allow_proposal)["properties"]["action"]["enum"].as_array().unwrap().iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(actions(false, false), vec!["answer"]);
+        assert!(!actions(true, false).contains(&"propose_change".to_owned()));
+        assert!(actions(true, true).contains(&"propose_change".to_owned()));
+    }
+
+    #[test]
     fn rejects_invalid_actions() {
         for raw in [
             "not json",
@@ -553,17 +575,19 @@ mod tests {
             "What files are in this project and what does the project appear to be?",
             "Review this website as a front-end developer. Identify 3-5 meaningful UX, accessibility or code-quality improvements. Do not modify anything. Tell me which files you inspected.",
             "Why doesn't the navigation work on mobile?",
-            "What is a JavaScript closure?",
+            "what is a javascript closure",
         ];
         for (index, prompt) in prompts.iter().enumerate() {
             if let Ok(selected) = std::env::var("AIIDE_ACCEPTANCE_CASE") {
                 if selected != (index + 1).to_string() { continue; }
             }
+            let debug_trace = Arc::new(Mutex::new(TraceBuffer::default()));
             let response = tauri::async_runtime::block_on(run_agent(
                 "qwen2.5-coder:7b".into(),
                 vec![ChatMessage { role: "user".into(), content: (*prompt).into() }],
-                Some(root.clone()), None, None, None,
+                Some(root.clone()), None, None, Some(&debug_trace),
             )).expect("agent request should complete");
+            println!("{}", debug_trace.lock().unwrap().lines.join("\n\n"));
             println!("case {} activity: {:?}; answer: {}", index + 1,
                 response.activity.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(), response.content);
             if index < 3 { assert!(!response.activity.is_empty(), "case {} did not inspect the repository", index + 1); }
