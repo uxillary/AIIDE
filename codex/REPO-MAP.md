@@ -6,6 +6,7 @@ Use this map to choose a starting point, then read only the files relevant to th
 | --- | --- | --- |
 | Chat layout, composer, activity | `src/components/LocalChat.tsx`, `src/styles.css` | `src/services/ai/`, `src/types/ai.ts` for data contracts |
 | Ollama connection, model output, agent protocol/retries | `src-tauri/src/ollama.rs` (focused tests are in this module) | `src-tauri/src/repository.rs` for tool results or limits; AI service/types for UI contract |
+| Elma conversational behaviour, personality tuning, model integration or personality benchmarks | `codex/PERSONALITY.md` (canonical personality specification) | `src-tauri/src/ollama.rs` for the current runtime prompt and rewrite boundary |
 | Repository listing, search, reads, path safety | `src-tauri/src/repository.rs` (focused tests are in this module) | `ollama.rs` only for orchestration |
 | Open folder, Git branch/status, project metadata | `src-tauri/src/project.rs` | `src/services/project.ts`, `src/types/project.ts`, `src/components/ProjectSidebar.tsx`, `src/components/FileTree.tsx` for presentation |
 | Tauri command wiring/permissions | `src-tauri/src/lib.rs`, relevant command module | `src-tauri/capabilities/default.json`, `src-tauri/tauri.conf.json` when permissions/config matter |
