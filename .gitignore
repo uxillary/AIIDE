@@ -19,3 +19,4 @@ Desktop.ini
 !.env.example
 *.local
 package-lock.json
+docs/openrouterai.txt
