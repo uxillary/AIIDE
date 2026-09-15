@@ -5,12 +5,12 @@ export function ProjectSidebar({ project, onOpen, busy }: { project: ProjectInfo
   return <aside className="sidebar">
     <div className="sidebar-heading"><span>PROJECT</span><button className="small-button" onClick={onOpen} disabled={busy} title="Open another project"><span aria-hidden="true">▣</span> Open folder</button></div>
     {project ? <>
-      <div className="border-b border-stone-800 px-4 pb-4 pt-3">
-        <h2 className="truncate text-sm font-semibold text-stone-100" title={project.name}>{project.name}</h2>
-        <p className="mt-1 break-all text-xs leading-5 text-stone-500" title={project.path}>{project.path}</p>
-        <div className="mt-4 space-y-2 text-xs"><div className="flex justify-between gap-2"><span className="text-stone-500">Repository</span><span className="truncate text-stone-300" title={project.repository?.name}>{project.repository?.name ?? 'No Git repository'}</span></div>{project.repository && <><div className="flex justify-between gap-2"><span className="text-stone-500">Branch</span><span className="truncate font-mono text-stone-300" title={project.repository.branch}>{project.repository.branch}</span></div><div className="flex justify-between gap-2"><span className="text-stone-500">Status</span><span className={project.repository.changedFiles ? 'text-amber-400' : 'text-emerald-400'}>{project.repository.changedFiles ? `${project.repository.changedFiles} changed ${project.repository.changedFiles === 1 ? 'file' : 'files'}` : 'Clean'}</span></div></>}</div>
+      <div className="project-card">
+        <h2 title={project.name}>{project.name}</h2>
+        <p title={project.path}>{project.path}</p>
+        <div className="project-meta"><div><span>Repository</span><strong title={project.repository?.name}>{project.repository?.name ?? 'No Git repository'}</strong></div>{project.repository && <><div><span>Branch</span><strong title={project.repository.branch}>{project.repository.branch}</strong></div><div><span>Status</span><strong className={project.repository.changedFiles ? 'status-warn' : 'status-clean'}>{project.repository.changedFiles ? `${project.repository.changedFiles} changed ${project.repository.changedFiles === 1 ? 'file' : 'files'}` : 'Clean'}</strong></div></>}</div>
       </div>
-      <div className="px-4 pb-2 pt-4 text-[11px] font-semibold tracking-[0.14em] text-stone-500">FILES</div>
+      <div className="files-heading">FILES</div>
       <FileTree entries={project.tree} truncated={project.treeTruncated} />
     </> : <div className="sidebar-empty"><span className="empty-icon" aria-hidden="true">▣</span><p>Your files and Git status will appear here.</p></div>}
   </aside>
