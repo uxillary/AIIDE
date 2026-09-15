@@ -51,15 +51,15 @@ pub(crate) enum ProviderErrorKind {
 #[derive(Debug)]
 pub(crate) struct ProviderFailure {
     pub kind: ProviderErrorKind,
-    message: &'static str,
+    message: String,
 }
 
 impl ProviderFailure {
-    pub(crate) fn new(kind: ProviderErrorKind, message: &'static str) -> Self { Self { kind, message } }
+    pub(crate) fn new(kind: ProviderErrorKind, message: impl Into<String>) -> Self { Self { kind, message: message.into() } }
 }
 
 impl fmt::Display for ProviderFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(self.message) }
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str(&self.message) }
 }
 
 pub(crate) trait ModelProvider {
@@ -231,8 +231,15 @@ struct OpenRouterResponse {
 
 #[derive(Deserialize)]
 struct OpenRouterChoice {
-    message: ModelMessage,
+    message: OpenRouterMessage,
     finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OpenRouterMessage {
+    role: String,
+    #[serde(default)]
+    content: Value,
 }
 
 #[derive(Deserialize)]
@@ -264,26 +271,83 @@ fn openrouter_response_format(schema: Value) -> Value {
     })
 }
 
-fn normalize_openrouter_response(result: OpenRouterResponse) -> Result<InferenceResponse, ProviderFailure> {
+fn json_type(value: Option<&Value>) -> &'static str {
+    match value {
+        None => "absent",
+        Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "boolean",
+        Some(Value::Number(_)) => "number",
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Object(_)) => "object",
+    }
+}
+
+fn openrouter_structure(status: u16, body: &Value) -> String {
+    let choices = body.get("choices");
+    let choice = choices.and_then(Value::as_array).and_then(|values| values.first());
+    let message = choice.and_then(|value| value.get("message"));
+    let finish_reason = match choice.and_then(|value| value.get("finish_reason")) {
+        None => "absent",
+        Some(Value::Null) => "null",
+        Some(Value::String(value)) if matches!(value.as_str(), "stop" | "length" | "tool_calls" | "content_filter" | "error") => value,
+        Some(Value::String(_)) => "other",
+        Some(_) => "non-string",
+    };
+    format!(
+        "HTTP {status}; body={}; model={}; choices={}; choiceCount={}; finishReason={finish_reason}; message={}; role={}; content={}; reasoning={}; reasoningDetails={}; toolCalls={}; refusal={}",
+        json_type(Some(body)),
+        json_type(body.get("model")),
+        json_type(choices),
+        choices.and_then(Value::as_array).map_or(0, Vec::len),
+        json_type(message),
+        json_type(message.and_then(|value| value.get("role"))),
+        json_type(message.and_then(|value| value.get("content"))),
+        message.is_some_and(|value| value.get("reasoning").is_some()),
+        message.is_some_and(|value| value.get("reasoning_details").is_some()),
+        message.is_some_and(|value| value.get("tool_calls").is_some()),
+        message.is_some_and(|value| value.get("refusal").is_some()),
+    )
+}
+
+fn invalid_openrouter_response(status: u16, body: &Value) -> ProviderFailure {
+    ProviderFailure::new(
+        ProviderErrorKind::MalformedResponse,
+        format!("OpenRouter returned an invalid response ({}).", openrouter_structure(status, body)),
+    )
+}
+
+fn normalize_openrouter_content(content: Value) -> Option<String> {
+    match content {
+        Value::String(value) if !value.is_empty() => Some(value),
+        Value::Array(parts) => {
+            let text = parts.iter().filter_map(|part| {
+                let kind = part.get("type")?.as_str()?;
+                if matches!(kind, "text" | "output_text") { part.get("text")?.as_str() } else { None }
+            }).collect::<String>();
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn normalize_openrouter_response(status: u16, body: Value) -> Result<InferenceResponse, ProviderFailure> {
+    let structure_error = || invalid_openrouter_response(status, &body);
+    let result: OpenRouterResponse = serde_json::from_value(body.clone()).map_err(|_| structure_error())?;
     if let Some(error) = result.error {
         return Err(openrouter_error(error.code, Some(&error.message)));
     }
-    let model = result.model.filter(|value| !value.is_empty()).ok_or_else(|| {
-        ProviderFailure::new(ProviderErrorKind::MalformedResponse, "OpenRouter returned an invalid response.")
-    })?;
-    let mut choices = result.choices.ok_or_else(|| {
-        ProviderFailure::new(ProviderErrorKind::MalformedResponse, "OpenRouter returned an invalid response.")
-    })?;
+    let model = result.model.filter(|value| !value.is_empty()).ok_or_else(&structure_error)?;
+    let mut choices = result.choices.ok_or_else(&structure_error)?;
     if choices.len() != 1 {
-        return Err(ProviderFailure::new(ProviderErrorKind::MalformedResponse, "OpenRouter returned an invalid response."));
+        return Err(structure_error());
     }
     let choice = choices.remove(0);
-    if choice.message.role != "assistant" || choice.message.content.is_empty() {
-        return Err(ProviderFailure::new(ProviderErrorKind::MalformedResponse, "OpenRouter returned an invalid response."));
-    }
+    let content = normalize_openrouter_content(choice.message.content).ok_or_else(&structure_error)?;
+    if choice.message.role != "assistant" { return Err(structure_error()); }
     Ok(InferenceResponse {
         model,
-        message: choice.message,
+        message: ModelMessage { role: choice.message.role, content },
         done: true,
         done_reason: choice.finish_reason,
     })
@@ -323,13 +387,14 @@ impl ModelProvider for OpenRouterProvider {
             .send().await.map_err(|_| ProviderFailure::new(ProviderErrorKind::Transport, "OpenRouter could not be reached. Try again."))?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
-            let result = response.json::<OpenRouterResponse>().await.ok();
-            return Err(openrouter_error(status, result.as_ref().and_then(|value| value.error.as_ref()).map(|error| error.message.as_str())));
+            let result = response.json::<Value>().await.ok();
+            let parsed = result.and_then(|value| serde_json::from_value::<OpenRouterResponse>(value).ok());
+            return Err(openrouter_error(status, parsed.as_ref().and_then(|value| value.error.as_ref()).map(|error| error.message.as_str())));
         }
-        let result = response.json::<OpenRouterResponse>().await.map_err(|_| {
-            ProviderFailure::new(ProviderErrorKind::MalformedResponse, "OpenRouter returned an invalid response.")
+        let result = response.json::<Value>().await.map_err(|_| {
+            ProviderFailure::new(ProviderErrorKind::MalformedResponse, format!("OpenRouter returned an invalid response (HTTP {status}; json=invalid)."))
         })?;
-        normalize_openrouter_response(result)
+        normalize_openrouter_response(status, result)
     }
 }
 
@@ -370,14 +435,13 @@ mod tests {
 
     #[test]
     fn openrouter_response_is_normalized_for_the_agent_protocol() {
-        let response = normalize_openrouter_response(OpenRouterResponse {
-            model: Some("vendor/model:free".into()),
-            choices: Some(vec![OpenRouterChoice {
-                message: ModelMessage { role: "assistant".into(), content: r#"{"action":"answer","answer":"ok"}"#.into() },
-                finish_reason: Some("stop".into()),
-            }]),
-            error: None,
-        }).unwrap();
+        let response = normalize_openrouter_response(200, serde_json::json!({
+            "model": "vendor/model:free",
+            "choices": [{
+                "message": { "role": "assistant", "content": "{\"action\":\"answer\",\"answer\":\"ok\"}" },
+                "finish_reason": "stop"
+            }]
+        })).unwrap();
         assert_eq!(response.model, "vendor/model:free");
         assert_eq!(response.message.content, r#"{"action":"answer","answer":"ok"}"#);
         assert_eq!(response.done_reason.as_deref(), Some("stop"));
@@ -387,6 +451,59 @@ mod tests {
         assert_eq!(format["type"], "json_schema");
         assert_eq!(format["json_schema"]["strict"], false);
         assert_eq!(format["json_schema"]["schema"], schema);
+    }
+
+    #[test]
+    fn openrouter_text_content_arrays_are_normalized_without_bypassing_validation() {
+        let response = normalize_openrouter_response(200, serde_json::json!({
+            "model": "vendor/model",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "{\"action\":\"answer\"," },
+                        { "type": "output_text", "text": "\"answer\":\"ok\"}" }
+                    ],
+                    "reasoning": "not used as answer content",
+                    "reasoning_details": [{ "type": "reasoning.text" }]
+                },
+                "finish_reason": "stop"
+            }]
+        })).unwrap();
+        assert_eq!(response.message.content, r#"{"action":"answer","answer":"ok"}"#);
+    }
+
+    #[test]
+    fn openrouter_invalid_response_diagnostics_are_structural_only() {
+        let private_output = "private model output must not appear";
+        let error = match normalize_openrouter_response(200, serde_json::json!({
+            "model": "vendor/model",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": private_output,
+                    "reasoning_details": [{ "text": private_output }],
+                    "tool_calls": [],
+                    "refusal": private_output
+                },
+                "finish_reason": "length"
+            }]
+        })) {
+            Err(error) => error,
+            Ok(_) => panic!("null content should not be accepted as an agent response"),
+        };
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("HTTP 200"));
+        assert!(diagnostic.contains("choiceCount=1"));
+        assert!(diagnostic.contains("finishReason=length"));
+        assert!(diagnostic.contains("content=null"));
+        assert!(diagnostic.contains("reasoning=true"));
+        assert!(diagnostic.contains("reasoningDetails=true"));
+        assert!(diagnostic.contains("toolCalls=true"));
+        assert!(diagnostic.contains("refusal=true"));
+        assert!(!diagnostic.contains(private_output));
+        assert!(!diagnostic.contains("vendor/model"));
     }
 
     #[test]

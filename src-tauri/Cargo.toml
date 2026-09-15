@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Local-first coding workspace"
 authors = ["Adam Johnston"]
 edition = "2021"
+default-run = "aiide"
 
 [lib]
 name = "aiide_lib"
