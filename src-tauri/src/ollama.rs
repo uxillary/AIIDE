@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, State};
 use crate::model_profiles;
+use crate::model_provider::{InferenceRequest, InferenceResponse, ModelMessage, ModelProvider, OllamaProvider};
 use crate::project::OpenProject;
 use crate::repository::{self, Activity, PendingChanges, PendingProposal, ProposedReplacement, ToolRequest};
 
-const BASE: &str = "http://127.0.0.1:11434";
 const MAX_MESSAGES: usize = 40;
 const MAX_MESSAGE_CHARS: usize = 12_000;
 const PROTOCOL_TEMPERATURE: f32 = 0.0;
@@ -79,26 +79,8 @@ pub struct ModelInfo { id: String, name: String, profile: model_profiles::ModelP
 #[derive(Serialize)]
 pub struct ProviderError { code: &'static str, message: &'static str }
 
-#[derive(Deserialize)]
-struct VersionResponse { version: String }
-
-#[derive(Deserialize)]
-struct TagsResponse { models: Vec<TaggedModel> }
-
-#[derive(Deserialize)]
-struct TaggedModel { name: String }
-
-#[derive(Deserialize, Serialize)]
-pub struct ChatMessage { role: String, content: String }
-
-#[derive(Serialize)]
-struct ChatPayload<'a> { model: &'a str, messages: &'a [ChatMessage], stream: bool, format: Value, options: ChatOptions }
-
-#[derive(Serialize)]
-struct ChatOptions { temperature: f32, num_predict: u16 }
-
-#[derive(Deserialize)]
-struct ChatPayloadResponse { model: String, message: ChatMessage, done: bool, done_reason: Option<String> }
+pub type ChatMessage = ModelMessage;
+type ChatPayloadResponse = InferenceResponse;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -194,7 +176,7 @@ fn repair_instruction(reason: &str, edit_intent: bool, has_read_evidence: bool) 
     } else { format!("Your previous response was invalid ({reason}). Return exactly one JSON object matching the schema. No prose or markdown.") }
 }
 
-async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessage], format: Value, temperature: f32, stage: &str, trace: Option<&Trace>) -> Result<ChatPayloadResponse, String> {
+async fn chat_turn(provider: &impl ModelProvider, model: &str, messages: &[ChatMessage], format: Value, temperature: f32, stage: &str, trace: Option<&Trace>) -> Result<ChatPayloadResponse, String> {
     let turn = trace_turn(trace);
     debug_log(trace, "protocol", format!("Turn {turn} — {stage}\nTemperature: {temperature}\nStructured format supplied: yes\nMessage count: {}\nMessage roles: {}\nSchema/format: {}", messages.len(), messages.iter().map(|message| message.role.as_str()).collect::<Vec<_>>().join(", "), format));
     if trace.is_some() {
@@ -203,22 +185,18 @@ async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessag
         }
     }
     let started = Instant::now();
-    debug_log(trace, "ollama", format!("Turn {turn} request started"));
-    let response = client.post(format!("{BASE}/api/chat"))
-        .json(&ChatPayload { model, messages, stream: false, format, options: ChatOptions { temperature, num_predict: 2_048 } })
-        .send().await.map_err(request_error)?;
-    if !response.status().is_success() { return Err("Ollama could not complete the chat request. Try again.".into()); }
-    let result = response.json::<ChatPayloadResponse>().await.map_err(|_| "Ollama returned an invalid chat response.".to_owned())?;
-    debug_log(trace, "ollama", format!("Turn {turn} response received in {}ms\n--- RAW OLLAMA RESPONSE START ---\n{}\n--- RAW OLLAMA RESPONSE END ---\nMetadata: model={}, done={}, done_reason={:?}", started.elapsed().as_millis(), result.message.content, result.model, result.done, result.done_reason));
-    if !result.done || result.message.role != "assistant" || result.model.is_empty() { return Err("Ollama returned an incomplete chat response.".into()); }
+    let provider_id = provider.metadata().id;
+    debug_log(trace, provider_id, format!("Turn {turn} request started"));
+    let result = provider.infer(InferenceRequest { model, messages, format, temperature }).await?;
+    debug_log(trace, provider_id, format!("Turn {turn} response received in {}ms\n--- RAW OLLAMA RESPONSE START ---\n{}\n--- RAW OLLAMA RESPONSE END ---\nMetadata: model={}, done={}, done_reason={:?}", started.elapsed().as_millis(), result.message.content, result.model, result.done, result.done_reason));
     Ok(result)
 }
 
-async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<ChatMessage>, project_open: bool, edit_intent: bool, has_read_evidence: bool, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<(ChatPayloadResponse, AgentAction), String> {
+async fn agent_turn(provider: &impl ModelProvider, model: &str, exchange: &mut Vec<ChatMessage>, project_open: bool, edit_intent: bool, has_read_evidence: bool, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<(ChatPayloadResponse, AgentAction), String> {
     let temperature = model_profiles::adaptation(model).protocol_temperature.unwrap_or(PROTOCOL_TEMPERATURE);
     for attempt in 0..=MAX_REPAIRS {
         let stage = if attempt == 0 { "STRUCTURED".to_owned() } else { format!("REPAIR {attempt}/{MAX_REPAIRS}") };
-        let result = chat_turn(client, model, exchange, agent_schema(project_open, edit_intent, has_read_evidence), temperature, &stage, trace).await?;
+        let result = chat_turn(provider, model, exchange, agent_schema(project_open, edit_intent, has_read_evidence), temperature, &stage, trace).await?;
         let parsed = if result.done_reason.as_deref() == Some("length") { Err("response exceeded the model output limit") }
             else { parse_action(&result.message.content) };
         match parsed {
@@ -268,13 +246,13 @@ fn tool_result_message(request: &ToolRequest, useful: bool, output: &str, known_
         if !unread.is_empty() { format!("\nListed files not yet read: {unread}") } else { String::new() })
 }
 
-async fn requires_inspection(client: &reqwest::Client, model: &str, prompt: &str, trace: Option<&Trace>) -> Result<bool, String> {
+async fn requires_inspection(provider: &impl ModelProvider, model: &str, prompt: &str, trace: Option<&Trace>) -> Result<bool, String> {
     let mut messages = vec![
         ChatMessage { role: "system".into(), content: "Classify whether answering this user prompt requires inspecting the currently opened project. Use repository for questions about this project's behavior, structure, UI, bugs, or improvements, including indirect references like 'the menu'. Use general for conceptual questions such as 'What is a JavaScript closure?'. Return only a JSON object with scope general or repository.".into() },
         ChatMessage { role: "user".into(), content: prompt.into() },
     ];
     for attempt in 0..=MAX_REPAIRS {
-        let result = chat_turn(client, model, &messages, scope_schema(), PROTOCOL_TEMPERATURE, "SCOPE CLASSIFICATION", trace).await?;
+        let result = chat_turn(provider, model, &messages, scope_schema(), PROTOCOL_TEMPERATURE, "SCOPE CLASSIFICATION", trace).await?;
         if let Some(needed) = parse_scope(&result.message.content) { return Ok(needed); }
         if attempt == MAX_REPAIRS { break; }
         messages.push(ChatMessage { role: "user".into(), content: "Return exactly one JSON object: {\"scope\":\"repository\"} or {\"scope\":\"general\"}.".into() });
@@ -290,7 +268,7 @@ fn parse_scope(raw: &str) -> Option<bool> {
     match scope.scope.as_str() { "repository" => Some(true), "general" => Some(false), _ => None }
 }
 
-async fn final_turn(client: &reqwest::Client, model: &str, prompt: &str, project_info: &str, evidence: &[(String, String)], read_paths: &[String], trace: Option<&Trace>) -> Result<String, String> {
+async fn final_turn(provider: &impl ModelProvider, model: &str, prompt: &str, project_info: &str, evidence: &[(String, String)], read_paths: &[String], trace: Option<&Trace>) -> Result<String, String> {
     let mut exchange = vec![
         ChatMessage { role: "system".into(), content: format!("You are Elma inside AIIDE. {project_info} Answer the user's original question using only the repository evidence below. Do not respond to a prior tool search or infer missing files from a failed tool. Do not invent filenames: HTML sections are not separate files. Do not list inspected filenames in your answer; the application appends the verified list. No more tools are available. Keep the answer under 120 words and address every part of the user's request. Avoid quoted code snippets or HTML attributes. Return only a JSON object with action answer and answer text.") },
         ChatMessage { role: "system".into(), content: DEFAULT_PERSONALITY.into() },
@@ -298,7 +276,7 @@ async fn final_turn(client: &reqwest::Client, model: &str, prompt: &str, project
     ];
     for attempt in 0..=MAX_REPAIRS {
         debug_log(trace, "final", "Grounded personality answer started; personality included: yes");
-        let result = chat_turn(client, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE, "GROUNDED FINAL ANSWER", trace).await?;
+        let result = chat_turn(provider, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE, "GROUNDED FINAL ANSWER", trace).await?;
         if result.done_reason.as_deref() != Some("length") {
             if let Ok(AgentAction::Answer(answer)) = parse_action(&result.message.content) { debug_log(trace, "final", "Grounded personality answer accepted"); return Ok(answer); }
         }
@@ -308,14 +286,14 @@ async fn final_turn(client: &reqwest::Client, model: &str, prompt: &str, project
     Err("The local model could not produce a final structured answer after two retries.".into())
 }
 
-async fn conversational_turn(client: &reqwest::Client, model: &str, prompt: &str, draft: &str, trace: Option<&Trace>) -> Result<String, String> {
+async fn conversational_turn(provider: &impl ModelProvider, model: &str, prompt: &str, draft: &str, trace: Option<&Trace>) -> Result<String, String> {
     let mut exchange = vec![
         ChatMessage { role: "system".into(), content: format!("You are Elma inside AIIDE. {DEFAULT_PERSONALITY} Preserve the draft's factual meaning. Return only a JSON object with action answer and answer text.") },
         ChatMessage { role: "user".into(), content: format!("Original question: {prompt}\n\nDraft answer: {draft}\n\nGive the shortest complete answer in Elma's natural voice. Do not add facts that are absent from the draft.") },
     ];
     for attempt in 0..=MAX_REPAIRS {
         debug_log(trace, "final", "Personality rewrite started; personality included: yes");
-        let result = chat_turn(client, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE, "PERSONALITY REWRITE", trace).await?;
+        let result = chat_turn(provider, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE, "PERSONALITY REWRITE", trace).await?;
         if result.done_reason.as_deref() != Some("length") {
             if let Ok(AgentAction::Answer(answer)) = parse_action(&result.message.content) { debug_log(trace, "final", "Personality rewrite accepted"); return Ok(answer); }
         }
@@ -325,34 +303,15 @@ async fn conversational_turn(client: &reqwest::Client, model: &str, prompt: &str
     Err("The local model could not produce a concise conversational answer after two retries.".into())
 }
 
-fn client(timeout: Duration) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder().no_proxy().timeout(timeout).build()
-        .map_err(|_| "Could not prepare the local Ollama connection.".to_owned())
-}
-
-fn request_error(error: reqwest::Error) -> String {
-    if error.is_timeout() { "Ollama took too long to respond. Try again.".to_owned() }
-    else if error.is_connect() { "Ollama is offline. Start Ollama and retry.".to_owned() }
-    else { "The local Ollama request failed. Try again.".to_owned() }
-}
-
 #[tauri::command]
 pub async fn ollama_status() -> ProviderStatus {
     let offline = || ProviderStatus { state: "offline", models: vec![], error: Some(ProviderError { code: "unavailable", message: "Ollama not detected. Start Ollama and try again." }) };
-    let Ok(client) = client(Duration::from_secs(4)) else { return offline() };
-    let Ok(response) = client.get(format!("{BASE}/api/version")).send().await else { return offline() };
-    if !response.status().is_success() { return offline(); }
-    let Ok(version) = response.json::<VersionResponse>().await else { return offline() };
-    if version.version.is_empty() { return offline(); }
-    let Ok(response) = client.get(format!("{BASE}/api/tags")).send().await else {
-        return ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "model_list_failed", message: "Ollama is connected, but its model list could not be loaded." }) };
-    };
-    if !response.status().is_success() {
-        return ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "model_list_failed", message: "Ollama is connected, but its model list could not be loaded." }) };
-    }
-    match response.json::<TagsResponse>().await {
-        Ok(tags) => ProviderStatus { state: "connected", models: tags.models.into_iter().filter(|model| !model.name.is_empty()).map(|model| ModelInfo { id: model.name.clone(), profile: model_profiles::resolve(&model.name), name: model.name }).collect(), error: None },
-        Err(_) => ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "malformed_response", message: "Ollama returned an invalid model list." }) },
+    let Ok(provider) = OllamaProvider::new(Duration::from_secs(4)) else { return offline() };
+    if !provider.is_available().await { return offline(); }
+    match provider.installed_models().await {
+        Ok(models) => ProviderStatus { state: "connected", models: models.into_iter().filter(|model| !model.is_empty()).map(|model| ModelInfo { id: model.clone(), profile: model_profiles::resolve(&model), name: model }).collect(), error: None },
+        Err(error) if error == "Ollama returned an invalid model list." => ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "malformed_response", message: "Ollama returned an invalid model list." }) },
+        Err(_) => ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "model_list_failed", message: "Ollama is connected, but its model list could not be loaded." }) },
     }
 }
 
@@ -383,16 +342,18 @@ pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project
 }
 
 async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::path::PathBuf>, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>, debug_trace: Option<&Trace>) -> Result<ChatResponse, String> {
+    let provider = OllamaProvider::new(Duration::from_secs(120))?;
+    run_agent_with_provider(&provider, model, messages, root, pending, app, debug_trace).await
+}
+
+async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, messages: Vec<ChatMessage>, root: Option<std::path::PathBuf>, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>, debug_trace: Option<&Trace>) -> Result<ChatResponse, String> {
     if model.is_empty() || messages.is_empty() || messages.len() > MAX_MESSAGES || messages.iter().any(|message| {
         !matches!(message.role.as_str(), "user" | "assistant") || message.content.is_empty() || message.content.chars().count() > MAX_MESSAGE_CHARS
     }) || messages.last().is_none_or(|message| message.role != "user") {
         return Err("The chat request is invalid or too long.".to_owned());
     }
-    let client = client(Duration::from_secs(120))?;
-    let tags = client.get(format!("{BASE}/api/tags")).send().await.map_err(request_error)?;
-    if !tags.status().is_success() { return Err("Could not verify installed models. Retry the connection.".to_owned()); }
-    let tags = tags.json::<TagsResponse>().await.map_err(|_| "Ollama returned an invalid model list.".to_owned())?;
-    if !tags.models.iter().any(|item| item.name == model) { return Err("This model is no longer installed. Retry to refresh the model list.".to_owned()); }
+    let installed_models = provider.installed_models().await?;
+    if !installed_models.iter().any(|item| item == &model) { return Err("This model is no longer installed. Retry to refresh the model list.".to_owned()); }
     let last_prompt = messages.last().map_or("", |message| message.content.trim()).to_owned();
     if last_prompt.eq_ignore_ascii_case("what is your name?") || last_prompt.eq_ignore_ascii_case("what is your name") {
         return Ok(ChatResponse { model, content: "I'm Elma, your local coding companion in AIIDE. My responses are generated by the selected Ollama model.".into(), activity: vec![], proposal: None });
@@ -430,7 +391,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
     let mut needs_inspection = match plan.scope { RequestScope::General => Some(false), RequestScope::Repository => Some(true), RequestScope::Unknown => None };
     let mut inspection_reminders = 0;
     for iteration in 0..=repository::MAX_TOOL_CALLS {
-        let (result, action) = agent_turn(&client, &model, &mut exchange, root.is_some(), plan.intent == RequestIntent::Edit, successful_reads > 0, app, debug_trace).await?;
+        let (result, action) = agent_turn(provider, &model, &mut exchange, root.is_some(), plan.intent == RequestIntent::Edit, successful_reads > 0, app, debug_trace).await?;
         if let AgentAction::Propose(summary, edits) = action {
             let root = root.as_ref().ok_or_else(|| "Open a project before proposing changes.".to_owned())?;
             if edits.iter().any(|edit| !read_paths.contains(&edit.path)) {
@@ -457,7 +418,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
                 let needed = match needs_inspection {
                     Some(needed) => needed,
                     None => {
-                        let needed = requires_inspection(&client, &model, &last_prompt, debug_trace).await?;
+                        let needed = requires_inspection(provider, &model, &last_prompt, debug_trace).await?;
                         needs_inspection = Some(needed);
                         needed
                     }
@@ -483,9 +444,9 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
             }
             let content = if !read_paths.is_empty() {
                 let info = root.as_ref().map(|path| super::project::inspect_metadata(path)).unwrap_or_default();
-                let answer = final_turn(&client, &model, &last_prompt, &info, &evidence, &read_paths, debug_trace).await?;
+                let answer = final_turn(provider, &model, &last_prompt, &info, &evidence, &read_paths, debug_trace).await?;
                 format!("{answer}\n\nFiles actually inspected: {}", read_paths.join(", "))
-            } else { conversational_turn(&client, &model, &last_prompt, &answer, debug_trace).await? };
+            } else { conversational_turn(provider, &model, &last_prompt, &answer, debug_trace).await? };
             return Ok(ChatResponse { model: result.model, content, activity, proposal: None });
         }
         if root.is_none() { return Ok(ChatResponse { model: result.model, content: "Open a project to use repository tools.".into(), activity, proposal: None }); }
@@ -532,7 +493,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
     }
     if !read_paths.is_empty() {
         let info = root.as_ref().map(|path| super::project::inspect_metadata(path)).unwrap_or_default();
-        let answer = final_turn(&client, &model, &last_prompt, &info, &evidence, &read_paths, debug_trace).await?;
+        let answer = final_turn(provider, &model, &last_prompt, &info, &evidence, &read_paths, debug_trace).await?;
         let content = format!("{answer}\n\nFiles actually inspected: {}", read_paths.join(", "));
         return Ok(ChatResponse { model, content, activity, proposal: None });
     }
@@ -565,6 +526,45 @@ pub(crate) async fn run_benchmark_agent(model: &str, root: std::path::PathBuf, p
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_provider::{ProviderLocality, ProviderMetadata};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StubProvider {
+        models: Vec<String>,
+        responses: Mutex<VecDeque<InferenceResponse>>,
+        inference_calls: AtomicUsize,
+    }
+
+    impl StubProvider {
+        fn new(models: &[&str], responses: &[&str]) -> Self {
+            Self {
+                models: models.iter().map(|value| (*value).to_owned()).collect(),
+                responses: Mutex::new(responses.iter().map(|content| InferenceResponse {
+                    model: "test-model".into(),
+                    message: ChatMessage { role: "assistant".into(), content: (*content).into() },
+                    done: true,
+                    done_reason: Some("stop".into()),
+                }).collect()),
+                inference_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ModelProvider for StubProvider {
+        fn metadata(&self) -> ProviderMetadata {
+            ProviderMetadata { id: "stub", locality: ProviderLocality::Local }
+        }
+
+        async fn is_available(&self) -> bool { true }
+
+        async fn installed_models(&self) -> Result<Vec<String>, String> { Ok(self.models.clone()) }
+
+        async fn infer(&self, _request: InferenceRequest<'_>) -> Result<InferenceResponse, String> {
+            self.inference_calls.fetch_add(1, Ordering::SeqCst);
+            self.responses.lock().unwrap().pop_front().ok_or_else(|| "No stub response configured.".to_owned())
+        }
+    }
 
     #[test]
     fn personality_is_separate_from_protocol_defaults() {
@@ -575,6 +575,34 @@ mod tests {
         assert!(!DEFAULT_PERSONALITY.contains("propose_change"));
         assert_eq!(PROTOCOL_TEMPERATURE, 0.0);
         assert_eq!(CONVERSATIONAL_TEMPERATURE, 0.2);
+    }
+
+    #[test]
+    fn provider_responses_enter_the_existing_validation_and_repair_pipeline() {
+        let provider = StubProvider::new(&["test-model"], &["plain prose", r#"{"action":"answer","answer":"repaired"}"#]);
+        let mut exchange = vec![ChatMessage { role: "user".into(), content: "hello".into() }];
+        let (_, action) = tauri::async_runtime::block_on(agent_turn(
+            &provider, "test-model", &mut exchange, false, false, false, None, None,
+        )).unwrap();
+        assert_eq!(action, AgentAction::Answer("repaired".into()));
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 2);
+        assert!(exchange.last().unwrap().content.contains("previous response was invalid"));
+    }
+
+    #[test]
+    fn agent_model_selection_uses_provider_discovery() {
+        let provider = StubProvider::new(&["installed-model"], &[]);
+        let error = match tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider,
+            "missing-model".into(),
+            vec![ChatMessage { role: "user".into(), content: "hello".into() }],
+            None, None, None, None,
+        )) {
+            Err(error) => error,
+            Ok(_) => panic!("missing model should be rejected"),
+        };
+        assert_eq!(error, "This model is no longer installed. Retry to refresh the model list.");
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

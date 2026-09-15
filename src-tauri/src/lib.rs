@@ -2,6 +2,7 @@ mod project;
 mod ollama;
 mod repository;
 mod model_profiles;
+mod model_provider;
 mod benchmark;
 
 pub fn run_benchmark_cli() -> Result<(), String> { benchmark::run_cli() }
