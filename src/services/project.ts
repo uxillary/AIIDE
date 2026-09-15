@@ -7,3 +7,7 @@ export async function chooseProject(): Promise<ProjectInfo | null> {
   if (!path) return null
   return invoke<ProjectInfo>('inspect_project', { path })
 }
+
+export const refreshProject = (path: string) => invoke<ProjectInfo>('inspect_project', { path })
+export const applyPendingChange = () => invoke<void>('apply_pending_change')
+export const rejectPendingChange = () => invoke<void>('reject_pending_change')

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { Elma, type ElmaState } from './Elma'
 import { ollamaProvider } from '../services/ai/ollama'
-import type { ChatMessage, ProviderStatus } from '../types/ai'
+import type { ChatMessage, PendingProposal, ProviderStatus } from '../types/ai'
 
 const MODEL_KEY = 'aiide.selected-model'
 const INSPECTION_DISPLAY_MS = 700
@@ -13,7 +13,7 @@ function messageOf(error: unknown): string {
   return typeof error === 'string' ? error : error instanceof Error ? error.message : 'The local AI request failed.'
 }
 
-export function LocalChat({ projectOpen }: { projectOpen: boolean }) {
+export function LocalChat({ projectOpen, onProposal, changeState }: { projectOpen: boolean; onProposal: (proposal: PendingProposal) => void; changeState: 'working' | 'success' | 'error' | null }) {
   const [status, setStatus] = useState<ProviderStatus | null>(null)
   const [selectedModel, setSelectedModel] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
@@ -68,6 +68,7 @@ export function LocalChat({ projectOpen }: { projectOpen: boolean }) {
     inspectionTimerRef.current = setTimeout(() => setInspecting(false), INSPECTION_DISPLAY_MS)
   }); return () => { void subscription.then(unlisten => unlisten()) } }, [])
   useEffect(() => { const subscription = listen('repository-retry', () => { setInspecting(false); setRetrying(true) }); return () => { void subscription.then(unlisten => unlisten()) } }, [])
+  useEffect(() => { const subscription = listen('proposal-validation-start', () => { setInspecting(false); setRetrying(true) }); return () => { void subscription.then(unlisten => unlisten()) } }, [])
   useEffect(() => () => {
     if (inspectionTimerRef.current) clearTimeout(inspectionTimerRef.current)
     if (terminalTimerRef.current) clearTimeout(terminalTimerRef.current)
@@ -92,6 +93,7 @@ export function LocalChat({ projectOpen }: { projectOpen: boolean }) {
     try {
       const response = await ollamaProvider.chat({ model, messages: nextMessages.slice(-39).map(({ role, content }) => ({ role, content })) })
       setMessages(current => [...current, { role: 'assistant', content: response.content, model: response.model, activity: response.activity }])
+      if (response.proposal) onProposal(response.proposal)
       showTerminalState('success', SUCCESS_DISPLAY_MS)
     } catch (cause) {
       setError(messageOf(cause))
@@ -104,8 +106,11 @@ export function LocalChat({ projectOpen }: { projectOpen: boolean }) {
 
   const connected = status?.state === 'connected'
   const ready = connected && status.models.length > 0
-  const elmaState: ElmaState = terminalState ?? (loading ? inspecting ? 'inspecting' : retrying ? 'working' : 'thinking' : 'idle')
-  const elmaStatus = terminalState === 'error' ? 'Elma hit an error.'
+  const elmaState: ElmaState = changeState ?? terminalState ?? (loading ? inspecting ? 'inspecting' : retrying ? 'working' : 'thinking' : 'idle')
+  const elmaStatus = changeState === 'working' ? 'Elma is applying the approved change…'
+    : changeState === 'success' ? 'Elma applied the approved change.'
+      : changeState === 'error' ? 'Elma could not apply the change.'
+        : terminalState === 'error' ? 'Elma hit an error.'
     : terminalState === 'success' ? 'Elma finished successfully.'
       : loading && inspecting ? 'Elma is inspecting the project…'
         : loading && retrying ? 'Elma is retrying the local model…'

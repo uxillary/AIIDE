@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
+use tauri::State;
 
-use crate::project::IGNORED;
+use crate::project::{OpenProject, IGNORED};
 
 pub const MAX_TOOL_CALLS: usize = 8;
 pub const MAX_CONTEXT_BYTES: usize = 48_000;
@@ -11,6 +13,52 @@ const MAX_FILE_BYTES: u64 = 256_000;
 const MAX_LIST: usize = 120;
 const MAX_SEARCH: usize = 30;
 const MAX_SCAN_FILES: usize = 2_000;
+pub const MAX_PROPOSAL_REPLACEMENTS: usize = 4;
+pub const MAX_PROPOSAL_BYTES: usize = 24_000;
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedReplacement {
+    pub path: String,
+    pub old_text: String,
+    pub new_text: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingChange {
+    pub path: String,
+    pub before: String,
+    pub after: String,
+    pub replacements: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingProposal {
+    pub summary: String,
+    pub changes: Vec<PendingChange>,
+}
+
+#[derive(Default)]
+pub struct PendingChanges(pub Mutex<Option<PendingProposal>>);
+
+#[tauri::command]
+pub fn apply_pending_change(open_project: State<'_, OpenProject>, pending: State<'_, PendingChanges>) -> Result<(), String> {
+    let root = open_project.0.lock().map_err(|_| "Project state unavailable")?.clone()
+        .ok_or_else(|| "No project is open.".to_owned())?;
+    let mut state = pending.0.lock().map_err(|_| "Pending change state unavailable")?;
+    let proposal = state.as_ref().ok_or_else(|| "There is no pending proposal.".to_owned())?;
+    apply_proposal(&root, proposal)?;
+    *state = None;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn reject_pending_change(pending: State<'_, PendingChanges>) -> Result<(), String> {
+    *pending.0.lock().map_err(|_| "Pending change state unavailable")? = None;
+    Ok(())
+}
 
 #[derive(Deserialize)]
 pub struct ToolRequest {
@@ -47,6 +95,54 @@ fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     let full = fs::canonicalize(root.join(relative)).map_err(|_| "Project path does not exist.".to_owned())?;
     if !full.starts_with(root) { return Err("Path escapes the opened project.".into()); }
     Ok(full)
+}
+
+fn read_text_file(path: &Path) -> Result<String, String> {
+    let metadata = fs::metadata(path).map_err(|_| "Project path does not exist.".to_owned())?;
+    if !metadata.is_file() { return Err("Target must be an existing file.".into()); }
+    if metadata.len() > MAX_FILE_BYTES { return Err("File exceeds the size limit.".into()); }
+    let bytes = fs::read(path).map_err(|_| "Cannot read project file.".to_owned())?;
+    if bytes.iter().take(8_000).any(|byte| *byte == 0) { return Err("Binary files are unavailable.".into()); }
+    String::from_utf8(bytes).map_err(|_| "Non-UTF-8 files are unavailable.".into())
+}
+
+pub fn validate_proposal(root: &Path, summary: String, edits: Vec<ProposedReplacement>) -> Result<PendingProposal, String> {
+    if summary.trim().is_empty() || summary.chars().count() > 240 { return Err("Proposal summary is missing or too long.".into()); }
+    if edits.is_empty() || edits.len() > MAX_PROPOSAL_REPLACEMENTS { return Err(format!("A proposal must contain 1 to {MAX_PROPOSAL_REPLACEMENTS} replacements.")); }
+    let total = edits.iter().map(|edit| edit.path.len() + edit.old_text.len() + edit.new_text.len()).sum::<usize>();
+    if total > MAX_PROPOSAL_BYTES { return Err("Proposal exceeds the size limit.".into()); }
+    let first_path = edits[0].path.clone();
+    if edits.iter().any(|edit| edit.path != first_path) { return Err("Milestone 04 proposals may change one file at a time.".into()); }
+    let relative = allowed_relative(&first_path)?;
+    if protected(&relative) { return Err("Protected files are unavailable.".into()); }
+    let full = resolve(root, &first_path)?;
+    let before = read_text_file(&full)?;
+    let mut after = before.clone();
+    let mut seen_old = std::collections::HashSet::new();
+    for edit in &edits {
+        if edit.old_text.is_empty() { return Err("old_text must not be empty.".into()); }
+        if edit.old_text == edit.new_text { return Err("Proposal contains a no-op replacement.".into()); }
+        if !seen_old.insert(edit.old_text.as_str()) { return Err("Proposal contains duplicate or conflicting replacements.".into()); }
+        let matches = after.match_indices(&edit.old_text).count();
+        if matches == 0 { return Err("old_text was not found in the current file.".into()); }
+        if matches > 1 { return Err("old_text is ambiguous in the current file.".into()); }
+        after = after.replacen(&edit.old_text, &edit.new_text, 1);
+    }
+    if after == before { return Err("Proposal does not change the file.".into()); }
+    Ok(PendingProposal { summary: summary.trim().to_owned(), changes: vec![PendingChange { path: first_path, before, after, replacements: edits.len() }] })
+}
+
+pub fn apply_proposal(root: &Path, proposal: &PendingProposal) -> Result<(), String> {
+    if proposal.changes.len() != 1 { return Err("Invalid pending proposal.".into()); }
+    let change = &proposal.changes[0];
+    let relative = allowed_relative(&change.path)?;
+    if protected(&relative) { return Err("Protected files are unavailable.".into()); }
+    let full = resolve(root, &change.path)?;
+    let current = read_text_file(&full)?;
+    if current != change.before {
+        return Err(format!("{} changed since Elma prepared this proposal. Ask Elma to inspect it again.", change.path));
+    }
+    fs::write(full, change.after.as_bytes()).map_err(|_| "Could not write the approved change.".to_owned())
 }
 
 fn relative(root: &Path, path: &Path) -> String {
@@ -196,6 +292,62 @@ mod tests {
         assert!(search_files(&root, "*.html *.css").unwrap_err().contains("globs"));
         for index in 0..MAX_LIST + 5 { fs::write(root.join(format!("{index}.txt")), "x").unwrap(); }
         assert!(list_files(&root, "").unwrap().contains("Listing truncated"));
+        fs::remove_dir_all(root).unwrap();
+    }
+    fn edit(path: &str, old_text: &str, new_text: &str) -> ProposedReplacement {
+        ProposedReplacement { path: path.into(), old_text: old_text.into(), new_text: new_text.into() }
+    }
+    #[test] fn validates_exact_replacement_and_applies_approved_change() {
+        let root = fixture();
+        let proposal = validate_proposal(&root, "Greeting".into(), vec![edit("hello.txt", "hello", "Hello")]).unwrap();
+        assert_eq!(proposal.changes[0].after, "Hello\nworld");
+        assert_eq!(fs::read_to_string(root.join("hello.txt")).unwrap(), "hello\nworld");
+        apply_proposal(&root, &proposal).unwrap();
+        assert_eq!(fs::read_to_string(root.join("hello.txt")).unwrap(), "Hello\nworld");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn rejects_unsafe_missing_ambiguous_and_noop_proposals() {
+        let root = fixture();
+        fs::write(root.join(".env"), "secret").unwrap();
+        fs::write(root.join("repeat.txt"), "same same").unwrap();
+        for (proposal, expected) in [
+            (edit("../hello.txt", "hello", "x"), "project-relative"),
+            (edit("C:/Windows/win.ini", "hello", "x"), "project-relative"),
+            (edit(".env", "secret", "x"), "Protected"),
+            (edit("missing.txt", "hello", "x"), "does not exist"),
+            (edit("hello.txt", "absent", "x"), "not found"),
+            (edit("repeat.txt", "same", "x"), "ambiguous"),
+            (edit("hello.txt", "hello", "hello"), "no-op"),
+        ] {
+            assert!(validate_proposal(&root, "Test".into(), vec![proposal]).unwrap_err().contains(expected));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn rejects_oversized_and_conflicting_proposals_without_partial_write() {
+        let root = fixture();
+        let original = fs::read_to_string(root.join("hello.txt")).unwrap();
+        let oversized = edit("hello.txt", "hello", &"x".repeat(MAX_PROPOSAL_BYTES + 1));
+        assert!(validate_proposal(&root, "Large".into(), vec![oversized]).is_err());
+        let conflicting = vec![edit("hello.txt", "hello", "Hello"), edit("hello.txt", "missing", "x")];
+        assert!(validate_proposal(&root, "Conflict".into(), conflicting).is_err());
+        assert_eq!(fs::read_to_string(root.join("hello.txt")).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn stale_proposal_fails_closed() {
+        let root = fixture();
+        let proposal = validate_proposal(&root, "Greeting".into(), vec![edit("hello.txt", "hello", "Hello")]).unwrap();
+        fs::write(root.join("hello.txt"), "external\nworld").unwrap();
+        assert!(apply_proposal(&root, &proposal).unwrap_err().contains("changed since"));
+        assert_eq!(fs::read_to_string(root.join("hello.txt")).unwrap(), "external\nworld");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn discarding_a_proposal_writes_nothing() {
+        let root = fixture();
+        let proposal = validate_proposal(&root, "Greeting".into(), vec![edit("hello.txt", "hello", "Hello")]).unwrap();
+        let mut pending = Some(proposal);
+        drop(pending.take());
+        assert!(pending.is_none());
+        assert_eq!(fs::read_to_string(root.join("hello.txt")).unwrap(), "hello\nworld");
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -4,7 +4,7 @@ use std::time::Duration;
 use std::collections::HashSet;
 use tauri::{Emitter, State};
 use crate::project::OpenProject;
-use crate::repository::{self, Activity, ToolRequest};
+use crate::repository::{self, Activity, PendingChanges, PendingProposal, ProposedReplacement, ToolRequest};
 
 const BASE: &str = "http://127.0.0.1:11434";
 const MAX_MESSAGES: usize = 40;
@@ -47,23 +47,26 @@ struct ChatPayloadResponse { model: String, message: ChatMessage, done: bool, do
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ChatResponse { model: String, content: String, activity: Vec<Activity> }
+pub struct ChatResponse { model: String, content: String, activity: Vec<Activity>, proposal: Option<PendingProposal> }
 
-const SYSTEM: &str = "You are Elma, a local-first AI coding companion inside AIIDE. Your underlying model is the selected Ollama model. You may inspect only the opened project through AIIDE's read-only tools. Never claim to have inspected a file unless read_file returned its contents. Do not invent files, code, Git state, tool results, or commands. You cannot modify files, execute commands, commit, or push. For questions about this project's behavior, structure, or changes, inspect relevant context before answering, even if the user does not say 'project'. General knowledge questions can be answered directly. list_files returns exact project-relative paths; copy them exactly into read_file. search_files searches one literal substring, not globs. A failed tool or no matches is not evidence that a file is absent. For website or UI reviews, read relevant markup, styles, and scripts when listed. For behavior bugs, read the relevant script and markup before diagnosing. Return exactly one JSON object with action list_files, search_files, read_file, or answer and the corresponding path, query, or answer string. When enough evidence is gathered, answer directly.";
+const SYSTEM: &str = "You are Elma, a local-first AI coding companion inside AIIDE. You may inspect the opened project through AIIDE's bounded tools and propose focused replacements to existing text files. You cannot apply changes, write files, execute commands, commit, or push. Inspect every target file with read_file before proposing a change. Preserve its style and avoid unrelated cleanup or whole-file rewrites. A propose_change action needs a concise summary and changes containing project-relative path, exact old_text copied from file content without the displayed line-number prefix, and replacement new_text. AIIDE validates and previews it; only the user's Apply button can write it. Never claim a proposal was applied. Questions and reviews may be answered without proposing changes. Never invent files, code, Git state, tool results, or commands. list_files returns exact paths; search_files searches one literal substring. Failed tools do not prove absence. Be concise by default. Give the shortest answer that fully addresses the request. Do not restate the user's request or add generic introductions or conclusions. Expand when asked for detail. Return exactly one JSON object matching the provided schema.";
 
 const MAX_REPAIRS: usize = 2;
 
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct AgentReply { action: String, path: Option<String>, query: Option<String>, answer: Option<String> }
+struct AgentReply { action: String, path: Option<String>, query: Option<String>, answer: Option<String>, summary: Option<String>, changes: Option<Vec<ProposedReplacement>> }
 
 #[derive(Debug, PartialEq)]
-enum AgentAction { List(String), Search(String), Read(String), Answer(String) }
+enum AgentAction { List(String), Search(String), Read(String), Answer(String), Propose(String, Vec<ProposedReplacement>) }
 
-fn agent_schema() -> Value {
+fn agent_schema(allow_proposal: bool) -> Value {
+    let actions = if allow_proposal { json!(["list_files","search_files","read_file","answer","propose_change"]) }
+        else { json!(["list_files","search_files","read_file","answer"]) };
     json!({"type":"object","properties":{
-        "action":{"type":"string","enum":["list_files","search_files","read_file","answer"]},
-        "path":{"type":"string"},"query":{"type":"string"},"answer":{"type":"string"}
+        "action":{"type":"string","enum":actions},
+        "path":{"type":"string"},"query":{"type":"string"},"answer":{"type":"string"},"summary":{"type":"string"},
+        "changes":{"type":"array","maxItems":4,"items":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}}
     },"required":["action"],"additionalProperties":false})
 }
 
@@ -80,14 +83,16 @@ fn answer_schema() -> Value {
 fn parse_action(raw: &str) -> Result<AgentAction, &'static str> {
     let reply: AgentReply = serde_json::from_str(raw.trim()).map_err(|_| "invalid JSON object")?;
     match reply.action.as_str() {
-        "list_files" if reply.answer.is_none() && reply.query.is_none() => Ok(AgentAction::List(reply.path.unwrap_or_default())),
+        "list_files" if reply.answer.is_none() && reply.query.is_none() && reply.summary.is_none() && reply.changes.is_none() => Ok(AgentAction::List(reply.path.unwrap_or_default())),
         "list_files" => Err("list_files accepts path, not query or answer; use {\"action\":\"list_files\",\"path\":\"src\"}"),
-        "search_files" if reply.answer.is_none() && reply.path.is_none() && reply.query.as_ref().is_some_and(|query| !query.trim().is_empty()) => Ok(AgentAction::Search(reply.query.unwrap())),
+        "search_files" if reply.answer.is_none() && reply.path.is_none() && reply.summary.is_none() && reply.changes.is_none() && reply.query.as_ref().is_some_and(|query| !query.trim().is_empty()) => Ok(AgentAction::Search(reply.query.unwrap())),
         "search_files" => Err("search_files requires a nonempty query and no path or answer"),
-        "read_file" if reply.answer.is_none() && reply.query.is_none() && reply.path.as_ref().is_some_and(|path| !path.trim().is_empty()) => Ok(AgentAction::Read(reply.path.unwrap())),
+        "read_file" if reply.answer.is_none() && reply.query.is_none() && reply.summary.is_none() && reply.changes.is_none() && reply.path.as_ref().is_some_and(|path| !path.trim().is_empty()) => Ok(AgentAction::Read(reply.path.unwrap())),
         "read_file" => Err("read_file requires a nonempty path and no query or answer"),
-        "answer" if reply.path.is_none() && reply.query.is_none() && reply.answer.as_ref().is_some_and(|answer| !answer.trim().is_empty()) => Ok(AgentAction::Answer(reply.answer.unwrap())),
+        "answer" if reply.path.is_none() && reply.query.is_none() && reply.summary.is_none() && reply.changes.is_none() && reply.answer.as_ref().is_some_and(|answer| !answer.trim().is_empty()) => Ok(AgentAction::Answer(reply.answer.unwrap())),
         "answer" => Err("answer requires nonempty answer text and no path or query"),
+        "propose_change" if reply.path.is_none() && reply.query.is_none() && reply.answer.is_none() && reply.summary.as_ref().is_some_and(|value| !value.trim().is_empty()) && reply.changes.as_ref().is_some_and(|value| !value.is_empty()) => Ok(AgentAction::Propose(reply.summary.unwrap(), reply.changes.unwrap())),
+        "propose_change" => Err("propose_change requires summary and one or more exact changes"),
         _ => Err("invalid or ambiguous action fields"),
     }
 }
@@ -101,7 +106,7 @@ fn trace(message: &str) {
 
 async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessage], format: Value) -> Result<ChatPayloadResponse, String> {
     let response = client.post(format!("{BASE}/api/chat"))
-        .json(&ChatPayload { model, messages, stream: false, format, options: ChatOptions { temperature: 0.0, num_predict: 640 } })
+        .json(&ChatPayload { model, messages, stream: false, format, options: ChatOptions { temperature: 0.0, num_predict: 2_048 } })
         .send().await.map_err(request_error)?;
     if !response.status().is_success() { return Err("Ollama could not complete the chat request. Try again.".into()); }
     let result = response.json::<ChatPayloadResponse>().await.map_err(|_| "Ollama returned an invalid chat response.".to_owned())?;
@@ -110,9 +115,9 @@ async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessag
     Ok(result)
 }
 
-async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<ChatMessage>, app: Option<&tauri::AppHandle>) -> Result<(ChatPayloadResponse, AgentAction), String> {
+async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<ChatMessage>, allow_proposal: bool, app: Option<&tauri::AppHandle>) -> Result<(ChatPayloadResponse, AgentAction), String> {
     for attempt in 0..=MAX_REPAIRS {
-        let result = chat_turn(client, model, exchange, agent_schema()).await?;
+        let result = chat_turn(client, model, exchange, agent_schema(allow_proposal)).await?;
         trace(&format!("raw model response: {}", result.message.content.chars().take(2_000).collect::<String>()));
         let parsed = if result.done_reason.as_deref() == Some("length") { Err("response exceeded the model output limit") }
             else { parse_action(&result.message.content) };
@@ -122,7 +127,7 @@ async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<Ch
                 trace(&format!("parse failure: {reason}; repair attempt {attempt}"));
                 if attempt == MAX_REPAIRS { break; }
                 if let Some(app) = app { let _ = app.emit("repository-retry", ()); }
-                exchange.push(ChatMessage { role: "user".into(), content: format!("Your previous response was invalid ({reason}). Return exactly one JSON object matching the provided schema. Use action list_files, search_files, read_file, or answer with its required nonempty field. No prose or markdown.") });
+                exchange.push(ChatMessage { role: "user".into(), content: format!("Your previous response was invalid ({reason}). Return exactly one JSON object matching the schema. No prose or markdown.") });
             }
         }
     }
@@ -130,7 +135,7 @@ async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<Ch
 }
 
 fn action_name(action: &AgentAction) -> &'static str {
-    match action { AgentAction::List(_) => "list_files", AgentAction::Search(_) => "search_files", AgentAction::Read(_) => "read_file", AgentAction::Answer(_) => "answer" }
+    match action { AgentAction::List(_) => "list_files", AgentAction::Search(_) => "search_files", AgentAction::Read(_) => "read_file", AgentAction::Answer(_) => "answer", AgentAction::Propose(_, _) => "propose_change" }
 }
 
 async fn requires_inspection(client: &reqwest::Client, model: &str, prompt: &str) -> Result<bool, String> {
@@ -205,12 +210,12 @@ pub async fn ollama_status() -> ProviderStatus {
 }
 
 #[tauri::command]
-pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project: State<'_, OpenProject>, app: tauri::AppHandle) -> Result<ChatResponse, String> {
+pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project: State<'_, OpenProject>, pending: State<'_, PendingChanges>, app: tauri::AppHandle) -> Result<ChatResponse, String> {
     let root = open_project.0.lock().map_err(|_| "Project state unavailable")?.clone();
-    run_agent(model, messages, root, Some(&app)).await
+    run_agent(model, messages, root, Some(&pending), Some(&app)).await
 }
 
-async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::path::PathBuf>, app: Option<&tauri::AppHandle>) -> Result<ChatResponse, String> {
+async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::path::PathBuf>, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>) -> Result<ChatResponse, String> {
     if model.is_empty() || messages.is_empty() || messages.len() > MAX_MESSAGES || messages.iter().any(|message| {
         !matches!(message.role.as_str(), "user" | "assistant") || message.content.is_empty() || message.content.chars().count() > MAX_MESSAGE_CHARS
     }) || messages.last().is_none_or(|message| message.role != "user") {
@@ -223,10 +228,10 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
     if !tags.models.iter().any(|item| item.name == model) { return Err("This model is no longer installed. Retry to refresh the model list.".to_owned()); }
     let last_prompt = messages.last().map_or("", |message| message.content.trim()).to_owned();
     if last_prompt.eq_ignore_ascii_case("what is your name?") || last_prompt.eq_ignore_ascii_case("what is your name") {
-        return Ok(ChatResponse { model, content: "I'm Elma, your local coding companion in AIIDE. My responses are generated by the selected Ollama model.".into(), activity: vec![] });
+        return Ok(ChatResponse { model, content: "I'm Elma, your local coding companion in AIIDE. My responses are generated by the selected Ollama model.".into(), activity: vec![], proposal: None });
     }
     if last_prompt.eq_ignore_ascii_case("do you have access to my files?") || last_prompt.eq_ignore_ascii_case("do you have access to my files") {
-        return Ok(ChatResponse { model, content: if root.is_some() { "I have controlled, read-only access to the currently opened project through AIIDE's repository tools. I cannot browse other folders or modify files." } else { "No project is open, so I cannot inspect your files. If you open a project, I can inspect it through controlled read-only tools." }.into(), activity: vec![] });
+        return Ok(ChatResponse { model, content: if root.is_some() { "I can inspect this project and prepare focused changes for your review. Only the Apply button can write them." } else { "No project is open, so I cannot inspect or propose changes to files." }.into(), activity: vec![], proposal: None });
     }
     let mut exchange = Vec::new();
     exchange.push(ChatMessage { role: "system".into(), content: SYSTEM.into() });
@@ -251,7 +256,21 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
     let mut needs_inspection: Option<bool> = None;
     let mut inspection_reminders = 0;
     for iteration in 0..=repository::MAX_TOOL_CALLS {
-        let (result, action) = agent_turn(&client, &model, &mut exchange, app).await?;
+        let (result, action) = agent_turn(&client, &model, &mut exchange, successful_reads > 0, app).await?;
+        if let AgentAction::Propose(summary, edits) = action {
+            let root = root.as_ref().ok_or_else(|| "Open a project before proposing changes.".to_owned())?;
+            if edits.iter().any(|edit| !read_paths.contains(&edit.path)) {
+                exchange.push(result.message);
+                exchange.push(ChatMessage { role: "user".into(), content: "Every proposed target must first be inspected with read_file. Inspect the exact target path, then propose the focused replacement.".into() });
+                continue;
+            }
+            if let Some(app) = app { let _ = app.emit("proposal-validation-start", ()); }
+            let proposal = repository::validate_proposal(root, summary, edits)?;
+            if let Some(pending) = pending {
+                *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone());
+            }
+            return Ok(ChatResponse { model: result.model, content: "A focused change is ready for review in the Changes panel.".into(), activity, proposal: Some(proposal) });
+        }
         if let AgentAction::Answer(answer) = action {
             if root.is_some() && successful_reads == 0 {
                 let needed = match needs_inspection {
@@ -270,7 +289,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
                         exchange.push(ChatMessage { role: "user".into(), content: "This question needs evidence from the opened project. Use list_files to find exact paths, then read_file on relevant files before answering. A failed tool or no matches does not prove files are absent.".into() });
                         continue;
                     }
-                    return Ok(ChatResponse { model: result.model, content: "I couldn't inspect the opened project, so I can't give a file-based answer. Please try again.".into(), activity });
+                    return Ok(ChatResponse { model: result.model, content: "I couldn't inspect the opened project, so I can't give a file-based answer. Please try again.".into(), activity, proposal: None });
                 }
             }
             if unresolved_failure && successful_inspections > 0 {
@@ -280,7 +299,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
                     exchange.push(ChatMessage { role: "user".into(), content: "Your last repository tool did not provide evidence. Inspect another relevant file or correct the path before answering. Use exact paths from list_files.".into() });
                     continue;
                 }
-                return Ok(ChatResponse { model: result.model, content: "I couldn't verify the relevant project files, so I can't give a grounded answer. Please try again.".into(), activity });
+                return Ok(ChatResponse { model: result.model, content: "I couldn't verify the relevant project files, so I can't give a grounded answer. Please try again.".into(), activity, proposal: None });
             }
             trace("final answer");
             let content = if !read_paths.is_empty() {
@@ -288,15 +307,15 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
                 let answer = final_turn(&client, &model, &last_prompt, &info, &evidence, &read_paths).await?;
                 format!("{answer}\n\nFiles actually inspected: {}", read_paths.join(", "))
             } else { answer };
-            return Ok(ChatResponse { model: result.model, content, activity });
+            return Ok(ChatResponse { model: result.model, content, activity, proposal: None });
         }
-        if root.is_none() { return Ok(ChatResponse { model: result.model, content: "Open a project to use repository tools.".into(), activity }); }
+        if root.is_none() { return Ok(ChatResponse { model: result.model, content: "Open a project to use repository tools.".into(), activity, proposal: None }); }
         if iteration == repository::MAX_TOOL_CALLS { break; }
         let request = match action {
             AgentAction::List(path) => ToolRequest { tool: "list_files".into(), path, query: String::new() },
             AgentAction::Search(query) => ToolRequest { tool: "search_files".into(), path: String::new(), query },
             AgentAction::Read(path) => ToolRequest { tool: "read_file".into(), path, query: String::new() },
-            AgentAction::Answer(_) => unreachable!(),
+            AgentAction::Answer(_) | AgentAction::Propose(_, _) => unreachable!(),
         };
         trace(&format!("tool selected: {}", request.tool));
         let key = format!("{}|{}|{}", request.tool, request.path, request.query);
@@ -331,7 +350,8 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
         exchange.push(result.message);
         let unread = known_file_paths.iter().filter(|path| !read_paths.contains(path)).cloned().collect::<Vec<_>>().join(", ");
         exchange.push(ChatMessage { role: "user".into(), content: format!("Tool result for {} ({}):\n{}\n{}{}{}", request.tool, if useful { "success" } else { "no evidence" }, output,
-            if useful { "Continue with another structured tool request or a grounded final answer. Use exact listed paths." }
+            if useful && request.tool == "read_file" { "The target file is now inspected. If the original request asks you to implement, fix, add, remove, or otherwise change code, use propose_change with focused exact old_text/new_text now. Otherwise continue inspection or answer. Use exact listed paths." }
+            else if useful { "Continue with another structured tool request or a grounded final answer. Use exact listed paths." }
             else { "This result does not establish that files are absent. Try list_files or another exact project-relative path before answering. If this request was repeated, choose an unread listed file." },
             if !known_paths.is_empty() { format!("\nExact paths from the project listing: {known_paths}") } else { String::new() },
             if !unread.is_empty() { format!("\nListed files not yet read: {unread}") } else { String::new() }) });
@@ -341,9 +361,9 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
         let info = root.as_ref().map(|path| super::project::inspect_metadata(path)).unwrap_or_default();
         let answer = final_turn(&client, &model, &last_prompt, &info, &evidence, &read_paths).await?;
         let content = format!("{answer}\n\nFiles actually inspected: {}", read_paths.join(", "));
-        return Ok(ChatResponse { model, content, activity });
+        return Ok(ChatResponse { model, content, activity, proposal: None });
     }
-    Ok(ChatResponse { model, content: "I reached the repository inspection limit before I could read a relevant file. Please ask a narrower question.".into(), activity })
+    Ok(ChatResponse { model, content: "I reached the repository inspection limit before I could read a relevant file. Please ask a narrower question.".into(), activity, proposal: None })
 }
 
 #[cfg(test)]
@@ -357,6 +377,7 @@ mod tests {
         assert_eq!(parse_action(r#"{"action":"search_files","query":"menu"}"#), Ok(AgentAction::Search("menu".into())));
         assert_eq!(parse_action(r#"{"action":"read_file","path":"src/index.html"}"#), Ok(AgentAction::Read("src/index.html".into())));
         assert_eq!(parse_action(r#"{"action":"answer","answer":"A direct response."}"#), Ok(AgentAction::Answer("A direct response.".into())));
+        assert!(matches!(parse_action(r#"{"action":"propose_change","summary":"Improve label","changes":[{"path":"index.html","old_text":"<input>","new_text":"<label>Name</label><input>"}]}"#), Ok(AgentAction::Propose(_, _))));
     }
 
     #[test]
@@ -402,7 +423,7 @@ mod tests {
             let response = tauri::async_runtime::block_on(run_agent(
                 "qwen2.5-coder:7b".into(),
                 vec![ChatMessage { role: "user".into(), content: (*prompt).into() }],
-                Some(root.clone()), None,
+                Some(root.clone()), None, None,
             )).expect("agent request should complete");
             println!("case {} activity: {:?}; answer: {}", index + 1,
                 response.activity.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(), response.content);
@@ -415,5 +436,22 @@ mod tests {
             }
             assert!(!response.content.contains("inspection limit"));
         }
+    }
+
+    #[test]
+    #[ignore = "requires local Ollama with qwen2.5-coder:7b and clean aiide-sandbox"]
+    fn local_proposal_acceptance() {
+        let root = std::fs::canonicalize(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../aiide-sandbox"))
+            .expect("aiide-sandbox must exist beside AIIDE");
+        let before = std::fs::read_to_string(root.join("src/index.html")).expect("sandbox signup page must exist");
+        let response = tauri::async_runtime::block_on(run_agent(
+            "qwen2.5-coder:7b".into(),
+            vec![ChatMessage { role: "user".into(), content: "Improve the signup form accessibility. Make a focused change and let me review it before anything is applied.".into() }],
+            Some(root.clone()), None, None,
+        )).expect("agent request should complete");
+        let proposal = response.proposal.expect("agent should produce a validated proposal");
+        assert_eq!(proposal.changes[0].path, "src/index.html");
+        assert_ne!(proposal.changes[0].before, proposal.changes[0].after);
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), before, "proposal must not write");
     }
 }
