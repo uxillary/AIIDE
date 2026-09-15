@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { Elma, type ElmaState } from './Elma'
-import { ollamaProvider } from '../services/ai/ollama'
+import { getAgentDebugStatus, getLatestAgentTrace, ollamaProvider, setAgentDebug } from '../services/ai/ollama'
 import type { ChatMessage, PendingProposal, ProviderStatus } from '../types/ai'
 
 const MODEL_KEY = 'aiide.selected-model'
@@ -25,6 +25,10 @@ export function LocalChat({ projectOpen, onProposal, changeState }: { projectOpe
   const [inspecting, setInspecting] = useState(false)
   const [terminalState, setTerminalState] = useState<'success' | 'error' | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [debug, setDebug] = useState(false)
+  const [hasTrace, setHasTrace] = useState(false)
+  const [debugTrace, setDebugTrace] = useState<string | null>(null)
+  const [copyStatus, setCopyStatus] = useState('')
   const endRef = useRef<HTMLDivElement>(null)
   const checkingRef = useRef(false)
   const inspectionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -54,7 +58,7 @@ export function LocalChat({ projectOpen, onProposal, changeState }: { projectOpe
     } finally { checkingRef.current = false; setChecking(false) }
   }
 
-  useEffect(() => { void refresh() }, [])
+  useEffect(() => { void refresh(); void getAgentDebugStatus().then(value => { setDebug(value.enabled); setHasTrace(value.hasTrace) }) }, [])
   useEffect(() => { const subscription = listen('repository-inspection-start', () => {
     setRetrying(false)
     setInspecting(true)
@@ -101,7 +105,26 @@ export function LocalChat({ projectOpen, onProposal, changeState }: { projectOpe
       setMessages(messages)
       showTerminalState('error', ERROR_DISPLAY_MS)
       await refresh()
-    } finally { setLoading(false); setInspecting(false); setRetrying(false) }
+    } finally {
+      if (debug) { try { const state = await getAgentDebugStatus(); setHasTrace(state.hasTrace); setDebugTrace(null) } catch { setHasTrace(false) } }
+      setLoading(false); setInspecting(false); setRetrying(false)
+    }
+  }
+
+  async function toggleDebug() {
+    const state = await setAgentDebug(!debug)
+    setDebug(state.enabled); setHasTrace(state.hasTrace); setDebugTrace(null); setCopyStatus('')
+  }
+
+  async function loadTrace() {
+    const trace = await getLatestAgentTrace(); setDebugTrace(trace); return trace
+  }
+
+  async function copyTrace() {
+    const trace = await loadTrace()
+    if (!trace) return
+    await navigator.clipboard.writeText(trace)
+    setCopyStatus('Copied')
   }
 
   const connected = status?.state === 'connected'
@@ -119,8 +142,9 @@ export function LocalChat({ projectOpen, onProposal, changeState }: { projectOpe
     <div className="main-label">LOCAL AI</div>
     <div className="chat-toolbar">
       <div className="flex items-center gap-3"><span className="text-xs font-semibold text-stone-200">{ollamaProvider.name}</span><span className={`connection-state ${connected ? 'text-emerald-400' : status ? 'text-amber-400' : 'text-stone-500'}`}>{checking ? 'Checking…' : connected ? 'Connected' : status?.state === 'error' ? 'Error' : 'Offline'}</span></div>
-      <div className="flex items-center gap-2"><label htmlFor="model" className="text-xs text-stone-500">Model</label><select id="model" className="model-select" value={selectedModel} disabled={!ready || loading} onChange={event => { setSelectedModel(event.target.value); localStorage.setItem(MODEL_KEY, event.target.value) }}><option value="">{ready ? 'Select model' : 'No models'}</option>{status?.models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</select><button className="subtle-button" onClick={() => void refresh()} disabled={checking || loading}>Retry</button></div>
+      <div className="flex items-center gap-2"><button className="subtle-button" aria-pressed={debug} disabled={loading} onClick={() => void toggleDebug()}>Debug [{debug ? 'ON' : 'OFF'}]</button><label htmlFor="model" className="text-xs text-stone-500">Model</label><select id="model" className="model-select" value={selectedModel} disabled={!ready || loading} onChange={event => { setSelectedModel(event.target.value); localStorage.setItem(MODEL_KEY, event.target.value) }}><option value="">{ready ? 'Select model' : 'No models'}</option>{status?.models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</select><button className="subtle-button" onClick={() => void refresh()} disabled={checking || loading}>Retry</button></div>
     </div>
+    {debug && <details className="border-b border-stone-800 bg-stone-950 px-4 py-2 text-[11px] text-stone-400" onToggle={event => { if (event.currentTarget.open && hasTrace && !debugTrace) void loadTrace() }}><summary className="cursor-pointer select-none">Agent diagnostics</summary><div className="mt-2 flex items-center gap-3"><button className="subtle-button" disabled={!hasTrace} onClick={() => void copyTrace()}>Copy trace</button>{copyStatus && <span>{copyStatus}</span>}<span>Local traces may contain prompts, paths, and source context. Review before sharing.</span></div>{debugTrace && <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded border border-stone-800 bg-black p-2 text-[10px] leading-4 text-stone-300">{debugTrace}</pre>}</details>}
     {projectOpen && <div className="chat-notice">Elma has controlled read-only access to this project.</div>}
     <div className="elma-status"><Elma state={elmaState} /><span>{elmaStatus}</span></div>
     <div className="chat-history">

@@ -10,3 +10,4 @@ export interface ChatRequest { model: string; messages: ChatMessage[] }
 export interface PendingChange { path: string; before: string; after: string; replacements: number }
 export interface PendingProposal { summary: string; changes: PendingChange[] }
 export interface ChatResponse { model: string; content: string; activity: { label: string }[]; proposal: PendingProposal | null }
+export interface AgentDebugStatus { enabled: boolean; hasTrace: boolean }

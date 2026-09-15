@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, State};
 use crate::project::OpenProject;
 use crate::repository::{self, Activity, PendingChanges, PendingProposal, ProposedReplacement, ToolRequest};
@@ -11,6 +13,54 @@ const MAX_MESSAGES: usize = 40;
 const MAX_MESSAGE_CHARS: usize = 12_000;
 const PROTOCOL_TEMPERATURE: f32 = 0.0;
 const CONVERSATIONAL_TEMPERATURE: f32 = 0.2;
+
+#[derive(Default)]
+struct DebugData { enabled: bool, latest: Option<String>, next_request: u64 }
+
+#[derive(Default)]
+pub struct AgentDebug(Mutex<DebugData>);
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugStatus { enabled: bool, has_trace: bool }
+
+#[derive(Default)]
+struct TraceBuffer { lines: Vec<String>, next_turn: usize }
+type Trace = Arc<Mutex<TraceBuffer>>;
+
+fn debug_log(trace: Option<&Trace>, category: &str, message: impl AsRef<str>) {
+    let Some(trace) = trace else { return };
+    let line = format!("[AIIDE][{category}] {}", message.as_ref());
+    eprintln!("{line}");
+    if let Ok(mut buffer) = trace.lock() { buffer.lines.push(line); }
+}
+
+fn trace_turn(trace: Option<&Trace>) -> usize {
+    let Some(trace) = trace else { return 0 };
+    let Ok(mut buffer) = trace.lock() else { return 0 };
+    buffer.next_turn += 1;
+    buffer.next_turn
+}
+
+#[tauri::command]
+pub fn set_agent_debug(enabled: bool, debug: State<'_, AgentDebug>) -> Result<DebugStatus, String> {
+    let mut state = debug.0.lock().map_err(|_| "Debug state unavailable")?;
+    state.enabled = enabled;
+    if !enabled { state.latest = None; }
+    Ok(DebugStatus { enabled, has_trace: state.latest.is_some() })
+}
+
+#[tauri::command]
+pub fn agent_debug_status(debug: State<'_, AgentDebug>) -> Result<DebugStatus, String> {
+    let state = debug.0.lock().map_err(|_| "Debug state unavailable")?;
+    Ok(DebugStatus { enabled: state.enabled, has_trace: state.latest.is_some() })
+}
+
+#[tauri::command]
+pub fn latest_agent_trace(debug: State<'_, AgentDebug>) -> Result<Option<String>, String> {
+    let state = debug.0.lock().map_err(|_| "Debug state unavailable")?;
+    Ok(if state.enabled { state.latest.clone() } else { None })
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,37 +151,48 @@ fn parse_action(raw: &str) -> Result<AgentAction, &'static str> {
     }
 }
 
-fn trace(message: &str) {
-    #[cfg(debug_assertions)]
-    if std::env::var_os("AIIDE_TRACE_AGENT").is_some() { eprintln!("[agent] {message}"); }
-    #[cfg(not(debug_assertions))]
-    let _ = message;
-}
-
-async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessage], format: Value, temperature: f32) -> Result<ChatPayloadResponse, String> {
+async fn chat_turn(client: &reqwest::Client, model: &str, messages: &[ChatMessage], format: Value, temperature: f32, stage: &str, trace: Option<&Trace>) -> Result<ChatPayloadResponse, String> {
+    let turn = trace_turn(trace);
+    debug_log(trace, "protocol", format!("Turn {turn} — {stage}\nTemperature: {temperature}\nStructured format supplied: yes\nMessage count: {}\nMessage roles: {}\nSchema/format: {}", messages.len(), messages.iter().map(|message| message.role.as_str()).collect::<Vec<_>>().join(", "), format));
+    if trace.is_some() {
+        for (index, message) in messages.iter().enumerate() {
+            debug_log(trace, "agent", format!("Message {} ({})\n--- MESSAGE START ---\n{}\n--- MESSAGE END ---", index + 1, message.role, message.content));
+        }
+    }
+    let started = Instant::now();
+    debug_log(trace, "ollama", format!("Turn {turn} request started"));
     let response = client.post(format!("{BASE}/api/chat"))
         .json(&ChatPayload { model, messages, stream: false, format, options: ChatOptions { temperature, num_predict: 2_048 } })
         .send().await.map_err(request_error)?;
     if !response.status().is_success() { return Err("Ollama could not complete the chat request. Try again.".into()); }
     let result = response.json::<ChatPayloadResponse>().await.map_err(|_| "Ollama returned an invalid chat response.".to_owned())?;
+    debug_log(trace, "ollama", format!("Turn {turn} response received in {}ms\n--- RAW OLLAMA RESPONSE START ---\n{}\n--- RAW OLLAMA RESPONSE END ---\nMetadata: model={}, done={}, done_reason={:?}", started.elapsed().as_millis(), result.message.content, result.model, result.done, result.done_reason));
     if !result.done || result.message.role != "assistant" || result.model.is_empty() { return Err("Ollama returned an incomplete chat response.".into()); }
-    trace(&format!("Ollama done_reason: {:?}", result.done_reason));
     Ok(result)
 }
 
-async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<ChatMessage>, allow_proposal: bool, app: Option<&tauri::AppHandle>) -> Result<(ChatPayloadResponse, AgentAction), String> {
+async fn agent_turn(client: &reqwest::Client, model: &str, exchange: &mut Vec<ChatMessage>, allow_proposal: bool, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<(ChatPayloadResponse, AgentAction), String> {
     for attempt in 0..=MAX_REPAIRS {
-        let result = chat_turn(client, model, exchange, agent_schema(allow_proposal), PROTOCOL_TEMPERATURE).await?;
-        trace(&format!("raw model response: {}", result.message.content.chars().take(2_000).collect::<String>()));
+        let stage = if attempt == 0 { "STRUCTURED".to_owned() } else { format!("REPAIR {attempt}/{MAX_REPAIRS}") };
+        let result = chat_turn(client, model, exchange, agent_schema(allow_proposal), PROTOCOL_TEMPERATURE, &stage, trace).await?;
         let parsed = if result.done_reason.as_deref() == Some("length") { Err("response exceeded the model output limit") }
             else { parse_action(&result.message.content) };
         match parsed {
-            Ok(action) => { trace(&format!("parse success: {}", action_name(&action))); return Ok((result, action)); }
+            Ok(action) => { debug_log(trace, "protocol", format!("JSON parsing: PASSED\nSchema validation: PASSED\nSemantic validation: PASSED\nSelected action: {}", action_name(&action))); return Ok((result, action)); }
             Err(reason) => {
-                trace(&format!("parse failure: {reason}; repair attempt {attempt}"));
+                let diagnostic = match serde_json::from_str::<Value>(&result.message.content) {
+                    Err(error) => format!("JSON parsing: FAILED — {error}\nSchema validation: not run\nSemantic validation: not run"),
+                    Ok(_) => match serde_json::from_str::<AgentReply>(&result.message.content) {
+                        Err(error) => format!("JSON parsing: PASSED\nSchema validation: FAILED — {error}\nSemantic validation: not run"),
+                        Ok(_) => format!("JSON parsing: PASSED\nSchema validation: PASSED\nSemantic validation: FAILED — {reason}"),
+                    },
+                };
+                debug_log(trace, "protocol", diagnostic);
                 if attempt == MAX_REPAIRS { break; }
                 if let Some(app) = app { let _ = app.emit("repository-retry", ()); }
-                exchange.push(ChatMessage { role: "user".into(), content: format!("Your previous response was invalid ({reason}). Return exactly one JSON object matching the schema. No prose or markdown.") });
+                let repair = format!("Your previous response was invalid ({reason}). Return exactly one JSON object matching the schema. No prose or markdown.");
+                debug_log(trace, "repair", format!("Attempt {}/{}\nOriginal failure: {reason}\n--- REPAIR INSTRUCTION START ---\n{repair}\n--- REPAIR INSTRUCTION END ---", attempt + 1, MAX_REPAIRS));
+                exchange.push(ChatMessage { role: "user".into(), content: repair });
             }
         }
     }
@@ -142,15 +203,14 @@ fn action_name(action: &AgentAction) -> &'static str {
     match action { AgentAction::List(_) => "list_files", AgentAction::Search(_) => "search_files", AgentAction::Read(_) => "read_file", AgentAction::Answer(_) => "answer", AgentAction::Propose(_, _) => "propose_change" }
 }
 
-async fn requires_inspection(client: &reqwest::Client, model: &str, prompt: &str) -> Result<bool, String> {
+async fn requires_inspection(client: &reqwest::Client, model: &str, prompt: &str, trace: Option<&Trace>) -> Result<bool, String> {
     let mut messages = vec![
         ChatMessage { role: "system".into(), content: "Classify whether answering this user prompt requires inspecting the currently opened project. Use repository for questions about this project's behavior, structure, UI, bugs, or improvements, including indirect references like 'the menu'. Use general for conceptual questions such as 'What is a JavaScript closure?'. Return only a JSON object with scope general or repository.".into() },
         ChatMessage { role: "user".into(), content: prompt.into() },
     ];
     for attempt in 0..=MAX_REPAIRS {
-        let result = chat_turn(client, model, &messages, scope_schema(), PROTOCOL_TEMPERATURE).await?;
+        let result = chat_turn(client, model, &messages, scope_schema(), PROTOCOL_TEMPERATURE, "SCOPE CLASSIFICATION", trace).await?;
         if let Some(needed) = parse_scope(&result.message.content) { return Ok(needed); }
-        trace(&format!("scope parse failure; repair attempt {attempt}"));
         if attempt == MAX_REPAIRS { break; }
         messages.push(ChatMessage { role: "user".into(), content: "Return exactly one JSON object: {\"scope\":\"repository\"} or {\"scope\":\"general\"}.".into() });
     }
@@ -165,17 +225,17 @@ fn parse_scope(raw: &str) -> Option<bool> {
     match scope.scope.as_str() { "repository" => Some(true), "general" => Some(false), _ => None }
 }
 
-async fn final_turn(client: &reqwest::Client, model: &str, prompt: &str, project_info: &str, evidence: &[(String, String)], read_paths: &[String]) -> Result<String, String> {
+async fn final_turn(client: &reqwest::Client, model: &str, prompt: &str, project_info: &str, evidence: &[(String, String)], read_paths: &[String], trace: Option<&Trace>) -> Result<String, String> {
     let mut exchange = vec![
         ChatMessage { role: "system".into(), content: format!("You are Elma inside AIIDE. {project_info} Answer the user's original question using only the repository evidence below. Do not respond to a prior tool search or infer missing files from a failed tool. Do not invent filenames: HTML sections are not separate files. Do not list inspected filenames in your answer; the application appends the verified list. No more tools are available. Keep the answer under 120 words and address every part of the user's request. Avoid quoted code snippets or HTML attributes. Return only a JSON object with action answer and answer text.") },
         ChatMessage { role: "system".into(), content: DEFAULT_PERSONALITY.into() },
         ChatMessage { role: "user".into(), content: format!("Files actually read: {}\n\nRepository evidence:\n{}\n\nOriginal user request: {prompt}\n\nAnswer this original request directly, using the evidence above. If it asks for a review, give exactly three concrete improvements. For each, say what to change, which of the actual files would be affected, and why. Avoid speculative claims, generic advice, invented files, code snippets, and unverified accessibility findings. The app separately reports inspected files.", read_paths.join(", "), evidence.iter().map(|(name, value)| format!("[{name}]\n{value}")).collect::<Vec<_>>().join("\n\n")) },
     ];
     for attempt in 0..=MAX_REPAIRS {
-        let result = chat_turn(client, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE).await?;
-        trace(&format!("final raw model response: {}", result.message.content.chars().take(2_000).collect::<String>()));
+        debug_log(trace, "final", "Grounded personality answer started; personality included: yes");
+        let result = chat_turn(client, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE, "GROUNDED FINAL ANSWER", trace).await?;
         if result.done_reason.as_deref() != Some("length") {
-            if let Ok(AgentAction::Answer(answer)) = parse_action(&result.message.content) { return Ok(answer); }
+            if let Ok(AgentAction::Answer(answer)) = parse_action(&result.message.content) { debug_log(trace, "final", "Grounded personality answer accepted"); return Ok(answer); }
         }
         if attempt == MAX_REPAIRS { break; }
         exchange.last_mut().unwrap().content.push_str("\n\nYour previous response was invalid or too long. Answer the ORIGINAL REQUEST above in at most 90 words. For a review, give three short numbered improvements with actual affected files and reasons. Return only the JSON answer object.");
@@ -183,15 +243,16 @@ async fn final_turn(client: &reqwest::Client, model: &str, prompt: &str, project
     Err("The local model could not produce a final structured answer after two retries.".into())
 }
 
-async fn conversational_turn(client: &reqwest::Client, model: &str, prompt: &str, draft: &str) -> Result<String, String> {
+async fn conversational_turn(client: &reqwest::Client, model: &str, prompt: &str, draft: &str, trace: Option<&Trace>) -> Result<String, String> {
     let mut exchange = vec![
         ChatMessage { role: "system".into(), content: format!("You are Elma inside AIIDE. {DEFAULT_PERSONALITY} Preserve the draft's factual meaning. Return only a JSON object with action answer and answer text.") },
         ChatMessage { role: "user".into(), content: format!("Original question: {prompt}\n\nDraft answer: {draft}\n\nGive the shortest complete answer in Elma's natural voice. Do not add facts that are absent from the draft.") },
     ];
     for attempt in 0..=MAX_REPAIRS {
-        let result = chat_turn(client, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE).await?;
+        debug_log(trace, "final", "Personality rewrite started; personality included: yes");
+        let result = chat_turn(client, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE, "PERSONALITY REWRITE", trace).await?;
         if result.done_reason.as_deref() != Some("length") {
-            if let Ok(AgentAction::Answer(answer)) = parse_action(&result.message.content) { return Ok(answer); }
+            if let Ok(AgentAction::Answer(answer)) = parse_action(&result.message.content) { debug_log(trace, "final", "Personality rewrite accepted"); return Ok(answer); }
         }
         if attempt == MAX_REPAIRS { break; }
         exchange.last_mut().unwrap().content.push_str("\n\nReturn one valid JSON answer object in at most 80 words.");
@@ -231,12 +292,32 @@ pub async fn ollama_status() -> ProviderStatus {
 }
 
 #[tauri::command]
-pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project: State<'_, OpenProject>, pending: State<'_, PendingChanges>, app: tauri::AppHandle) -> Result<ChatResponse, String> {
+pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project: State<'_, OpenProject>, pending: State<'_, PendingChanges>, debug: State<'_, AgentDebug>, app: tauri::AppHandle) -> Result<ChatResponse, String> {
     let root = open_project.0.lock().map_err(|_| "Project state unavailable")?.clone();
-    run_agent(model, messages, root, Some(&pending), Some(&app)).await
+    let started = Instant::now();
+    let (request, trace) = {
+        let mut state = debug.0.lock().map_err(|_| "Debug state unavailable")?;
+        if state.enabled {
+            state.next_request += 1;
+            (state.next_request, Some(Arc::new(Mutex::new(TraceBuffer::default()))))
+        } else { (0, None) }
+    };
+    if let Some(trace) = trace.as_ref() {
+        let started_at = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0);
+        debug_log(Some(trace), "agent", format!("==================================================\nAIIDE AGENT DEBUG TRACE\nTrace version: 1\nRequest: #{request}\nStarted at Unix ms: {started_at}\nModel: {model}\nProject: {}\nCore agent instructions: included on agent turns\nDefault personality: included only on final conversational turns\n==================================================", root.as_ref().and_then(|path| path.file_name()).map(|name| name.to_string_lossy()).unwrap_or_else(|| "none".into())));
+    }
+    let result = run_agent(model, messages, root, Some(&pending), Some(&app), trace.as_ref()).await;
+    if let Some(trace) = trace {
+        if let Err(error) = &result { debug_log(Some(&trace), "final", format!("FAILED\n{error}")); }
+        debug_log(Some(&trace), "final", format!("Result: {}\nTotal duration: {}ms\n==================================================", if result.is_ok() { "SUCCESS" } else { "FAILED" }, started.elapsed().as_millis()));
+        let report = trace.lock().map(|buffer| buffer.lines.join("\n\n")).unwrap_or_else(|_| "Trace unavailable".into());
+        let mut state = debug.0.lock().map_err(|_| "Debug state unavailable")?;
+        if state.enabled { state.latest = Some(report); }
+    }
+    result
 }
 
-async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::path::PathBuf>, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>) -> Result<ChatResponse, String> {
+async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::path::PathBuf>, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>, debug_trace: Option<&Trace>) -> Result<ChatResponse, String> {
     if model.is_empty() || messages.is_empty() || messages.len() > MAX_MESSAGES || messages.iter().any(|message| {
         !matches!(message.role.as_str(), "user" | "assistant") || message.content.is_empty() || message.content.chars().count() > MAX_MESSAGE_CHARS
     }) || messages.last().is_none_or(|message| message.role != "user") {
@@ -277,7 +358,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
     let mut needs_inspection: Option<bool> = None;
     let mut inspection_reminders = 0;
     for iteration in 0..=repository::MAX_TOOL_CALLS {
-        let (result, action) = agent_turn(&client, &model, &mut exchange, successful_reads > 0, app).await?;
+        let (result, action) = agent_turn(&client, &model, &mut exchange, successful_reads > 0, app, debug_trace).await?;
         if let AgentAction::Propose(summary, edits) = action {
             let root = root.as_ref().ok_or_else(|| "Open a project before proposing changes.".to_owned())?;
             if edits.iter().any(|edit| !read_paths.contains(&edit.path)) {
@@ -286,10 +367,12 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
                 continue;
             }
             if let Some(app) = app { let _ = app.emit("proposal-validation-start", ()); }
+            debug_log(debug_trace, "tool", format!("propose_change selected\nPath: {}\nReplacements: {}\nValidation: started", edits.first().map(|edit| edit.path.as_str()).unwrap_or("none"), edits.len()));
             let proposal = repository::validate_proposal(root, summary, edits)?;
             if let Some(pending) = pending {
                 *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone());
             }
+            debug_log(debug_trace, "tool", "Proposal validation: passed\nPending change creation: passed");
             return Ok(ChatResponse { model: result.model, content: "Done — have a wee look in Changes 👀".into(), activity, proposal: Some(proposal) });
         }
         if let AgentAction::Answer(answer) = action {
@@ -297,8 +380,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
                 let needed = match needs_inspection {
                     Some(needed) => needed,
                     None => {
-                        let needed = requires_inspection(&client, &model, &last_prompt).await?;
-                        trace(&format!("repository intent: {needed}"));
+                        let needed = requires_inspection(&client, &model, &last_prompt, debug_trace).await?;
                         needs_inspection = Some(needed);
                         needed
                     }
@@ -322,12 +404,11 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
                 }
                 return Ok(ChatResponse { model: result.model, content: "I couldn't verify the relevant project files, so I can't give a grounded answer. Please try again.".into(), activity, proposal: None });
             }
-            trace("final answer");
             let content = if !read_paths.is_empty() {
                 let info = root.as_ref().map(|path| super::project::inspect_metadata(path)).unwrap_or_default();
-                let answer = final_turn(&client, &model, &last_prompt, &info, &evidence, &read_paths).await?;
+                let answer = final_turn(&client, &model, &last_prompt, &info, &evidence, &read_paths, debug_trace).await?;
                 format!("{answer}\n\nFiles actually inspected: {}", read_paths.join(", "))
-            } else { conversational_turn(&client, &model, &last_prompt, &answer).await? };
+            } else { conversational_turn(&client, &model, &last_prompt, &answer, debug_trace).await? };
             return Ok(ChatResponse { model: result.model, content, activity, proposal: None });
         }
         if root.is_none() { return Ok(ChatResponse { model: result.model, content: "Open a project to use repository tools.".into(), activity, proposal: None }); }
@@ -338,12 +419,13 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
             AgentAction::Read(path) => ToolRequest { tool: "read_file".into(), path, query: String::new() },
             AgentAction::Answer(_) | AgentAction::Propose(_, _) => unreachable!(),
         };
-        trace(&format!("tool selected: {}", request.tool));
         let key = format!("{}|{}|{}", request.tool, request.path, request.query);
         let repeated = seen.contains(&key);
         if !repeated {
             if let Some(app) = app { let _ = app.emit("repository-inspection-start", ()); }
         }
+        let tool_started = Instant::now();
+        debug_log(debug_trace, "tool", format!("{} requested\nPath: {}\nQuery: {}", request.tool, request.path, request.query));
         let (output, event) = if seen.insert(key) { repository::execute(root.as_deref().unwrap(), &request) }
             else { ("This tool request was already answered in this turn; use the earlier result.".into(), Activity { label: "Repeated inspection skipped".into() }) };
         let remaining = repository::MAX_CONTEXT_BYTES.saturating_sub(context_bytes);
@@ -365,7 +447,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
             evidence.push((format!("{} {}", request.tool, request.path), output.clone()));
             unresolved_failure = false;
         } else { unresolved_failure = true; }
-        trace(&format!("tool result: {} bytes; error={}", output.len(), output.starts_with("Error:")));
+        debug_log(debug_trace, "tool", format!("{}\nValidation/execution: {}\nReturned: {} bytes\nDuration: {}ms\nNext stage: agent turn", request.tool, if output.starts_with("Error:") { &output } else { "passed" }, output.len(), tool_started.elapsed().as_millis()));
         if let Some(app) = app { let _ = app.emit("repository-activity", &event); }
         activity.push(event);
         exchange.push(result.message);
@@ -380,7 +462,7 @@ async fn run_agent(model: String, messages: Vec<ChatMessage>, root: Option<std::
     }
     if !read_paths.is_empty() {
         let info = root.as_ref().map(|path| super::project::inspect_metadata(path)).unwrap_or_default();
-        let answer = final_turn(&client, &model, &last_prompt, &info, &evidence, &read_paths).await?;
+        let answer = final_turn(&client, &model, &last_prompt, &info, &evidence, &read_paths, debug_trace).await?;
         let content = format!("{answer}\n\nFiles actually inspected: {}", read_paths.join(", "));
         return Ok(ChatResponse { model, content, activity, proposal: None });
     }
@@ -400,6 +482,31 @@ mod tests {
         assert!(!DEFAULT_PERSONALITY.contains("propose_change"));
         assert_eq!(PROTOCOL_TEMPERATURE, 0.0);
         assert_eq!(CONVERSATIONAL_TEMPERATURE, 0.2);
+    }
+
+    #[test]
+    fn debug_defaults_off_and_trace_is_chronological() {
+        let debug = AgentDebug::default();
+        let state = debug.0.lock().unwrap();
+        assert!(!state.enabled);
+        assert!(state.latest.is_none());
+        drop(state);
+
+        let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        debug_log(Some(&trace), "ollama", "--- RAW OLLAMA RESPONSE START ---\nplain prose\n--- RAW OLLAMA RESPONSE END ---");
+        debug_log(Some(&trace), "protocol", "Parse or semantic validation: FAILED — expected value");
+        debug_log(Some(&trace), "repair", "Attempt 1/2");
+        debug_log(Some(&trace), "final", "Personality rewrite started");
+        let report = trace.lock().unwrap().lines.join("\n");
+        assert!(report.find("plain prose").unwrap() < report.find("FAILED").unwrap());
+        assert!(report.find("FAILED").unwrap() < report.find("Attempt 1/2").unwrap());
+        assert!(report.find("Attempt 1/2").unwrap() < report.find("Personality rewrite").unwrap());
+    }
+
+    #[test]
+    fn debug_off_retains_nothing() {
+        debug_log(None, "ollama", "raw response");
+        assert_eq!(trace_turn(None), 0);
     }
 
     #[test]
@@ -455,7 +562,7 @@ mod tests {
             let response = tauri::async_runtime::block_on(run_agent(
                 "qwen2.5-coder:7b".into(),
                 vec![ChatMessage { role: "user".into(), content: (*prompt).into() }],
-                Some(root.clone()), None, None,
+                Some(root.clone()), None, None, None,
             )).expect("agent request should complete");
             println!("case {} activity: {:?}; answer: {}", index + 1,
                 response.activity.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(), response.content);
@@ -479,7 +586,7 @@ mod tests {
         let response = tauri::async_runtime::block_on(run_agent(
             "qwen2.5-coder:7b".into(),
             vec![ChatMessage { role: "user".into(), content: "Improve the signup form accessibility. Make a focused change and let me review it before anything is applied.".into() }],
-            Some(root.clone()), None, None,
+            Some(root.clone()), None, None, None,
         )).expect("agent request should complete");
         let proposal = response.proposal.expect("agent should produce a validated proposal");
         assert_eq!(proposal.changes[0].path, "src/index.html");

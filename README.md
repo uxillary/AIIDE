@@ -10,4 +10,8 @@ Ollama's JSON-schema output format constrains tool, answer, and change-proposal 
 
 Milestone 04 proposals are limited to one existing UTF-8 text file, four exact unambiguous replacements, and 24 KB of proposal content. New files, deletion, rename, fuzzy matching, automatic merge, commands, and Git mutations are not supported.
 
+## Agent Debug Mode
+
+Use the secondary **Debug [OFF/ON]** toggle beside the model selector, reproduce one request, then choose **Agent diagnostics → Copy trace**. Debug Mode retains only the latest request in memory and prints the same chronological trace to the `npm run tauri dev` terminal. Traces include request metadata, supplied messages and schemas, exact raw model responses, parse results, repairs, tool summaries, final stages, and timings. They can contain prompts, local paths, and source context, so review them before sharing. Debug Mode changes observability only and is off by default.
+
 See [PROJECT.md](PROJECT.md) for the detailed specification and roadmap.
