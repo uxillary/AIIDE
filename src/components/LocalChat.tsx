@@ -8,12 +8,13 @@ const MODEL_KEY = 'aiide.selected-model'
 const INSPECTION_DISPLAY_MS = 700
 const SUCCESS_DISPLAY_MS = 1300
 const ERROR_DISPLAY_MS = 2000
+const STARTER_PROMPTS = ['Tell me about this project', 'Find where this is implemented', 'Make a small change']
 
 function messageOf(error: unknown): string {
   return typeof error === 'string' ? error : error instanceof Error ? error.message : 'The local AI request failed.'
 }
 
-export function LocalChat({ projectOpen, onProposal, changeState }: { projectOpen: boolean; onProposal: (proposal: PendingProposal) => void; changeState: 'working' | 'success' | 'error' | null }) {
+export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal, changeState }: { projectOpen: boolean; projectBusy: boolean; onOpenProject: () => void; onProposal: (proposal: PendingProposal) => void; changeState: 'working' | 'success' | 'error' | null }) {
   const [status, setStatus] = useState<ProviderStatus | null>(null)
   const [selectedModel, setSelectedModel] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
@@ -123,38 +124,41 @@ export function LocalChat({ projectOpen, onProposal, changeState }: { projectOpe
   async function copyTrace() {
     const trace = await loadTrace()
     if (!trace) return
-    await navigator.clipboard.writeText(trace)
-    setCopyStatus('Copied')
+    try { await navigator.clipboard.writeText(trace); setCopyStatus('✓ Copied') }
+    catch { setCopyStatus('Copy failed') }
   }
 
   const connected = status?.state === 'connected'
   const ready = connected && status.models.length > 0
   const elmaState: ElmaState = changeState ?? terminalState ?? (loading ? inspecting ? 'inspecting' : retrying ? 'working' : 'thinking' : 'idle')
-  const elmaStatus = changeState === 'working' ? 'Elma is applying the approved change…'
-    : changeState === 'success' ? 'Elma applied the approved change.'
-      : changeState === 'error' ? 'Elma could not apply the change.'
-        : terminalState === 'error' ? 'Elma hit an error.'
-    : terminalState === 'success' ? 'Elma finished successfully.'
-      : loading && inspecting ? 'Elma is inspecting the project…'
-        : loading && retrying ? 'Elma is retrying the local model…'
-          : loading ? 'Elma is thinking…' : 'Elma is ready.'
+  const elmaStatus = changeState === 'working' ? 'Applying the approved change…'
+    : changeState === 'success' ? 'Change applied'
+      : changeState === 'error' ? 'Something went wrong'
+        : terminalState === 'error' ? 'Something went wrong'
+    : terminalState === 'success' ? 'Done'
+      : loading && inspecting ? 'Checking files…'
+        : loading && retrying ? 'Working on it…'
+          : loading ? 'Thinking…' : 'Ready'
+  const currentActivity = activeSteps.at(-1)
+  const showElmaStatus = messages.length > 0 || loading || Boolean(changeState) || Boolean(terminalState)
   return <main className="main-panel">
-    <div className="main-label">LOCAL AI</div>
+    <div className="main-label">ELMA · LOCAL AI</div>
     <div className="chat-toolbar">
-      <div className="flex items-center gap-3"><span className="text-xs font-semibold text-stone-200">{ollamaProvider.name}</span><span className={`connection-state ${connected ? 'text-emerald-400' : status ? 'text-amber-400' : 'text-stone-500'}`}>{checking ? 'Checking…' : connected ? 'Connected' : status?.state === 'error' ? 'Error' : 'Offline'}</span></div>
-      <div className="flex items-center gap-2"><button className="subtle-button" aria-pressed={debug} disabled={loading} onClick={() => void toggleDebug()}>Debug [{debug ? 'ON' : 'OFF'}]</button><label htmlFor="model" className="text-xs text-stone-500">Model</label><select id="model" className="model-select" value={selectedModel} disabled={!ready || loading} onChange={event => { setSelectedModel(event.target.value); localStorage.setItem(MODEL_KEY, event.target.value) }}><option value="">{ready ? 'Select model' : 'No models'}</option>{status?.models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</select><button className="subtle-button" onClick={() => void refresh()} disabled={checking || loading}>Retry</button></div>
+      <div className="provider-state"><span className={`connection-dot ${connected ? 'connected' : ''}`} /><span>{ollamaProvider.name}</span><span className="connection-state">{checking ? 'Checking…' : connected ? 'Connected' : status?.state === 'error' ? 'Error' : 'Offline'}</span></div>
+      <div className="workspace-controls"><label htmlFor="model">Model</label><select id="model" className="model-select" value={selectedModel} disabled={!ready || loading} onChange={event => { setSelectedModel(event.target.value); localStorage.setItem(MODEL_KEY, event.target.value) }}><option value="">{ready ? 'Select model' : 'No models'}</option>{status?.models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</select><button className="small-button" aria-pressed={debug} disabled={loading} onClick={() => void toggleDebug()}><span aria-hidden="true">›_</span> Debug {debug ? 'on' : 'off'}</button><button className="icon-button" aria-label="Retry Ollama connection" title="Retry connection" onClick={() => void refresh()} disabled={checking || loading}>↻</button></div>
     </div>
-    {debug && <details className="border-b border-stone-800 bg-stone-950 px-4 py-2 text-[11px] text-stone-400" onToggle={event => { if (event.currentTarget.open && hasTrace && !debugTrace) void loadTrace() }}><summary className="cursor-pointer select-none">Agent diagnostics</summary><div className="mt-2 flex items-center gap-3"><button className="subtle-button" disabled={!hasTrace} onClick={() => void copyTrace()}>Copy trace</button>{copyStatus && <span>{copyStatus}</span>}<span>Local traces may contain prompts, paths, and source context. Review before sharing.</span></div>{debugTrace && <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded border border-stone-800 bg-black p-2 text-[10px] leading-4 text-stone-300">{debugTrace}</pre>}</details>}
+    {debug && <details className="diagnostics" onToggle={event => { if (event.currentTarget.open && hasTrace && !debugTrace) void loadTrace() }}><summary><span aria-hidden="true">›_</span> Agent diagnostics</summary><div className="diagnostics-tools"><button className="small-button" disabled={!hasTrace} onClick={() => void copyTrace()}><span aria-hidden="true">⧉</span> Copy trace</button>{copyStatus && <span role="status" className={copyStatus === 'Copy failed' ? 'copy-error' : 'copy-success'}>{copyStatus}</span>}<span className="diagnostics-note">Local traces may contain prompts, paths, and source context. Review before sharing.</span></div>{debugTrace && <pre className="debug-trace">{debugTrace}</pre>}</details>}
     {projectOpen && <div className="chat-notice">Elma has controlled read-only access to this project.</div>}
-    <div className="elma-status"><Elma state={elmaState} /><span>{elmaStatus}</span></div>
+    {showElmaStatus && <div className="elma-status"><Elma state={elmaState} /><div><strong>{elmaStatus}</strong>{loading && currentActivity && <span>{currentActivity}</span>}</div></div>}
     <div className="chat-history">
-      {!status && <div className="chat-empty">Checking for a local Ollama service…</div>}
-      {status?.state === 'offline' && <div className="chat-empty"><h2>Ollama not detected</h2><p>AIIDE uses a local Ollama service for offline AI. Start Ollama and try again.</p><button className="primary-button mt-5" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
-      {status?.state === 'error' && <div className="chat-empty"><h2>Ollama connection issue</h2><p>{status.error?.message}</p><button className="primary-button mt-5" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
-      {connected && !status.models.length && <div className="chat-empty"><h2>No local models installed</h2><p>Ollama is connected, but no local models are installed. Pull a model with the Ollama CLI, then select Retry.</p></div>}
-      {ready && messages.length === 0 && <div className="chat-empty"><h2>Your local AI coding workspace.</h2><p>{projectOpen ? 'Ask Elma about the opened project.' : 'Ask a general question to start a local conversation.'}</p></div>}
+      {!projectOpen && messages.length === 0 && <div className="chat-empty welcome-state"><Elma state="idle" /><span className="eyebrow">LOCAL-FIRST CODING COMPANION</span><h2>Open a project and we’ll have a nosey 👀</h2><p>Elma can inspect your project and prepare focused changes for you to review.</p><button className="primary-button" disabled={projectBusy} onClick={onOpenProject}><span aria-hidden="true">▣</span> {projectBusy ? 'Opening…' : 'Open project'}</button></div>}
+      {projectOpen && !status && <div className="chat-empty">Checking for a local Ollama service…</div>}
+      {projectOpen && status?.state === 'offline' && <div className="chat-empty"><h2>Ollama not detected</h2><p>Start your local Ollama service, then try again.</p><button className="primary-button" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
+      {projectOpen && status?.state === 'error' && <div className="chat-empty"><h2>Ollama connection issue</h2><p>{status.error?.message}</p><button className="primary-button" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
+      {projectOpen && connected && !status.models.length && <div className="chat-empty"><h2>No local models installed</h2><p>Ollama is connected, but no local models are installed. Pull a model with the Ollama CLI, then retry.</p></div>}
+      {projectOpen && ready && messages.length === 0 && <div className="chat-empty project-start"><Elma state="idle" /><span className="eyebrow">READY TO HAVE A LOOK</span><h2>What are we working on?</h2><p>I can inspect this project, explain what I find, or prepare a focused edit for review.</p><div className="starter-prompts">{STARTER_PROMPTS.map(starter => <button key={starter} onClick={() => setPrompt(starter)}>{starter}<span aria-hidden="true">→</span></button>)}</div></div>}
       {messages.map((message, index) => <div className="chat-message" key={index}><div className="chat-speaker">{message.role === 'user' ? 'YOU' : `ELMA · ${message.model}`}</div>{Boolean(message.activity?.length) && <details className="mb-3 text-xs text-stone-500"><summary>Inspected {message.activity?.length} items</summary><ul className="mt-2 space-y-1">{message.activity?.map((item, step) => <li key={step}>✓ {item.label}</li>)}</ul></details>}<div className="whitespace-pre-wrap break-words text-sm leading-6 text-stone-200">{message.content}</div></div>)}
-      {loading && <div className="chat-message text-xs text-stone-500"><div>{retrying ? 'Elma is retrying the local model…' : inspecting ? 'Elma is inspecting the project…' : activeSteps.length ? 'Elma is preparing an answer…' : 'Elma is thinking…'}</div>{activeSteps.map((step, index) => <div key={index}>✓ {step}</div>)}</div>}
+      {loading && <div className="chat-message activity-message"><div>{retrying ? 'Working on it…' : inspecting ? 'Checking files…' : activeSteps.length ? 'Preparing an answer…' : 'Thinking…'}</div>{activeSteps.map((step, index) => <div className="activity-step" key={index}>✓ {step}</div>)}</div>}
       <div ref={endRef} />
     </div>
     <div className="chat-composer">{error && <div role="alert" className="mb-2 text-xs text-red-400">{error}</div>}<div className="flex items-end gap-3"><textarea aria-label="Prompt" className="prompt-input" value={prompt} disabled={!ready || loading} maxLength={12000} placeholder={ready ? 'Ask a question…' : 'Connect Ollama and select a model to chat'} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() } }} /><button className="primary-button" onClick={() => void send()} disabled={!ready || !prompt.trim() || loading}>Send</button></div><p className="mt-2 text-[11px] text-stone-600">Enter to send · Shift+Enter for a new line · Chat stays in this session</p></div>

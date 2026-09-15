@@ -72,3 +72,8 @@ cargo check
 cd ..
 git diff --check
 git status
+
+# ── RUN ELMA / AIIDE ─────────────────────────────
+
+npm run tauri dev
+change the main heading to "Welcome to the AIIDE Sandbox". make only that change and prepare it for review

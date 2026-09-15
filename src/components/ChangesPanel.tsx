@@ -20,10 +20,10 @@ function diff(change: PendingChange) {
 }
 
 export function ChangesPanel({ proposal, busy, error, onApply, onReject }: { proposal: PendingProposal | null; busy: boolean; error: string | null; onApply: () => void; onReject: () => void }) {
-  return <aside className="changes-panel"><div className="main-label">CHANGES</div>{proposal ? <div className="changes-review">
-    <div className="pending-badge">PENDING · NOT APPLIED</div><p className="change-summary">{proposal.summary}</p>
-    {proposal.changes.map(change => <section key={change.path}><div className="change-file">{change.path}</div><pre className="change-diff">{diff(change).map((line, index) => <div key={index} className={`diff-${line.kind}`}><span>{line.kind === 'delete' ? '-' : line.kind === 'add' ? '+' : ' '}</span>{line.text}</div>)}</pre></section>)}
+  return <aside className="changes-panel" aria-label="Changes"><div className="main-label">CHANGES</div>{proposal ? <div className="changes-review">
+    <div className="pending-badge">READY FOR REVIEW · NOT APPLIED</div><p className="change-summary">{proposal.summary}</p>
+    {proposal.changes.map(change => <section className="change-section" key={change.path}><div className="change-file"><span aria-hidden="true">⌘</span> {change.path}</div><pre className="change-diff">{diff(change).map((line, index) => <div key={index} className={`diff-${line.kind}`}><span>{line.kind === 'delete' ? '-' : line.kind === 'add' ? '+' : ' '}</span>{line.text}</div>)}</pre></section>)}
     {error && <p role="alert" className="change-error">{error}</p>}
-    <div className="change-actions"><button className="primary-button" disabled={busy} onClick={onApply}>Apply</button><button className="subtle-button" disabled={busy} onClick={onReject}>Reject</button></div>
-  </div> : <div className="changes-empty">No pending proposal.</div>}</aside>
+    <div className="change-actions"><button className="primary-button" disabled={busy} onClick={onApply}><span aria-hidden="true">✓</span> Apply</button><button className="reject-button" disabled={busy} onClick={onReject}><span aria-hidden="true">×</span> Reject</button></div>
+  </div> : <div className="changes-empty"><span className="changes-empty-icon" aria-hidden="true">✦</span><h2>No changes yet</h2><p>Edits Elma prepares for you will appear here before anything is written.</p></div>}</aside>
 }

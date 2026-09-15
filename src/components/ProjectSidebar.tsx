@@ -3,7 +3,7 @@ import { FileTree } from './FileTree'
 
 export function ProjectSidebar({ project, onOpen, busy }: { project: ProjectInfo | null; onOpen: () => void; busy: boolean }) {
   return <aside className="sidebar">
-    <div className="sidebar-heading"><span>PROJECT</span><button className="subtle-button" onClick={onOpen} disabled={busy} title="Open another project">Open folder</button></div>
+    <div className="sidebar-heading"><span>PROJECT</span><button className="small-button" onClick={onOpen} disabled={busy} title="Open another project"><span aria-hidden="true">▣</span> Open folder</button></div>
     {project ? <>
       <div className="border-b border-stone-800 px-4 pb-4 pt-3">
         <h2 className="truncate text-sm font-semibold text-stone-100" title={project.name}>{project.name}</h2>
@@ -12,6 +12,6 @@ export function ProjectSidebar({ project, onOpen, busy }: { project: ProjectInfo
       </div>
       <div className="px-4 pb-2 pt-4 text-[11px] font-semibold tracking-[0.14em] text-stone-500">FILES</div>
       <FileTree entries={project.tree} truncated={project.treeTruncated} />
-    </> : <p className="px-4 pt-4 text-xs leading-5 text-stone-500">Open a local folder to explore its files and Git status.</p>}
+    </> : <div className="sidebar-empty"><span className="empty-icon" aria-hidden="true">▣</span><p>Your files and Git status will appear here.</p></div>}
   </aside>
 }
