@@ -9,6 +9,7 @@ use crate::project::{OpenProject, IGNORED};
 pub const MAX_TOOL_CALLS: usize = 8;
 pub const MAX_CONTEXT_BYTES: usize = 48_000;
 const MAX_READ_BYTES: usize = 12_000;
+const MAX_SOURCE_SPAN_BYTES: usize = 4_000;
 const MAX_FILE_BYTES: u64 = 256_000;
 const MAX_LIST: usize = 120;
 const MAX_SEARCH: usize = 30;
@@ -23,6 +24,23 @@ pub struct ProposedReplacement {
     pub path: String,
     pub old_text: String,
     pub new_text: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SourceSnapshot {
+    pub path: String,
+    pub resolved: PathBuf,
+    pub content: String,
+    pub visible_lines: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct SourceSpan {
+    pub path: String,
+    pub start: usize,
+    pub end: usize,
+    pub start_line: usize,
+    pub end_line: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -105,6 +123,72 @@ fn read_text_file(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|_| "Cannot read project file.".to_owned())?;
     if bytes.iter().take(8_000).any(|byte| *byte == 0) { return Err("Binary files are unavailable.".into()); }
     String::from_utf8(bytes).map_err(|_| "Non-UTF-8 files are unavailable.".into())
+}
+
+fn current_snapshot(root: &Path, snapshot: &SourceSnapshot) -> Result<(), String> {
+    let relative = allowed_relative(&snapshot.path)?;
+    if protected(&relative) { return Err("Protected files are unavailable.".into()); }
+    let full = resolve(root, &snapshot.path)?;
+    if protected(&full) { return Err("Protected files are unavailable.".into()); }
+    if full != snapshot.resolved { return Err("Source path changed since inspection. Read the file again.".into()); }
+    if read_text_file(&full)? != snapshot.content { return Err("Source changed since inspection. Read the file again.".into()); }
+    Ok(())
+}
+
+pub fn select_source_span(root: &Path, snapshot: &SourceSnapshot, start_line: usize, end_line: usize) -> Result<SourceSpan, String> {
+    current_snapshot(root, snapshot)?;
+    if start_line == 0 || end_line < start_line || end_line > snapshot.visible_lines {
+        return Err("Source line range is outside the inspected output.".into());
+    }
+    let mut offset = 0;
+    let mut start = None;
+    let mut end = None;
+    for (index, line) in snapshot.content.split_inclusive('\n').enumerate() {
+        let number = index + 1;
+        if number == start_line { start = Some(offset); }
+        if number == end_line {
+            let body = line.strip_suffix('\n').unwrap_or(line).strip_suffix('\r').unwrap_or_else(|| line.strip_suffix('\n').unwrap_or(line));
+            end = Some(offset + body.len());
+            break;
+        }
+        offset += line.len();
+    }
+    let (start, end) = (start.ok_or("Source line range is invalid.")?, end.ok_or("Source line range is invalid.")?);
+    if end <= start || end - start > MAX_SOURCE_SPAN_BYTES { return Err("Source span is empty or exceeds the size limit.".into()); }
+    if !snapshot.content.is_char_boundary(start) || !snapshot.content.is_char_boundary(end) { return Err("Source span has invalid UTF-8 boundaries.".into()); }
+    Ok(SourceSpan { path: snapshot.path.clone(), start, end, start_line, end_line })
+}
+
+pub fn validate_span_proposal(root: &Path, snapshot: &SourceSnapshot, span: &SourceSpan, summary: String, replacement_text: String) -> Result<(PendingProposal, ProposedReplacement), String> {
+    current_snapshot(root, snapshot)?;
+    if span.path != snapshot.path || span.start >= span.end || span.end > snapshot.content.len() {
+        return Err("Invalid source span.".into());
+    }
+    if !snapshot.content.is_char_boundary(span.start) || !snapshot.content.is_char_boundary(span.end) {
+        return Err("Source span has invalid UTF-8 boundaries.".into());
+    }
+    let before = &snapshot.content;
+    if before[span.start..span.end] == replacement_text { return Err("Proposal contains a no-op replacement.".into()); }
+    // Expand only AiiDE-owned, unchanged context until the exact anchor is unique.
+    let mut left = span.start;
+    let mut right = span.end;
+    loop {
+        let old_text = &before[left..right];
+        let new_text = format!("{}{}{}", &before[left..span.start], replacement_text, &before[span.end..right]);
+        if snapshot.path.len() + old_text.len() + new_text.len() > MAX_PROPOSAL_BYTES {
+            return Err("A unique source anchor exceeds the proposal size limit.".into());
+        }
+        let mut matches = before.match_indices(old_text);
+        if matches.next().is_some_and(|(offset, _)| offset == left) && matches.next().is_none() {
+            let edit = ProposedReplacement { path: snapshot.path.clone(), old_text: old_text.into(), new_text };
+            let proposal = validate_proposal(root, summary, vec![edit.clone()])?;
+            if proposal.changes[0].before != *before { return Err("Source changed since inspection. Read the file again.".into()); }
+            return Ok((proposal, edit));
+        }
+        if left == 0 && right == before.len() { return Err(AMBIGUOUS_OLD_TEXT_ERROR.into()); }
+        left = before.floor_char_boundary(left.saturating_sub(64));
+        right = before.ceil_char_boundary((right + 64).min(before.len()));
+    }
 }
 
 pub fn validate_proposal(root: &Path, summary: String, edits: Vec<ProposedReplacement>) -> Result<PendingProposal, String> {
@@ -216,6 +300,10 @@ fn list_walk(root: &Path, folder: &Path, lines: &mut Vec<String>) -> Result<bool
 }
 
 fn read_file(root: &Path, path: &str) -> Result<String, String> {
+    read_source_snapshot(root, path).map(|(output, _)| output)
+}
+
+pub fn read_source_snapshot(root: &Path, path: &str) -> Result<(String, SourceSnapshot), String> {
     if path.is_empty() { return Err("A file path is required.".into()); }
     let relative_path = allowed_relative(path)?;
     if protected(&relative_path) { return Err("Protected file: contents are unavailable.".into()); }
@@ -228,12 +316,14 @@ fn read_file(root: &Path, path: &str) -> Result<String, String> {
     if bytes.contains(&0) { return Err("Binary file: contents are unavailable.".into()); }
     let content = std::str::from_utf8(&bytes).map_err(|_| "Non-UTF-8 file: contents are unavailable.".to_owned())?;
     let mut output = String::new();
+    let mut visible_lines = 0;
     for (index, line) in content.lines().enumerate() {
         let next = format!("{}: {}\n", index + 1, line);
         if output.len() + next.len() > MAX_READ_BYTES { output.push_str("[File truncated; request a more specific file or search]\n"); break; }
         output.push_str(&next);
+        visible_lines += 1;
     }
-    Ok(output)
+    Ok((output, SourceSnapshot { path: path.to_owned(), resolved: file, content: content.to_owned(), visible_lines }))
 }
 
 fn search_files(root: &Path, query: &str) -> Result<String, String> {
@@ -377,6 +467,71 @@ mod tests {
         drop(pending.take());
         assert!(pending.is_none());
         assert_eq!(fs::read_to_string(root.join("hello.txt")).unwrap(), "hello\nworld");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test] fn orbitnote_multiline_span_preserves_raw_crlf_and_only_changes_heading() {
+        let root = fixture();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let path = root.join("src/index.html");
+        let original = include_str!("../fixtures/orbitnote-heading/src/index.html").replace('\n', "\r\n");
+        fs::write(&path, &original).unwrap();
+        let (display, snapshot) = read_source_snapshot(&root, "src/index.html").unwrap();
+        assert!(display.contains("6:           <h1>"));
+        assert!(display.contains("8:             <span>another unfinished project.</span>"));
+        assert_eq!(snapshot.content, original);
+        let span = select_source_span(&root, &snapshot, 6, 9).unwrap();
+        let selected = &snapshot.content[span.start..span.end];
+        assert_eq!(selected, "          <h1>\r\n            Notes that don't become\r\n            <span>another unfinished project.</span>\r\n          </h1>");
+        let replacement = "          <h1>Welcome to OrbitNote 2.0</h1>";
+        let (proposal, edit) = validate_span_proposal(&root, &snapshot, &span, "Replace heading".into(), replacement.into()).unwrap();
+        assert_eq!(proposal.changes[0].after, original.replacen(selected, replacement, 1));
+        assert_eq!(proposal.changes[0].before, original);
+        assert_eq!(proposal.changes[0].replacements, 1);
+        assert!(edit.old_text.contains(selected));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original, "preview must not write");
+        apply_proposal(&root, &proposal).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), proposal.changes[0].after);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test] fn source_spans_reject_invalid_ranges_stale_content_and_unsafe_paths() {
+        let root = fixture();
+        let (_, snapshot) = read_source_snapshot(&root, "hello.txt").unwrap();
+        for (start, end) in [(0, 1), (2, 1), (1, 3)] {
+            assert!(select_source_span(&root, &snapshot, start, end).is_err());
+        }
+        assert!(read_source_snapshot(&root, "../hello.txt").is_err());
+        fs::write(root.join(".env"), "secret").unwrap();
+        assert!(read_source_snapshot(&root, ".env").is_err());
+        let span = select_source_span(&root, &snapshot, 1, 1).unwrap();
+        fs::write(root.join("hello.txt"), "external\nworld").unwrap();
+        assert!(select_source_span(&root, &snapshot, 1, 1).unwrap_err().contains("changed since inspection"));
+        assert!(validate_span_proposal(&root, &snapshot, &span, "Test".into(), "Hello".into()).unwrap_err().contains("changed since inspection"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test] fn repeated_selected_text_uses_unique_server_owned_context() {
+        let root = fixture();
+        fs::write(root.join("hello.txt"), "first\nvalue\nsecond\nvalue\n").unwrap();
+        let (_, snapshot) = read_source_snapshot(&root, "hello.txt").unwrap();
+        let span = select_source_span(&root, &snapshot, 4, 4).unwrap();
+        let (proposal, edit) = validate_span_proposal(&root, &snapshot, &span, "Change second".into(), "changed".into()).unwrap();
+        assert_eq!(proposal.changes[0].after, "first\nvalue\nsecond\nchanged\n");
+        assert!(edit.old_text.contains("second"));
+        assert_eq!(fs::read_to_string(root.join("hello.txt")).unwrap(), snapshot.content);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test] fn oversized_and_invalid_utf8_source_spans_fail_closed() {
+        let root = fixture();
+        fs::write(root.join("hello.txt"), format!("{}\n", "a".repeat(MAX_SOURCE_SPAN_BYTES + 1))).unwrap();
+        let (_, snapshot) = read_source_snapshot(&root, "hello.txt").unwrap();
+        assert!(select_source_span(&root, &snapshot, 1, 1).unwrap_err().contains("size limit"));
+        fs::write(root.join("hello.txt"), "é\n").unwrap();
+        let (_, snapshot) = read_source_snapshot(&root, "hello.txt").unwrap();
+        let forged = SourceSpan { path: "hello.txt".into(), start: 1, end: 2, start_line: 1, end_line: 1 };
+        assert!(validate_span_proposal(&root, &snapshot, &forged, "Test".into(), "e".into()).unwrap_err().contains("UTF-8"));
         fs::remove_dir_all(root).unwrap();
     }
 }
