@@ -86,7 +86,7 @@ type ChatPayloadResponse = InferenceResponse;
 #[serde(rename_all = "camelCase")]
 pub struct ChatResponse { model: String, content: String, activity: Vec<Activity>, proposal: Option<PendingProposal> }
 
-const CORE_AGENT_INSTRUCTIONS: &str = "You are Elma, a local-first AI coding companion inside AIIDE. You may inspect the opened project through AIIDE's bounded tools and propose focused replacements to existing text files. You cannot apply changes, write files, execute commands, commit, or push. Questions about project files, source code, directories, structure, or repository content require relevant repository evidence before answering. If the user gives only a filename, use list_files to discover its exact project-relative path, then read_file when its contents are needed. Never ask the user to provide project content that AIIDE's tools can inspect, and do not treat recognizing missing evidence as a final answer. Use the least expensive relevant tool and do not inspect unrelated files. answer is only for general conversation or a repository answer supported by sufficient evidence. Inspect every target file with read_file before proposing a change; do not return propose_change before that read succeeds. Preserve its style and avoid unrelated cleanup or whole-file rewrites. For a conversational response, return exactly {\"action\":\"answer\",\"answer\":\"<response>\"}; never put conversational answer text in summary. list_files.path is a project-relative directory, never a glob: use path=\"\" for the project root, then copy exact returned paths into read_file. After inspection, a proposal has this shape: {\"action\":\"propose_change\",\"summary\":\"<short edit summary>\",\"changes\":[{\"path\":\"<exact path>\",\"old_text\":\"<exact inspected text>\",\"new_text\":\"<replacement>\"}]}. old_text must be exact content from the inspected file without the displayed line-number prefix. AIIDE validates and previews it; only the user's Apply button can write it. Never claim a proposal was applied. Questions and reviews may be answered without proposing changes. Never invent files, code, Git state, tool results, or commands. search_files searches one literal substring. Failed tools do not prove absence. Return exactly one JSON object matching the provided schema.";
+const CORE_AGENT_INSTRUCTIONS: &str = "You are Elma, a local-first AI coding companion inside AIIDE. You may inspect the opened project through AIIDE's bounded tools and propose focused replacements to existing text files. You cannot apply changes, write files, execute commands, commit, or push. Questions about project files, source code, directories, structure, or repository content require relevant repository evidence before answering. If the user gives only a filename, use list_files to discover its exact project-relative path, then read_file when its contents are needed. Never ask the user to provide project content that AIIDE's tools can inspect, and do not treat recognizing missing evidence as a final answer. Use the least expensive relevant tool and do not inspect unrelated files. answer is only for general conversation or a repository answer supported by sufficient evidence. Inspect every target file with read_file before proposing a change; do not return propose_change before that read succeeds. Preserve its style and avoid unrelated cleanup or whole-file rewrites. For a conversational response, return exactly {\"action\":\"answer\",\"answer\":\"<response>\"}; never put conversational answer text in summary. list_files.path is a project-relative directory, never a glob: use path=\"\" for the project root, then copy exact returned paths into read_file. After inspection, a proposal has this shape: {\"action\":\"propose_change\",\"summary\":\"<short edit summary>\",\"changes\":[{\"path\":\"<exact path>\",\"old_text\":\"<unique exact inspected text>\",\"new_text\":\"<replacement>\"}]}. old_text must be copied exactly from the inspected file, match exactly one location, and omit displayed line-number prefixes. If a fragment repeats, include enough exact unchanged surrounding context to make it unique. Never invent old_text. Keep it as small as practical while still unique; for example, if `target` repeats, use a unique exact span such as `unique-prefix target`. AIIDE validates and previews the proposal; only the user's Apply button can write it. Never claim a proposal was applied. Questions and reviews may be answered without proposing changes. Never invent files, code, Git state, tool results, or commands. search_files searches one literal substring. Failed tools do not prove absence. Return exactly one JSON object matching the provided schema.";
 
 const DEFAULT_PERSONALITY: &str = "Elma is calm, clever, trustworthy, and down-to-earth, with a cute exterior and a dry sense of humour. Sound moderately casual and task-focused. Occasional mild sarcasm, playful comments, and natural emoji are welcome when they do not obscure technical facts or errors. Lightly mirror the user's casual language without forcing slang or caricature. Be concise by default: give the shortest complete answer, usually a few sentences for simple questions. Start with the answer; do not restate the question or add generic introductions, conclusions, or unnecessary headings. Assume normal software-development basics, explain important details briefly, and expand only when useful or requested.";
 
@@ -205,7 +205,7 @@ fn agent_schema(project_open: bool, edit_intent: bool, has_read_evidence: bool, 
     }
     if project_open && edit_intent && has_read_evidence {
         properties.insert("summary".into(), json!({"type":"string","maxLength":160,"description":"For propose_change only: one short sentence describing the edit."}));
-        properties.insert("changes".into(), json!({"type":"array","minItems":1,"maxItems":4,"description":"Focused exact replacements for propose_change.","items":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}}));
+        properties.insert("changes".into(), json!({"type":"array","minItems":1,"maxItems":4,"description":"Focused exact replacements for propose_change.","items":{"type":"object","properties":{"path":{"type":"string","description":"Exact project-relative path previously read."},"old_text":{"type":"string","description":"Exact text copied from the inspected file that matches exactly once. Include unchanged surrounding context when a smaller fragment repeats. Never include displayed line numbers."},"new_text":{"type":"string","description":"Replacement text for that unique old_text anchor."}},"required":["path","old_text","new_text"],"additionalProperties":false}}));
     }
     let required = if project_open && edit_intent && has_read_evidence {
         json!(["action", "summary", "changes"])
@@ -266,6 +266,19 @@ fn response_shape(raw: &str) -> String {
         }, trimmed.chars().count()),
         Err(_) => format!("non-json(fenced={fenced}, chars={})", trimmed.chars().count()),
     }
+}
+
+fn ambiguous_anchor_guidance() -> &'static str {
+    "Proposal validation rejected old_text because it matches more than one location. Retry propose_change with old_text copied exactly from the inspected file and expanded with enough unchanged surrounding context to match exactly once. Do not invent text, include displayed line numbers, or guess which occurrence to replace. Keep the anchor as small as practical while still unique."
+}
+
+fn anchor_shape(edits: &[ProposedReplacement]) -> String {
+    edits.iter().enumerate().map(|(index, edit)| {
+        let has_line_prefix = edit.old_text.lines().any(|line| line.split_once(": ")
+            .is_some_and(|(prefix, _)| prefix.parse::<usize>().is_ok()));
+        format!("{}:chars={},lines={},displayedLinePrefix={has_line_prefix}", index + 1,
+            edit.old_text.chars().count(), edit.old_text.lines().count())
+    }).collect::<Vec<_>>().join("; ")
 }
 
 fn provider_error(provider: &impl ModelProvider, ollama: &'static str, remote: &'static str) -> String {
@@ -507,6 +520,7 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
     let mut needs_inspection = match plan.scope { RequestScope::General => Some(false), RequestScope::Repository => Some(true), RequestScope::Unknown => None };
     let mut grounding = evidence_requirement(&last_prompt, plan.scope);
     let mut inspection_reminders = 0;
+    let mut proposal_repairs = 0;
     for iteration in 0..=repository::MAX_TOOL_CALLS {
         let evidence_sufficient = grounding.satisfied(successful_listings, successful_searches, &read_paths);
         let answer_allowed = plan.intent == RequestIntent::Answer && (needs_inspection != Some(true) || evidence_sufficient);
@@ -520,7 +534,18 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
             }
             if let Some(app) = app { let _ = app.emit("proposal-validation-start", ()); }
             debug_log(debug_trace, "tool", format!("propose_change selected\nPath: {}\nReplacements: {}\nValidation: started", edits.first().map(|edit| edit.path.as_str()).unwrap_or("none"), edits.len()));
-            let proposal = repository::validate_proposal(root, summary, edits)?;
+            let shape = anchor_shape(&edits);
+            let proposal = match repository::validate_proposal(root, summary, edits) {
+                Ok(proposal) => proposal,
+                Err(error) if error == repository::AMBIGUOUS_OLD_TEXT_ERROR && proposal_repairs < MAX_REPAIRS => {
+                    proposal_repairs += 1;
+                    debug_log(debug_trace, "repair", format!("Ambiguous proposal anchor rejected\nAttempt {proposal_repairs}/{MAX_REPAIRS}\nAnchor shape: {shape}"));
+                    exchange.push(result.message);
+                    exchange.push(ChatMessage { role: "user".into(), content: ambiguous_anchor_guidance().into() });
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if let Some(pending) = pending {
                 *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone());
             }
@@ -702,9 +727,11 @@ mod tests {
     #[test]
     fn personality_is_separate_from_protocol_defaults() {
         assert!(CORE_AGENT_INSTRUCTIONS.contains("cannot apply changes"));
-        assert!(CORE_AGENT_INSTRUCTIONS.contains("old_text must be exact"));
+        assert!(CORE_AGENT_INSTRUCTIONS.contains("old_text must be copied exactly"));
         assert!(CORE_AGENT_INSTRUCTIONS.contains("Never ask the user to provide project content"));
         assert!(CORE_AGENT_INSTRUCTIONS.contains("least expensive relevant tool"));
+        assert!(CORE_AGENT_INSTRUCTIONS.contains("match exactly one location"));
+        assert!(CORE_AGENT_INSTRUCTIONS.contains("Never invent old_text"));
         assert!(DEFAULT_PERSONALITY.contains("concise by default"));
         assert!(DEFAULT_PERSONALITY.contains("dry sense of humour"));
         assert!(!DEFAULT_PERSONALITY.contains("propose_change"));
@@ -812,6 +839,7 @@ mod tests {
         assert!(before_read["properties"].get("changes").is_none());
         let after_read = agent_schema(true, true, true, false);
         assert_eq!(after_read["properties"]["changes"]["minItems"], 1);
+        assert!(after_read["properties"]["changes"]["items"]["properties"]["old_text"]["description"].as_str().unwrap().contains("matches exactly once"));
         assert_eq!(after_read["required"], json!(["action", "summary", "changes"]));
         assert!(after_read["properties"].get("path").is_none());
     }
@@ -955,6 +983,50 @@ mod tests {
         let formats = provider.formats.lock().unwrap();
         assert!(formats[0]["properties"].get("changes").is_none());
         assert!(formats[2]["properties"].get("changes").is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_edit_is_retried_with_unique_exact_context() {
+        let root = grounding_fixture("ambiguous-edit");
+        std::fs::write(root.join("src/index.html"), "<title>Welcome</title>\n<h1>Welcome</h1>").unwrap();
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            r#"{"action":"propose_change","summary":"Change visible heading.","changes":[{"path":"src/index.html","old_text":"Welcome","new_text":"Changed"}]}"#,
+            r#"{"action":"propose_change","summary":"Change visible heading.","changes":[{"path":"src/index.html","old_text":"<h1>Welcome</h1>","new_text":"<h1>Changed</h1>"}]}"#,
+        ]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "change the visible heading to Changed".into() }],
+            Some(root.clone()), None, None, None,
+        )).unwrap();
+        let proposal = response.proposal.expect("unique retry should produce a proposal");
+        assert_eq!(proposal.changes[0].after, "<title>Welcome</title>\n<h1>Changed</h1>");
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), "<title>Welcome</title>\n<h1>Welcome</h1>");
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_edit_repair_is_bounded_and_never_selects_an_occurrence() {
+        let root = grounding_fixture("bounded-ambiguous-edit");
+        let original = "first value\nsecond value";
+        std::fs::write(root.join("src/index.html"), original).unwrap();
+        let ambiguous = r#"{"action":"propose_change","summary":"Change value.","changes":[{"path":"src/index.html","old_text":"value","new_text":"changed"}]}"#;
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            ambiguous, ambiguous, ambiguous,
+        ]);
+        let error = match tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "change the second value".into() }],
+            Some(root.clone()), None, None, None,
+        )) { Err(error) => error, Ok(_) => panic!("ambiguous proposals must remain rejected") };
+        assert_eq!(error, repository::AMBIGUOUS_OLD_TEXT_ERROR);
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), original);
+        assert!(ambiguous_anchor_guidance().contains("matches more than one location"));
+        assert!(ambiguous_anchor_guidance().contains("Do not invent text"));
+        assert!(ambiguous_anchor_guidance().contains("displayed line numbers") && ambiguous_anchor_guidance().contains("guess"));
+        assert_eq!(anchor_shape(&[ProposedReplacement { path: "x".into(), old_text: "10: repeated".into(), new_text: "x".into() }]), "1:chars=12,lines=1,displayedLinePrefix=true");
         std::fs::remove_dir_all(root).unwrap();
     }
 
