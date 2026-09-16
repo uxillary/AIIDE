@@ -15,6 +15,7 @@ const MAX_SEARCH: usize = 30;
 const MAX_SCAN_FILES: usize = 2_000;
 pub const MAX_PROPOSAL_REPLACEMENTS: usize = 4;
 pub const MAX_PROPOSAL_BYTES: usize = 24_000;
+pub const AMBIGUOUS_OLD_TEXT_ERROR: &str = "old_text is ambiguous in the current file.";
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -125,7 +126,7 @@ pub fn validate_proposal(root: &Path, summary: String, edits: Vec<ProposedReplac
         if !seen_old.insert(edit.old_text.as_str()) { return Err("Proposal contains duplicate or conflicting replacements.".into()); }
         let matches = after.match_indices(&edit.old_text).count();
         if matches == 0 { return Err("old_text was not found in the current file.".into()); }
-        if matches > 1 { return Err("old_text is ambiguous in the current file.".into()); }
+        if matches > 1 { return Err(AMBIGUOUS_OLD_TEXT_ERROR.into()); }
         after = after.replacen(&edit.old_text, &edit.new_text, 1);
     }
     if after == before { return Err("Proposal does not change the file.".into()); }
@@ -337,6 +338,18 @@ mod tests {
         ] {
             assert!(validate_proposal(&root, "Test".into(), vec![proposal]).unwrap_err().contains(expected));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn unique_surrounding_context_is_required_without_first_match_selection() {
+        let root = fixture();
+        let path = root.join("repeated.txt");
+        let original = "section-a\nvalue\nsection-b\nvalue\n";
+        fs::write(&path, original).unwrap();
+        assert_eq!(validate_proposal(&root, "Ambiguous".into(), vec![edit("repeated.txt", "value", "changed")]).unwrap_err(), AMBIGUOUS_OLD_TEXT_ERROR);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original, "ambiguous validation must not select the first match");
+        let proposal = validate_proposal(&root, "Unique".into(), vec![edit("repeated.txt", "section-b\nvalue", "section-b\nchanged")]).unwrap();
+        assert_eq!(proposal.changes[0].after, "section-a\nvalue\nsection-b\nchanged\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original, "validation must only prepare a preview");
         fs::remove_dir_all(root).unwrap();
     }
     #[test] fn rejects_oversized_and_conflicting_proposals_without_partial_write() {

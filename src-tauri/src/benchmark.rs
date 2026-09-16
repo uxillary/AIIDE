@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::ollama::{self, BenchmarkAgentOutput};
+use crate::ollama::{self, BenchmarkAgentFailure, BenchmarkAgentOutput};
 use crate::model_provider::{OLLAMA_PROVIDER_ID, OPENROUTER_PROVIDER_ID};
 
 const EXPECTED_PATH: &str = "src/index.html";
@@ -42,26 +42,31 @@ fn concise_error(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
     if lower.contains("project-relative") { "invalid project-relative path".into() }
     else if lower.contains("inspection limit") { "inspection limit reached".into() }
-    else if lower.contains("proposal") && lower.contains("changes") { "proposal missing changes".into() }
+    else if error.contains("For action='propose_change', include changes") { "proposal missing changes".into() }
     else { error.lines().next().unwrap_or("benchmark failed").trim().to_owned() }
 }
 
-fn trace_failure(trace: &str) -> Option<&'static str> {
-    if trace.contains("Only project-relative paths are allowed") { Some("invalid project-relative path") }
-    else if trace.contains("inspection limit") { Some("inspection limit reached") }
-    else if trace.contains("Proposal validation") && trace.contains("changes") { Some("proposal missing changes") }
-    else { None }
+fn repair_count(trace: &str) -> usize { trace.matches("[AIIDE][repair] ").count() }
+
+fn edit_mismatch(after: &str) -> &'static str {
+    if after.contains(OLD_HEADING) { "intended heading unchanged; other content changed" }
+    else if !after.contains(NEW_HEADING) { "incorrect or missing heading replacement" }
+    else { "unexpected additional change beyond the heading replacement" }
 }
 
-fn classify(model: &str, case: Case, elapsed: u128, outcome: Result<BenchmarkAgentOutput, String>, fixture_before: &str, fixture_after: &str) -> BenchmarkResult {
+fn classify(model: &str, case: Case, elapsed: u128, outcome: Result<BenchmarkAgentOutput, BenchmarkAgentFailure>, fixture_before: &str, fixture_after: &str) -> BenchmarkResult {
     let mut result = BenchmarkResult { model: model.into(), case: case.id().into(), passed: false, duration_ms: elapsed,
         tool_calls: 0, repair_count: 0, final_action: "error".into(), failure_reason: None };
     let output = match outcome {
         Ok(output) => output,
-        Err(error) => { result.failure_reason = Some(concise_error(&error)); return result; }
+        Err(failure) => {
+            result.repair_count = repair_count(&failure.trace);
+            result.failure_reason = Some(concise_error(&failure.error));
+            return result;
+        }
     };
     result.tool_calls = output.activity.len();
-    result.repair_count = output.trace.matches("[AIIDE][repair] Attempt").count();
+    result.repair_count = repair_count(&output.trace);
     result.final_action = if output.proposal.is_some() { "propose_change" } else { "answer" }.into();
     let failure = match case {
         Case::Answer if output.proposal.is_some() => Some("unexpected proposal"),
@@ -74,14 +79,15 @@ fn classify(model: &str, case: Case, elapsed: u128, outcome: Result<BenchmarkAge
             Some(proposal) if proposal.changes.len() != 1 => Some("proposal did not contain exactly one file change"),
             Some(proposal) if proposal.changes[0].path != EXPECTED_PATH => Some("proposal targeted the wrong file"),
             Some(proposal) if proposal.changes[0].replacements != 1 => Some("proposal was not one focused replacement"),
-            Some(proposal) if proposal.changes[0].before != fixture_before || proposal.changes[0].after != fixture_before.replacen(OLD_HEADING, NEW_HEADING, 1) => Some("proposal did not match the expected heading replacement"),
+            Some(proposal) if proposal.changes[0].before != fixture_before => Some("proposal was based on a different fixture snapshot"),
+            Some(proposal) if proposal.changes[0].after != fixture_before.replacen(OLD_HEADING, NEW_HEADING, 1) => Some(edit_mismatch(&proposal.changes[0].after)),
             Some(_) if fixture_after != fixture_before => Some("benchmark modified the fixture"),
             Some(_) => None,
         },
         _ => None,
     };
     result.passed = failure.is_none();
-    result.failure_reason = failure.map(|reason| trace_failure(&output.trace).unwrap_or(reason).to_owned());
+    result.failure_reason = failure.map(str::to_owned);
     result
 }
 
@@ -168,6 +174,7 @@ mod tests {
     fn failure_reasons_are_concise() {
         assert_eq!(concise_error("Only project-relative paths are allowed."), "invalid project-relative path");
         assert_eq!(concise_error("I reached the repository inspection limit"), "inspection limit reached");
+        assert_eq!(concise_error("For action='propose_change', include changes; each change needs path, old_text, and new_text."), "proposal missing changes");
     }
 
     #[test]
@@ -181,6 +188,63 @@ mod tests {
         }), &before, &before);
         assert!(result.passed);
         assert_eq!(result.final_action, "propose_change");
+    }
+
+    #[test]
+    fn validated_edit_mismatch_is_not_misreported_as_missing_changes() {
+        let before = format!("before\n{OLD_HEADING}\nafter");
+        let proposal = PendingProposal { summary: "Wrong replacement".into(), changes: vec![PendingChange {
+            path: EXPECTED_PATH.into(), before: before.clone(), after: before.replacen(OLD_HEADING, "<h1>Wrong</h1>", 1), replacements: 1,
+        }] };
+        let result = classify("m", Case::Edit, 1, Ok(BenchmarkAgentOutput {
+            content: "ready".into(), activity: vec!["Read: src/index.html".into()], proposal: Some(proposal),
+            trace: "[AIIDE][protocol] Schema/format: changes\n[AIIDE][tool] Proposal validation: passed\nPending change creation: passed".into(),
+        }), &before, &before);
+        assert!(!result.passed);
+        assert_eq!(result.final_action, "propose_change");
+        assert_eq!(result.failure_reason.as_deref(), Some("incorrect or missing heading replacement"));
+    }
+
+    #[test]
+    fn edit_mismatch_categories_do_not_expose_proposal_content() {
+        let before = format!("<title>OrbitNote</title>\n{OLD_HEADING}\n<footer>Keep</footer>");
+        let cases = [
+            (before.replacen("<title>OrbitNote</title>", "<title>Changed</title>", 1), "intended heading unchanged; other content changed"),
+            (before.replacen(OLD_HEADING, "<h1>Different</h1>", 1), "incorrect or missing heading replacement"),
+            (before.replacen(OLD_HEADING, NEW_HEADING, 1).replacen("<footer>Keep</footer>", "<footer>Changed</footer>", 1), "unexpected additional change beyond the heading replacement"),
+        ];
+        for (after, expected_reason) in cases {
+            let proposal = PendingProposal { summary: "Edit".into(), changes: vec![PendingChange {
+                path: EXPECTED_PATH.into(), before: before.clone(), after: after.clone(), replacements: 1,
+            }] };
+            let result = classify("m", Case::Edit, 1, Ok(BenchmarkAgentOutput {
+                content: "ready".into(), activity: vec!["Read: src/index.html".into()], proposal: Some(proposal), trace: String::new(),
+            }), &before, &before);
+            assert_eq!(result.failure_reason.as_deref(), Some(expected_reason));
+            assert!(!result.failure_reason.unwrap().contains(&after));
+        }
+    }
+
+    #[test]
+    fn repair_count_includes_structural_and_proposal_retries() {
+        let trace = "[AIIDE][repair] Attempt 1/2\n[AIIDE][repair] Ambiguous proposal anchor rejected\nAttempt 1/2";
+        let result = classify("m", Case::Answer, 1, Ok(BenchmarkAgentOutput {
+            content: "grounded".into(), activity: vec![format!("Read: {EXPECTED_PATH}")], proposal: None, trace: trace.into(),
+        }), OLD_HEADING, OLD_HEADING);
+        assert!(result.passed);
+        assert_eq!(result.repair_count, 2);
+    }
+
+    #[test]
+    fn failed_agent_attempts_retain_their_repair_count() {
+        let failure = BenchmarkAgentFailure {
+            error: "The local model could not produce a valid structured response after two retries.".into(),
+            trace: "[AIIDE][repair] Attempt 1/2\n[AIIDE][repair] Attempt 2/2".into(),
+        };
+        let result = classify("m", Case::Edit, 1, Err(failure), OLD_HEADING, OLD_HEADING);
+        assert!(!result.passed);
+        assert_eq!(result.final_action, "error");
+        assert_eq!(result.repair_count, 2);
     }
 
     #[test]
