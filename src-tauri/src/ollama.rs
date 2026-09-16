@@ -539,12 +539,16 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
                 Ok(proposal) => proposal,
                 Err(error) if error == repository::AMBIGUOUS_OLD_TEXT_ERROR && proposal_repairs < MAX_REPAIRS => {
                     proposal_repairs += 1;
+                    debug_log(debug_trace, "tool", format!("Proposal validation: rejected — {error}"));
                     debug_log(debug_trace, "repair", format!("Ambiguous proposal anchor rejected\nAttempt {proposal_repairs}/{MAX_REPAIRS}\nAnchor shape: {shape}"));
                     exchange.push(result.message);
                     exchange.push(ChatMessage { role: "user".into(), content: ambiguous_anchor_guidance().into() });
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    debug_log(debug_trace, "tool", format!("Proposal validation: rejected — {error}"));
+                    return Err(error);
+                }
             };
             if let Some(pending) = pending {
                 *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone());

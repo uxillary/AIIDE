@@ -96,11 +96,12 @@ fn fixture_root() -> Result<PathBuf, String> {
     std::fs::canonicalize(root).map_err(|_| "Benchmark fixture is missing.".to_owned())
 }
 
-fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<(String, String, Option<Case>, bool), String> {
+fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<(String, String, Option<Case>, bool, bool), String> {
     let mut provider = OLLAMA_PROVIDER_ID.to_owned();
     let mut model = None;
     let mut case = None;
     let mut json = false;
+    let mut diagnose = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -111,6 +112,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<(String, St
                 _ => return Err("--case must be answer, lookup, or edit".into()),
             }),
             "--json" => json = true,
+            "--diagnose" => diagnose = true,
             _ => return Err(format!("Unknown argument: {arg}")),
         }
     }
@@ -118,17 +120,51 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<(String, St
         return Err("Unknown model provider. Use 'ollama' or 'openrouter'.".into());
     }
     let model = model.filter(|value| !value.trim().is_empty()).ok_or(
-        "Usage: agent-benchmark [--provider ollama|openrouter] --model <model-id> [--case answer|lookup|edit] [--json]"
+        "Usage: agent-benchmark [--provider ollama|openrouter] --model <model-id> [--case answer|lookup|edit] [--json] [--diagnose]"
     )?;
-    Ok((provider, model, case, json))
+    Ok((provider, model, case, json, diagnose))
 }
 
-fn parse_args() -> Result<(String, String, Option<Case>, bool), String> {
+fn parse_args() -> Result<(String, String, Option<Case>, bool, bool), String> {
     parse_args_from(std::env::args().skip(1))
 }
 
+fn changed_span(before: &str, after: &str) -> (String, String) {
+    let before_chars: Vec<char> = before.chars().collect();
+    let after_chars: Vec<char> = after.chars().collect();
+    let prefix = before_chars.iter().zip(&after_chars).take_while(|(a, b)| a == b).count();
+    let suffix = before_chars[prefix..].iter().rev().zip(after_chars[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b).count();
+    let fragment = |chars: &[char]| {
+        let mut value: String = chars.iter().take(160).collect();
+        if chars.len() > 160 { value.push('…'); }
+        value
+    };
+    (fragment(&before_chars[prefix..before_chars.len() - suffix]),
+        fragment(&after_chars[prefix..after_chars.len() - suffix]))
+}
+
+fn print_diagnosis(case: Case, outcome: &Result<BenchmarkAgentOutput, BenchmarkAgentFailure>) {
+    if case != Case::Edit { return; }
+    let trace = match outcome { Ok(output) => &output.trace, Err(failure) => &failure.trace };
+    for line in trace.lines().filter(|line| line.starts_with("[AIIDE][repair] ")
+        || line.starts_with("Original failure:") || line.starts_with("[AIIDE][tool] Proposal validation:")) {
+        eprintln!("diagnostic: {line}");
+    }
+    if let Ok(output) = outcome {
+        for activity in &output.activity { eprintln!("diagnostic: activity={activity}"); }
+        if let Some(proposal) = &output.proposal {
+            for change in &proposal.changes {
+                let (old, new) = changed_span(&change.before, &change.after);
+                eprintln!("diagnostic: validated change path={} replacements={} old_span={:?} new_span={:?}",
+                    change.path, change.replacements, old, new);
+            }
+        }
+    }
+}
+
 pub fn run_cli() -> Result<(), String> {
-    let (provider, model, selected, json) = parse_args()?;
+    let (provider, model, selected, json, diagnose) = parse_args()?;
     let root = fixture_root()?;
     let cases = selected.map_or_else(|| vec![Case::Answer, Case::Lookup, Case::Edit], |value| vec![value]);
     let mut results = Vec::new();
@@ -138,6 +174,7 @@ pub fn run_cli() -> Result<(), String> {
         let started = Instant::now();
         let outcome = tauri::async_runtime::block_on(ollama::run_benchmark_agent(&provider, &model, root.clone(), case.prompt()));
         let after = std::fs::read_to_string(&target).map_err(|_| "Benchmark fixture target is missing.".to_owned())?;
+        if diagnose { print_diagnosis(case, &outcome); }
         results.push(classify(&model, case, started.elapsed().as_millis(), outcome, &before, &after));
     }
     if json {
@@ -249,11 +286,11 @@ mod tests {
 
     #[test]
     fn benchmark_defaults_to_ollama_and_accepts_explicit_openrouter() {
-        let (provider, model, _, _) = parse_args_from(["--model", "local-model"].into_iter().map(str::to_owned)).unwrap();
+        let (provider, model, _, _, _) = parse_args_from(["--model", "local-model"].into_iter().map(str::to_owned)).unwrap();
         assert_eq!(provider, "ollama");
         assert_eq!(model, "local-model");
 
-        let (provider, model, _, _) = parse_args_from(
+        let (provider, model, _, _, _) = parse_args_from(
             ["--provider", "openrouter", "--model", "vendor/model:free"].into_iter().map(str::to_owned)
         ).unwrap();
         assert_eq!(provider, "openrouter");
@@ -264,5 +301,14 @@ mod tests {
     fn benchmark_rejects_unknown_providers() {
         let error = parse_args_from(["--provider", "cloud", "--model", "m"].into_iter().map(str::to_owned)).unwrap_err();
         assert_eq!(error, "Unknown model provider. Use 'ollama' or 'openrouter'.");
+    }
+
+    #[test]
+    fn diagnosis_extracts_only_the_changed_span() {
+        let before = format!("<title>OrbitNote</title>\n{OLD_HEADING}\n<footer>Keep</footer>");
+        let after = before.replacen(OLD_HEADING, "<h1>Wrong heading</h1>", 1);
+        assert_eq!(changed_span(&before, &after), ("OrbitNote".into(), "Wrong heading".into()));
+        let (_, _, _, _, diagnose) = parse_args_from(["--model", "m", "--diagnose"].into_iter().map(str::to_owned)).unwrap();
+        assert!(diagnose);
     }
 }
