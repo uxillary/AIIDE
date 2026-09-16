@@ -34,8 +34,9 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .sidebar-empty { display: grid; justify-items: start; gap: 8px; padding: 20px 16px; color: #78716c; font-size: 12px; line-height: 1.55; }
 .empty-icon { color: #57534e; font-size: 18px; }
 .project-card { border-bottom: 1px solid #272c29; padding: 13px 15px 15px; background: #171a18; }
-.project-card h2 { overflow: hidden; color: #f3efe8; font-size: 14px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
-.project-card p { margin-top: 5px; color: #77716b; font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+.project-card h2 { display: flex; min-width: 0; align-items: center; gap: 7px; color: #f3efe8; font-size: 14px; font-weight: 700; }
+.project-card h2 span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-card p { overflow: hidden; margin-top: 7px; color: #77716b; font-family: ui-monospace, monospace; font-size: 10px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
 .project-meta { display: grid; gap: 7px; margin-top: 13px; font-size: 11px; }
 .project-meta div { display: grid; grid-template-columns: minmax(72px, .8fr) minmax(0, 1.2fr); align-items: baseline; gap: 10px; }
 .project-meta span { color: #756f69; }
@@ -43,9 +44,32 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .project-meta .status-clean { color: #7fd99d; }
 .project-meta .status-warn { color: #f2b85c; }
 .files-heading { padding: 14px 15px 8px; color: #756f69; font-family: ui-monospace, monospace; font-size: 10px; font-weight: 750; letter-spacing: .14em; }
+.file-tree-scroll { min-height: 0; overflow-y: auto; }
+@supports not selector(::-webkit-scrollbar) {
+  .file-tree-scroll, .chat-history, .changes-panel { scrollbar-width: thin; scrollbar-color: #42564b #151816; }
+  .file-tree-scroll:hover, .chat-history:hover, .changes-panel:hover { scrollbar-color: #638473 #151816; }
+}
+.file-tree-scroll::-webkit-scrollbar, .chat-history::-webkit-scrollbar, .changes-panel::-webkit-scrollbar { width: 7px; height: 7px; }
+.file-tree-scroll::-webkit-scrollbar-track, .chat-history::-webkit-scrollbar-track, .changes-panel::-webkit-scrollbar-track { background: #151816; }
+.file-tree-scroll::-webkit-scrollbar-thumb, .chat-history::-webkit-scrollbar-thumb, .changes-panel::-webkit-scrollbar-thumb { border: 1px solid #151816; border-radius: 6px; background: #42564b; }
+.file-tree-scroll::-webkit-scrollbar-thumb:hover, .chat-history::-webkit-scrollbar-thumb:hover, .changes-panel::-webkit-scrollbar-thumb:hover { background: #638473; }
+.file-tree-scroll::-webkit-scrollbar-button, .chat-history::-webkit-scrollbar-button, .changes-panel::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
 .tree-row { display: flex; width: 100%; height: 28px; align-items: center; gap: 7px; overflow: hidden; border-left: 2px solid transparent; padding-right: 10px; text-align: left; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .tree-row:hover { border-left-color: #2f71d0; background: #1e2421; }
-.tree-icon { width: 12px; flex: none; color: #71927f; font-family: ui-monospace, monospace; }
+.tree-row:focus-visible { position: relative; z-index: 1; background: #202c24; }
+.tree-chevron { width: 10px; flex: none; color: #71927f; font-family: ui-monospace, monospace; }
+.file-type-icon { display: block; width: 16px; height: 16px; flex: none; color: #a3a8a5; }
+.file-type-folder { color: #78c4a0; }
+.file-type-html { color: #d9a17d; }
+.file-type-css { color: #85aed8; }
+.file-type-js { color: #d1bc72; }
+.file-type-ts { color: #79a4d9; }
+.file-type-json { color: #cdb584; }
+.file-type-markdown { color: #9bb2c1; }
+.file-type-image { color: #b09acb; }
+.file-type-config { color: #a7aaa4; }
+.tree-name { min-width: 0; overflow: hidden; color: #a8a29e; text-overflow: ellipsis; white-space: nowrap; }
+.tree-name-folder { color: #dedbd5; }
 .tree-hint { color: #78716c; font-size: 11px; }
 
 .main-panel { min-width: 0; flex: 1; display: flex; flex-direction: column; background: #101311; }
@@ -79,13 +103,14 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .elma-status strong { display: block; color: #eeeae4; font-weight: 650; }
 .elma-status span { display: block; max-width: 520px; overflow: hidden; margin-top: 2px; color: #78716c; font-family: ui-monospace, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 
-.chat-history { flex: 1; min-height: 0; overflow-y: auto; }
+.chat-history { flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; }
 .chat-empty { max-width: 440px; margin: 0 auto; padding: 58px 22px; color: #aaa39b; text-align: center; font-size: 13px; line-height: 1.6; }
 .chat-empty .elma-sprite { margin: 0 auto 14px; }
 .chat-empty .eyebrow { display: block; margin-bottom: 9px; color: #6b8f7d; font-family: ui-monospace, monospace; font-size: 9px; font-weight: 700; letter-spacing: .14em; }
 .chat-empty h2 { margin-bottom: 8px; color: #f8f6f1; font-size: 19px; font-weight: 650; }
 .chat-empty p { margin: 0 auto 20px; max-width: 370px; }
-.starter-prompts { display: grid; gap: 7px; margin-top: 20px; text-align: left; }
+.project-start p { margin-bottom: 0; }
+.starter-prompts { display: grid; gap: 7px; margin-top: 16px; text-align: left; }
 .starter-prompts button { display: flex; align-items: center; justify-content: space-between; width: 100%; border: 1px solid #2d3832; background: #171c18; padding: 9px 11px; color: #cbc6bf; font-size: 12px; }
 .starter-prompts button:hover { border-color: #526459; background: #1c221e; color: #f5f5f4; }
 .starter-prompts span { color: #6ee7b7; }
@@ -114,7 +139,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .composer-hint kbd { border: 1px solid #303a34; border-bottom-color: #222923; background: #111512; padding: 1px 5px; color: #a9b8ae; font-family: ui-monospace, monospace; font-size: 10px; }
 .composer-hint span { color: #434943; }
 
-.changes-panel { width: 322px; flex: none; overflow: auto; border-left: 1px solid #272c29; background: #151816; }
+.changes-panel { width: 322px; flex: none; overflow-y: auto; border-left: 1px solid #272c29; background: #151816; }
 .changes-review { padding: 15px; }
 .changes-empty { display: grid; justify-items: start; gap: 8px; padding: 22px 17px; color: #827d76; font-size: 12px; line-height: 1.55; }
 .changes-empty-motif { position: relative; width: 42px; height: 36px; display: flex; align-items: center; }

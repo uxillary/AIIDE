@@ -1,13 +1,19 @@
 import type { ProjectInfo } from '../types/project'
-import { FileTree } from './FileTree'
+import { FileIcon, FileTree } from './FileTree'
+
+function formatDisplayPath(path: string) {
+  if (path.startsWith('\\\\?\\UNC\\')) return `\\\\${path.slice(8)}`
+  return path.startsWith('\\\\?\\') ? path.slice(4) : path
+}
 
 export function ProjectSidebar({ project, onOpen, busy }: { project: ProjectInfo | null; onOpen: () => void; busy: boolean }) {
+  const displayPath = project ? formatDisplayPath(project.path) : ''
   return <aside className="sidebar">
     <div className="sidebar-heading"><span>PROJECT</span><button className="small-button" onClick={onOpen} disabled={busy} title="Open another project"><span aria-hidden="true">▣</span> Open folder</button></div>
     {project ? <>
       <div className="project-card">
-        <h2 title={project.name}>{project.name}</h2>
-        <p title={project.path}>{project.path}</p>
+        <h2 title={project.name}><FileIcon kind="folder" /> <span>{project.name}</span></h2>
+        <p title={displayPath}>{displayPath}</p>
         <div className="project-meta"><div><span>Repository</span><strong title={project.repository?.name}>{project.repository?.name ?? 'No Git repository'}</strong></div>{project.repository && <><div><span>Branch</span><strong title={project.repository.branch}>{project.repository.branch}</strong></div><div><span>Status</span><strong className={project.repository.changedFiles ? 'status-warn' : 'status-clean'}>{project.repository.changedFiles ? `${project.repository.changedFiles} changed ${project.repository.changedFiles === 1 ? 'file' : 'files'}` : 'Clean'}</strong></div></>}</div>
       </div>
       <div className="files-heading">FILES</div>
