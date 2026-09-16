@@ -86,7 +86,7 @@ type ChatPayloadResponse = InferenceResponse;
 #[serde(rename_all = "camelCase")]
 pub struct ChatResponse { model: String, content: String, activity: Vec<Activity>, proposal: Option<PendingProposal> }
 
-const CORE_AGENT_INSTRUCTIONS: &str = "You are Elma, a local-first AI coding companion inside AIIDE. You may inspect the opened project through AIIDE's bounded tools and propose focused replacements to existing text files. You cannot apply changes, write files, execute commands, commit, or push. Inspect every target file with read_file before proposing a change. Preserve its style and avoid unrelated cleanup or whole-file rewrites. For a conversational response, return exactly {\"action\":\"answer\",\"answer\":\"<response>\"}; never put conversational answer text in summary. list_files.path is a project-relative directory, never a glob: use path=\"\" for the project root, then copy exact returned paths into read_file. A propose_change action needs a concise summary and changes containing project-relative path, exact old_text copied from file content without the displayed line-number prefix, and replacement new_text. AIIDE validates and previews it; only the user's Apply button can write it. Never claim a proposal was applied. Questions and reviews may be answered without proposing changes. Never invent files, code, Git state, tool results, or commands. search_files searches one literal substring. Failed tools do not prove absence. Return exactly one JSON object matching the provided schema.";
+const CORE_AGENT_INSTRUCTIONS: &str = "You are Elma, a local-first AI coding companion inside AIIDE. You may inspect the opened project through AIIDE's bounded tools and propose focused replacements to existing text files. You cannot apply changes, write files, execute commands, commit, or push. Questions about project files, source code, directories, structure, or repository content require relevant repository evidence before answering. If the user gives only a filename, use list_files to discover its exact project-relative path, then read_file when its contents are needed. Never ask the user to provide project content that AIIDE's tools can inspect, and do not treat recognizing missing evidence as a final answer. Use the least expensive relevant tool and do not inspect unrelated files. answer is only for general conversation or a repository answer supported by sufficient evidence. Inspect every target file with read_file before proposing a change. Preserve its style and avoid unrelated cleanup or whole-file rewrites. For a conversational response, return exactly {\"action\":\"answer\",\"answer\":\"<response>\"}; never put conversational answer text in summary. list_files.path is a project-relative directory, never a glob: use path=\"\" for the project root, then copy exact returned paths into read_file. A propose_change action needs a concise summary and changes containing project-relative path, exact old_text copied from file content without the displayed line-number prefix, and replacement new_text. AIIDE validates and previews it; only the user's Apply button can write it. Never claim a proposal was applied. Questions and reviews may be answered without proposing changes. Never invent files, code, Git state, tool results, or commands. search_files searches one literal substring. Failed tools do not prove absence. Return exactly one JSON object matching the provided schema.";
 
 const DEFAULT_PERSONALITY: &str = "Elma is calm, clever, trustworthy, and down-to-earth, with a cute exterior and a dry sense of humour. Sound moderately casual and task-focused. Occasional mild sarcasm, playful comments, and natural emoji are welcome when they do not obscure technical facts or errors. Lightly mirror the user's casual language without forcing slang or caricature. Be concise by default: give the shortest complete answer, usually a few sentences for simple questions. Start with the answer; do not restate the question or add generic introductions, conclusions, or unnecessary headings. Assume normal software-development basics, explain important details briefly, and expand only when useful or requested.";
 
@@ -108,6 +108,28 @@ enum RequestIntent { Answer, Edit }
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RequestPlan { scope: RequestScope, intent: RequestIntent }
 
+#[derive(Clone, Debug, PartialEq)]
+enum EvidenceKind { None, Listing, Inspection, Read }
+
+#[derive(Clone, Debug, PartialEq)]
+struct EvidenceRequirement { kind: EvidenceKind, filename: Option<String> }
+
+impl EvidenceRequirement {
+    fn none() -> Self { Self { kind: EvidenceKind::None, filename: None } }
+
+    fn satisfied(&self, listings: usize, searches: usize, read_paths: &[String]) -> bool {
+        match self.kind {
+            EvidenceKind::None => true,
+            EvidenceKind::Listing => listings > 0,
+            EvidenceKind::Inspection => searches > 0 || !read_paths.is_empty(),
+            EvidenceKind::Read => self.filename.as_ref().map_or(!read_paths.is_empty(), |filename| {
+                read_paths.iter().any(|path| std::path::Path::new(path).file_name()
+                    .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(filename)))
+            }),
+        }
+    }
+}
+
 fn is_edit_clause(clause: &str) -> bool {
     let mut clause = clause.trim();
     loop {
@@ -124,20 +146,59 @@ fn is_edit_clause(clause: &str) -> bool {
 fn classify_current_request(prompt: &str) -> RequestPlan {
     let text = prompt.trim().to_ascii_lowercase();
     let edit = text.split(['.', '!', '?', ';', '\n']).any(is_edit_clause);
-    let repository = edit || ["this project", "the project", "look at the css", "look at the code", "mobile menu", "main heading", "signup form", "repository"].iter().any(|phrase| text.contains(phrase));
-    let general = text.starts_with("what is ") || text.starts_with("what's ") || text.starts_with("explain ");
+    let repository = edit || file_reference(prompt).is_some() || has_path_reference(prompt)
+        || ["this project", "the project", "look at the css", "look at the code", "source code", "codebase", "project structure", "repository structure", "repository", "what files", "which files", "list files", "files in ", "files are in ", "directory", "folder", "page heading", "mobile menu", "main heading", "signup form"].iter().any(|phrase| text.contains(phrase));
+    let general = matches!(text.as_str(), "hey" | "hello" | "hi" | "how are you" | "how are you?")
+        || text.starts_with("what is ") || text.starts_with("what's ") || text.starts_with("explain ");
     RequestPlan { scope: if repository { RequestScope::Repository } else if general { RequestScope::General } else { RequestScope::Unknown }, intent: if edit { RequestIntent::Edit } else { RequestIntent::Answer } }
 }
 
-fn agent_schema(project_open: bool, edit_intent: bool, has_read_evidence: bool) -> Value {
+fn has_path_reference(prompt: &str) -> bool {
+    prompt.split_whitespace().any(|word| {
+        let token = word.trim_matches(|character: char| matches!(character, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '!' | '?'));
+        !token.contains("://") && (token.starts_with("./") || token.contains('/') || token.contains('\\'))
+    })
+}
+
+fn file_reference(prompt: &str) -> Option<String> {
+    const EXTENSIONS: &[&str] = &["html", "htm", "css", "scss", "js", "jsx", "ts", "tsx", "rs", "py", "go", "java", "c", "h", "cpp", "json", "toml", "yaml", "yml", "md", "txt", "xml", "sql", "sh", "ps1"];
+    const FILENAMES: &[&str] = &["dockerfile", "makefile", "readme", "license"];
+    prompt.split_whitespace().filter_map(|word| {
+        let token = word.trim_matches(|character: char| matches!(character, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '!' | '?'));
+        let name = token.rsplit(['/', '\\']).next().unwrap_or(token);
+        let lower = name.to_ascii_lowercase();
+        let extension = lower.rsplit_once('.').map(|(_, extension)| extension);
+        ((!name.is_empty()) && (FILENAMES.contains(&lower.as_str()) || extension.is_some_and(|value| EXTENSIONS.contains(&value))))
+            .then_some(name.to_owned())
+    }).next()
+}
+
+fn evidence_requirement(prompt: &str, scope: RequestScope) -> EvidenceRequirement {
+    if scope != RequestScope::Repository { return EvidenceRequirement::none(); }
+    let text = prompt.trim().to_ascii_lowercase();
+    if ["what files", "which files", "list files", "files are in ", "files in ", "directory contents", "folder contents"]
+        .iter().any(|phrase| text.contains(phrase)) {
+        EvidenceRequirement { kind: EvidenceKind::Listing, filename: None }
+    } else if let Some(filename) = file_reference(prompt) {
+        EvidenceRequirement { kind: EvidenceKind::Read, filename: Some(filename) }
+    } else if ["find ", "locate ", "search ", "where is ", "where's "].iter().any(|phrase| text.starts_with(phrase)) {
+        EvidenceRequirement { kind: EvidenceKind::Inspection, filename: None }
+    } else {
+        EvidenceRequirement { kind: EvidenceKind::Read, filename: None }
+    }
+}
+
+fn agent_schema(project_open: bool, edit_intent: bool, has_read_evidence: bool, answer_allowed: bool) -> Value {
     let actions = if !project_open { json!(["answer"]) }
         else if edit_intent && has_read_evidence { json!(["list_files","search_files","read_file","propose_change"]) }
         else if edit_intent { json!(["list_files","search_files","read_file"]) }
+        else if !answer_allowed { json!(["list_files","search_files","read_file"]) }
         else { json!(["list_files","search_files","read_file","answer"]) };
     json!({"type":"object","properties":{
-        "action":{"type":"string","enum":actions,"description":"Choose answer for conversational responses. For action=answer, use the answer field and never summary."},
-        "path":{"type":"string","description":"For list_files, a project-relative directory such as '' or 'src', never a glob. For read_file, an exact file path returned by list_files."},"query":{"type":"string"},
-        "answer":{"type":"string","description":"Required conversational response text when action is answer."},
+        "action":{"type":"string","enum":actions,"description":"Use the least expensive relevant repository action when project evidence is needed. Choose answer only for general conversation or after sufficient evidence. For answer, use the answer field and never summary."},
+        "path":{"type":"string","description":"For list_files, the project-relative directory to enumerate, such as '' or 'src', never a glob. Use it to discover exact paths. For read_file, an exact project-relative file path returned by list_files; use it when file contents are needed."},
+        "query":{"type":"string","description":"For search_files, one literal text substring to find in project files; use it to locate content, not filenames."},
+        "answer":{"type":"string","description":"Required response text when action is answer. Do not ask for project content that repository tools can obtain."},
         "summary":{"type":"string","maxLength":160,"description":"For propose_change only: one short sentence describing the edit. Never include rationale or repeat text. Never use this for action=answer."},
         "changes":{"type":"array","maxItems":4,"items":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}}
     },"required":["action"],"additionalProperties":false})
@@ -197,11 +258,11 @@ async fn chat_turn(provider: &impl ModelProvider, model: &str, messages: &[ChatM
     Ok(result)
 }
 
-async fn agent_turn(provider: &impl ModelProvider, model: &str, exchange: &mut Vec<ChatMessage>, project_open: bool, edit_intent: bool, has_read_evidence: bool, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<(ChatPayloadResponse, AgentAction), String> {
+async fn agent_turn(provider: &impl ModelProvider, model: &str, exchange: &mut Vec<ChatMessage>, project_open: bool, edit_intent: bool, has_read_evidence: bool, answer_allowed: bool, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<(ChatPayloadResponse, AgentAction), String> {
     let temperature = model_profiles::adaptation(model).protocol_temperature.unwrap_or(PROTOCOL_TEMPERATURE);
     for attempt in 0..=MAX_REPAIRS {
         let stage = if attempt == 0 { "STRUCTURED".to_owned() } else { format!("REPAIR {attempt}/{MAX_REPAIRS}") };
-        let result = chat_turn(provider, model, exchange, agent_schema(project_open, edit_intent, has_read_evidence), temperature, &stage, trace).await?;
+        let result = chat_turn(provider, model, exchange, agent_schema(project_open, edit_intent, has_read_evidence, answer_allowed), temperature, &stage, trace).await?;
         let parsed = if result.done_reason.as_deref() == Some("length") { Err("response exceeded the model output limit") }
             else { parse_action(&result.message.content) };
         match parsed {
@@ -397,6 +458,8 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
     let mut tool_cache: HashMap<String, (String, Activity)> = HashMap::new();
     let mut context_bytes = 0;
     let mut successful_inspections = 0;
+    let mut successful_listings = 0;
+    let mut successful_searches = 0;
     let mut successful_reads = 0;
     let mut read_paths = Vec::new();
     let mut evidence: Vec<(String, String)> = Vec::new();
@@ -405,9 +468,12 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
     let mut known_paths = String::new();
     let mut known_file_paths: Vec<String> = Vec::new();
     let mut needs_inspection = match plan.scope { RequestScope::General => Some(false), RequestScope::Repository => Some(true), RequestScope::Unknown => None };
+    let mut grounding = evidence_requirement(&last_prompt, plan.scope);
     let mut inspection_reminders = 0;
     for iteration in 0..=repository::MAX_TOOL_CALLS {
-        let (result, action) = agent_turn(provider, &model, &mut exchange, root.is_some(), plan.intent == RequestIntent::Edit, successful_reads > 0, app, debug_trace).await?;
+        let evidence_sufficient = grounding.satisfied(successful_listings, successful_searches, &read_paths);
+        let answer_allowed = plan.intent == RequestIntent::Answer && (needs_inspection != Some(true) || evidence_sufficient);
+        let (result, action) = agent_turn(provider, &model, &mut exchange, root.is_some(), plan.intent == RequestIntent::Edit, successful_reads > 0, answer_allowed, app, debug_trace).await?;
         if let AgentAction::Propose(summary, edits) = action {
             let root = root.as_ref().ok_or_else(|| "Open a project before proposing changes.".to_owned())?;
             if edits.iter().any(|edit| !read_paths.contains(&edit.path)) {
@@ -430,7 +496,7 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
                 exchange.push(ChatMessage { role: "user".into(), content: if successful_reads == 0 { "This edit request cannot finish with an answer. Inspect the relevant file first, then prepare a focused proposal.".into() } else { "This edit request cannot finish with an answer or claim review readiness. Return a minimal propose_change using the inspected file content.".into() } });
                 continue;
             }
-            if root.is_some() && successful_reads == 0 {
+            if root.is_some() && (needs_inspection.is_none() || (needs_inspection == Some(true) && !evidence_sufficient)) {
                 let needed = match needs_inspection {
                     Some(needed) => needed,
                     None => {
@@ -440,10 +506,19 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
                     }
                 };
                 if needed {
+                    if grounding.kind == EvidenceKind::None {
+                        grounding = evidence_requirement(&last_prompt, RequestScope::Repository);
+                    }
                     if inspection_reminders < 2 {
+                        debug_log(debug_trace, "protocol", "Grounding validation: FAILED — repository evidence required before answer");
                         inspection_reminders += 1;
                         exchange.push(result.message);
-                        exchange.push(ChatMessage { role: "user".into(), content: "This question needs evidence from the opened project. Use list_files to find exact paths, then read_file on relevant files before answering. A failed tool or no matches does not prove files are absent.".into() });
+                        exchange.push(ChatMessage { role: "user".into(), content: match grounding.kind {
+                            EvidenceKind::Listing => "This question needs a project directory listing before it can be answered. Use list_files with the relevant project-relative directory. Do not ask the user to provide information AIIDE can inspect.".into(),
+                            EvidenceKind::Inspection => "This question needs repository evidence before it can be answered. Use the least expensive relevant list_files, search_files, or read_file action. Do not ask the user to provide information AIIDE can inspect.".into(),
+                            EvidenceKind::Read => "This question needs evidence from the opened project. Use list_files to discover exact paths, then read_file on the relevant file before answering. Do not ask the user to provide content AIIDE can inspect.".into(),
+                            EvidenceKind::None => unreachable!(),
+                        } });
                         continue;
                     }
                     return Ok(ChatResponse { model: result.model, content: "I couldn't inspect the opened project, so I can't give a file-based answer. Please try again.".into(), activity, proposal: None });
@@ -495,6 +570,8 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
         }
         if useful {
             successful_inspections += 1;
+            if request.tool == "list_files" { successful_listings += 1; }
+            if request.tool == "search_files" { successful_searches += 1; }
             if request.tool == "read_file" { successful_reads += 1; read_paths.push(request.path.clone()); }
             evidence.push((format!("{} {}", request.tool, request.path), output.clone()));
             unresolved_failure = false;
@@ -549,6 +626,7 @@ mod tests {
     struct StubProvider {
         models: Vec<String>,
         responses: Mutex<VecDeque<InferenceResponse>>,
+        formats: Mutex<Vec<Value>>,
         inference_calls: AtomicUsize,
     }
 
@@ -562,6 +640,7 @@ mod tests {
                     done: true,
                     done_reason: Some("stop".into()),
                 }).collect()),
+                formats: Mutex::new(Vec::new()),
                 inference_calls: AtomicUsize::new(0),
             }
         }
@@ -576,8 +655,9 @@ mod tests {
 
         async fn installed_models(&self) -> Result<Vec<String>, ProviderFailure> { Ok(self.models.clone()) }
 
-        async fn infer(&self, _request: InferenceRequest<'_>) -> Result<InferenceResponse, ProviderFailure> {
+        async fn infer(&self, request: InferenceRequest<'_>) -> Result<InferenceResponse, ProviderFailure> {
             self.inference_calls.fetch_add(1, Ordering::SeqCst);
+            self.formats.lock().unwrap().push(request.format.clone());
             self.responses.lock().unwrap().pop_front().ok_or_else(|| ProviderFailure::new(ProviderErrorKind::Api, "No stub response configured."))
         }
     }
@@ -586,6 +666,8 @@ mod tests {
     fn personality_is_separate_from_protocol_defaults() {
         assert!(CORE_AGENT_INSTRUCTIONS.contains("cannot apply changes"));
         assert!(CORE_AGENT_INSTRUCTIONS.contains("exact old_text"));
+        assert!(CORE_AGENT_INSTRUCTIONS.contains("Never ask the user to provide project content"));
+        assert!(CORE_AGENT_INSTRUCTIONS.contains("least expensive relevant tool"));
         assert!(DEFAULT_PERSONALITY.contains("concise by default"));
         assert!(DEFAULT_PERSONALITY.contains("dry sense of humour"));
         assert!(!DEFAULT_PERSONALITY.contains("propose_change"));
@@ -598,7 +680,7 @@ mod tests {
         let provider = StubProvider::new(&["test-model"], &["plain prose", r#"{"action":"answer","answer":"repaired"}"#]);
         let mut exchange = vec![ChatMessage { role: "user".into(), content: "hello".into() }];
         let (_, action) = tauri::async_runtime::block_on(agent_turn(
-            &provider, "test-model", &mut exchange, false, false, false, None, None,
+            &provider, "test-model", &mut exchange, false, false, false, true, None, None,
         )).unwrap();
         assert_eq!(action, AgentAction::Answer("repaired".into()));
         assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 2);
@@ -662,21 +744,22 @@ mod tests {
         let error = parse_action(r#"{"action":"answer","summary":"Wrong field."}"#).unwrap_err();
         assert!(error.contains("put the response text in the 'answer' field"));
         assert!(error.contains("Do not put it in 'summary'"));
-        let schema = agent_schema(false, false, false);
-        assert!(schema["properties"]["answer"]["description"].as_str().unwrap().contains("Required conversational response"));
+        let schema = agent_schema(false, false, false, true);
+        assert!(schema["properties"]["answer"]["description"].as_str().unwrap().contains("Required response text"));
         assert!(schema["properties"]["summary"]["description"].as_str().unwrap().contains("Never use this for action=answer"));
     }
 
     #[test]
     fn agent_action_availability_matches_project_and_inspection_state() {
-        let actions = |project_open, edit, evidence| agent_schema(project_open, edit, evidence)["properties"]["action"]["enum"].as_array().unwrap().iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>();
-        assert_eq!(actions(false, false, false), vec!["answer"]);
-        assert!(actions(true, false, true).contains(&"answer".to_owned()));
-        assert!(!actions(true, false, true).contains(&"propose_change".to_owned()));
-        assert!(!actions(true, true, false).contains(&"answer".to_owned()));
-        assert!(!actions(true, true, false).contains(&"propose_change".to_owned()));
-        assert!(actions(true, true, true).contains(&"propose_change".to_owned()));
-        assert!(!actions(true, true, true).contains(&"answer".to_owned()));
+        let actions = |project_open, edit, evidence, answer_allowed| agent_schema(project_open, edit, evidence, answer_allowed)["properties"]["action"]["enum"].as_array().unwrap().iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(actions(false, false, false, false), vec!["answer"]);
+        assert!(actions(true, false, true, true).contains(&"answer".to_owned()));
+        assert!(!actions(true, false, true, false).contains(&"answer".to_owned()));
+        assert!(!actions(true, false, true, true).contains(&"propose_change".to_owned()));
+        assert!(!actions(true, true, false, true).contains(&"answer".to_owned()));
+        assert!(!actions(true, true, false, true).contains(&"propose_change".to_owned()));
+        assert!(actions(true, true, true, true).contains(&"propose_change".to_owned()));
+        assert!(!actions(true, true, true, true).contains(&"answer".to_owned()));
     }
 
     #[test]
@@ -713,6 +796,92 @@ mod tests {
     }
 
     #[test]
+    fn natural_repository_requests_and_general_chat_are_classified_conservatively() {
+        for prompt in ["summarize index.html", "what does styles.css do?", "find the page heading", "what files are in src?"] {
+            assert_eq!(classify_current_request(prompt).scope, RequestScope::Repository, "{prompt}");
+        }
+        for prompt in ["hey", "how are you?", "explain what HTML is", "what is CSS?"] {
+            assert_ne!(classify_current_request(prompt).scope, RequestScope::Repository, "{prompt}");
+        }
+        assert_eq!(evidence_requirement("summarize index.html", RequestScope::Repository), EvidenceRequirement { kind: EvidenceKind::Read, filename: Some("index.html".into()) });
+        let named = evidence_requirement("what does styles.css do?", RequestScope::Repository);
+        assert!(!named.satisfied(1, 1, &["src/index.html".into()]));
+        assert!(named.satisfied(0, 0, &["src/styles.css".into()]));
+        assert_eq!(evidence_requirement("find the page heading", RequestScope::Repository).kind, EvidenceKind::Inspection);
+        assert!(!evidence_requirement("find the page heading", RequestScope::Repository).satisfied(1, 0, &[]));
+        assert!(evidence_requirement("find the page heading", RequestScope::Repository).satisfied(0, 1, &[]));
+        assert_eq!(evidence_requirement("what files are in src?", RequestScope::Repository).kind, EvidenceKind::Listing);
+        assert_eq!(classify_current_request("inspect src/components").scope, RequestScope::Repository);
+    }
+
+    fn grounding_fixture(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("aiide-grounding-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/index.html"), "<h1>Welcome</h1>").unwrap();
+        std::fs::write(root.join("src/styles.css"), "body { color: black; }").unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn named_file_refusal_cannot_complete_before_discovery_and_relevant_read() {
+        let root = grounding_fixture("named-file");
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"answer","answer":"I cannot summarize it until you provide the file."}"#,
+            r#"{"action":"list_files","path":""}"#,
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            r#"{"action":"answer","answer":"The page contains a Welcome heading."}"#,
+            r#"{"action":"answer","answer":"It is a small page headed Welcome."}"#,
+        ]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "summarize index.html".into() }],
+            Some(root.clone()), None, None, None,
+        )).unwrap();
+        assert!(response.activity.iter().any(|item| item.label == "Project structure"));
+        assert!(response.activity.iter().any(|item| item.label == "Read: src/index.html"));
+        assert!(response.content.contains("small page"));
+        assert!(!response.content.contains("provide the file"));
+        let first_actions = provider.formats.lock().unwrap()[0]["properties"]["action"]["enum"].as_array().unwrap().clone();
+        assert!(!first_actions.iter().any(|action| action == "answer"), "answer must be unavailable before evidence");
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 5);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_listing_is_sufficient_without_unnecessary_reads() {
+        let root = grounding_fixture("directory-listing");
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"list_files","path":"src"}"#,
+            r#"{"action":"answer","answer":"src contains index.html and styles.css."}"#,
+            r#"{"action":"answer","answer":"src contains index.html and styles.css."}"#,
+        ]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "what files are in src?".into() }],
+            Some(root.clone()), None, None, None,
+        )).unwrap();
+        assert_eq!(response.activity.iter().filter(|item| item.label.starts_with("Read: ")).count(), 0);
+        assert_eq!(response.activity.iter().filter(|item| item.label == "Project structure").count(), 1);
+        assert!(response.content.contains("index.html"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ordinary_conversation_answers_without_repository_tools() {
+        let root = grounding_fixture("general-chat");
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"answer","answer":"Hey!"}"#,
+            r#"{"action":"answer","answer":"Hey!"}"#,
+        ]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "hey".into() }],
+            Some(root.clone()), None, None, None,
+        )).unwrap();
+        assert!(response.activity.is_empty());
+        assert_eq!(response.content, "Hey!");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn malformed_or_oversized_proposals_get_minimal_guidance() {
         for raw in [
             r#"{"action":"propose_change","summary":"Update heading."}"#.to_owned(),
@@ -723,7 +892,7 @@ mod tests {
             assert!(error.contains("old_text"));
             assert!(error.contains("one short sentence"));
         }
-        assert_eq!(agent_schema(true, true, true)["properties"]["summary"]["maxLength"], 160);
+        assert_eq!(agent_schema(true, true, true, false)["properties"]["summary"]["maxLength"], 160);
         let repair = repair_instruction("response exceeded the model output limit", true, true);
         assert!(repair.contains("minimal propose_change"));
         assert!(repair.contains("Do not repeat rationale"));
@@ -790,6 +959,20 @@ mod tests {
         assert_eq!(parse_scope(r#"{"scope":"unknown"}"#), None);
         assert_eq!(parse_scope("general"), None);
         assert_eq!(parse_scope(r#"{"scope":"general","tool":"read_file"}"#), None);
+    }
+
+    #[test]
+    #[ignore = "requires local Ollama with qwen2.5-coder:7b"]
+    fn local_grounding_calibration_acceptance() {
+        let root = std::fs::canonicalize(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/agent-benchmark"))
+            .expect("agent benchmark fixture must exist");
+        let response = tauri::async_runtime::block_on(run_agent(OLLAMA_PROVIDER_ID,
+            "qwen2.5-coder:7b".into(),
+            vec![ChatMessage { role: "user".into(), content: "summarize index.html".into() }],
+            Some(root), None, None, None,
+        )).expect("named-file summary should complete");
+        assert!(response.activity.iter().any(|item| item.label == "Read: src/index.html"));
+        assert!(!response.content.to_ascii_lowercase().contains("provide the file"));
     }
 
     #[test]
