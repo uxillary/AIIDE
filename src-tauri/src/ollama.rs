@@ -139,15 +139,22 @@ fn is_edit_clause(clause: &str) -> bool {
             .iter().find_map(|prefix| clause.strip_prefix(prefix));
         if let Some(value) = stripped { clause = value.trim_start(); } else { break; }
     }
+    if let Some((location, instruction)) = clause.split_once(',') {
+        let location = location.trim();
+        if ["in ", "on ", "for ", "within ", "inside ", "regarding "].iter().any(|prefix| location.starts_with(prefix))
+            || has_path_reference(location) || file_reference(location).is_some() {
+            return is_edit_clause(instruction);
+        }
+    }
     ["change", "edit", "modify", "fix", "implement", "add", "remove", "rename", "update", "replace", "refactor"]
         .iter().any(|verb| clause == *verb || clause.starts_with(&format!("{verb} ")))
-        || ["make this change", "make only that change", "prepare this change for review", "prepare it for review"]
+        || ["make this change", "make only that change", "prepare this change for review", "prepare the change for review", "prepare it for review"]
             .iter().any(|phrase| clause.starts_with(phrase))
 }
 
 fn classify_current_request(prompt: &str) -> RequestPlan {
     let text = prompt.trim().to_ascii_lowercase();
-    let edit = text.split(['.', '!', '?', ';', '\n']).any(is_edit_clause);
+    let edit = text.split(['!', '?', ';', '\n']).flat_map(|part| part.split(". ")).any(is_edit_clause);
     let repository = edit || file_reference(prompt).is_some() || has_path_reference(prompt)
         || ["this project", "the project", "look at the css", "look at the code", "source code", "codebase", "project structure", "repository structure", "repository", "what files", "which files", "list files", "files in ", "files are in ", "directory", "folder", "page heading", "mobile menu", "main heading", "signup form"].iter().any(|phrase| text.contains(phrase));
     let general = matches!(text.as_str(), "hey" | "hello" | "hi" | "how are you" | "how are you?")
@@ -1025,6 +1032,28 @@ mod tests {
         let current_edit = "okay implement that";
         assert_eq!(classify_current_request(current_edit).intent, RequestIntent::Edit);
         assert_eq!(classify_current_request(earlier_answer).intent, RequestIntent::Answer);
+    }
+
+    #[test]
+    fn location_prefixed_edits_and_review_preparation_are_edit_intent() {
+        let failed_prompt = "In src/index.html, replace the entire main hero <h1> element with:\n\n<h1>Welcome to OrbitNote 2.0</h1>\n\nPreserve all other content exactly. Prepare the change for review.";
+        for prompt in [
+            failed_prompt,
+            "In src/index.html, replace the heading with Welcome.",
+            "src/index.html, replace the heading with Welcome.",
+            "Please update the CSS in styles.css to use a larger font.",
+            "Prepare the change for review.",
+        ] {
+            assert_eq!(classify_current_request(prompt), RequestPlan { scope: RequestScope::Repository, intent: RequestIntent::Edit }, "{prompt}");
+        }
+        for prompt in [
+            "What is the heading in src/index.html?",
+            "In src/index.html, what would you change?",
+            "Please review the CSS in styles.css and suggest an update.",
+            "Explain how to replace the heading without editing it.",
+        ] {
+            assert_eq!(classify_current_request(prompt).intent, RequestIntent::Answer, "{prompt}");
+        }
     }
 
     #[test]
