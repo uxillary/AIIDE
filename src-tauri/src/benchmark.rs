@@ -148,7 +148,8 @@ fn print_diagnosis(case: Case, outcome: &Result<BenchmarkAgentOutput, BenchmarkA
     if case != Case::Edit { return; }
     let trace = match outcome { Ok(output) => &output.trace, Err(failure) => &failure.trace };
     for line in trace.lines().filter(|line| line.starts_with("[AIIDE][repair] ")
-        || line.starts_with("Original failure:") || line.starts_with("[AIIDE][tool] Proposal validation:")) {
+        || line.starts_with("Original failure:") || line.starts_with("[AIIDE][tool] Proposal validation:")
+        || line.starts_with("[AIIDE][intent] ")) {
         eprintln!("diagnostic: {line}");
     }
     if let Ok(output) = outcome {
