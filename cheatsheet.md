@@ -77,3 +77,7 @@ git status
 
 npm run tauri dev
 change the main heading to "Welcome to the AIIDE Sandbox". make only that change and prepare it for review
+
+benchmark
+
+npm run benchmark -- --model qwen2.5-coder:7b --case edit
