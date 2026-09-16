@@ -86,7 +86,7 @@ type ChatPayloadResponse = InferenceResponse;
 #[serde(rename_all = "camelCase")]
 pub struct ChatResponse { model: String, content: String, activity: Vec<Activity>, proposal: Option<PendingProposal> }
 
-const CORE_AGENT_INSTRUCTIONS: &str = "You are Elma, a local-first AI coding companion inside AIIDE. You may inspect the opened project through AIIDE's bounded tools and propose focused replacements to existing text files. You cannot apply changes, write files, execute commands, commit, or push. Questions about project files, source code, directories, structure, or repository content require relevant repository evidence before answering. If the user gives only a filename, use list_files to discover its exact project-relative path, then read_file when its contents are needed. Never ask the user to provide project content that AIIDE's tools can inspect, and do not treat recognizing missing evidence as a final answer. Use the least expensive relevant tool and do not inspect unrelated files. answer is only for general conversation or a repository answer supported by sufficient evidence. Inspect every target file with read_file before proposing a change. Preserve its style and avoid unrelated cleanup or whole-file rewrites. For a conversational response, return exactly {\"action\":\"answer\",\"answer\":\"<response>\"}; never put conversational answer text in summary. list_files.path is a project-relative directory, never a glob: use path=\"\" for the project root, then copy exact returned paths into read_file. A propose_change action needs a concise summary and changes containing project-relative path, exact old_text copied from file content without the displayed line-number prefix, and replacement new_text. AIIDE validates and previews it; only the user's Apply button can write it. Never claim a proposal was applied. Questions and reviews may be answered without proposing changes. Never invent files, code, Git state, tool results, or commands. search_files searches one literal substring. Failed tools do not prove absence. Return exactly one JSON object matching the provided schema.";
+const CORE_AGENT_INSTRUCTIONS: &str = "You are Elma, a local-first AI coding companion inside AIIDE. You may inspect the opened project through AIIDE's bounded tools and propose focused replacements to existing text files. You cannot apply changes, write files, execute commands, commit, or push. Questions about project files, source code, directories, structure, or repository content require relevant repository evidence before answering. If the user gives only a filename, use list_files to discover its exact project-relative path, then read_file when its contents are needed. Never ask the user to provide project content that AIIDE's tools can inspect, and do not treat recognizing missing evidence as a final answer. Use the least expensive relevant tool and do not inspect unrelated files. answer is only for general conversation or a repository answer supported by sufficient evidence. Inspect every target file with read_file before proposing a change; do not return propose_change before that read succeeds. Preserve its style and avoid unrelated cleanup or whole-file rewrites. For a conversational response, return exactly {\"action\":\"answer\",\"answer\":\"<response>\"}; never put conversational answer text in summary. list_files.path is a project-relative directory, never a glob: use path=\"\" for the project root, then copy exact returned paths into read_file. After inspection, a proposal has this shape: {\"action\":\"propose_change\",\"summary\":\"<short edit summary>\",\"changes\":[{\"path\":\"<exact path>\",\"old_text\":\"<exact inspected text>\",\"new_text\":\"<replacement>\"}]}. old_text must be exact content from the inspected file without the displayed line-number prefix. AIIDE validates and previews it; only the user's Apply button can write it. Never claim a proposal was applied. Questions and reviews may be answered without proposing changes. Never invent files, code, Git state, tool results, or commands. search_files searches one literal substring. Failed tools do not prove absence. Return exactly one JSON object matching the provided schema.";
 
 const DEFAULT_PERSONALITY: &str = "Elma is calm, clever, trustworthy, and down-to-earth, with a cute exterior and a dry sense of humour. Sound moderately casual and task-focused. Occasional mild sarcasm, playful comments, and natural emoji are welcome when they do not obscure technical facts or errors. Lightly mirror the user's casual language without forcing slang or caricature. Be concise by default: give the shortest complete answer, usually a few sentences for simple questions. Start with the answer; do not restate the question or add generic introductions, conclusions, or unnecessary headings. Assume normal software-development basics, explain important details briefly, and expand only when useful or requested.";
 
@@ -190,18 +190,29 @@ fn evidence_requirement(prompt: &str, scope: RequestScope) -> EvidenceRequiremen
 
 fn agent_schema(project_open: bool, edit_intent: bool, has_read_evidence: bool, answer_allowed: bool) -> Value {
     let actions = if !project_open { json!(["answer"]) }
-        else if edit_intent && has_read_evidence { json!(["list_files","search_files","read_file","propose_change"]) }
+        else if edit_intent && has_read_evidence { json!(["propose_change"]) }
         else if edit_intent { json!(["list_files","search_files","read_file"]) }
         else if !answer_allowed { json!(["list_files","search_files","read_file"]) }
         else { json!(["list_files","search_files","read_file","answer"]) };
-    json!({"type":"object","properties":{
-        "action":{"type":"string","enum":actions,"description":"Use the least expensive relevant repository action when project evidence is needed. Choose answer only for general conversation or after sufficient evidence. For answer, use the answer field and never summary."},
-        "path":{"type":"string","description":"For list_files, the project-relative directory to enumerate, such as '' or 'src', never a glob. Use it to discover exact paths. For read_file, an exact project-relative file path returned by list_files; use it when file contents are needed."},
-        "query":{"type":"string","description":"For search_files, one literal text substring to find in project files; use it to locate content, not filenames."},
-        "answer":{"type":"string","description":"Required response text when action is answer. Do not ask for project content that repository tools can obtain."},
-        "summary":{"type":"string","maxLength":160,"description":"For propose_change only: one short sentence describing the edit. Never include rationale or repeat text. Never use this for action=answer."},
-        "changes":{"type":"array","maxItems":4,"items":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}}
-    },"required":["action"],"additionalProperties":false})
+    let mut properties = serde_json::Map::new();
+    properties.insert("action".into(), json!({"type":"string","enum":actions,"description":"Use the least expensive relevant repository action when project evidence is needed. Choose answer only for general conversation or after sufficient evidence."}));
+    if project_open && !(edit_intent && has_read_evidence) {
+        properties.insert("path".into(), json!({"type":"string","description":"For list_files, the project-relative directory to enumerate, such as '' or 'src', never a glob. Use it to discover exact paths. For read_file, an exact project-relative file path returned by list_files; use it when file contents are needed."}));
+        properties.insert("query".into(), json!({"type":"string","description":"For search_files, one literal text substring to find in project files; use it to locate content, not filenames."}));
+    }
+    if !project_open || (!edit_intent && answer_allowed) {
+        properties.insert("answer".into(), json!({"type":"string","description":"Required response text when action is answer. Do not ask for project content that repository tools can obtain."}));
+    }
+    if project_open && edit_intent && has_read_evidence {
+        properties.insert("summary".into(), json!({"type":"string","maxLength":160,"description":"For propose_change only: one short sentence describing the edit."}));
+        properties.insert("changes".into(), json!({"type":"array","minItems":1,"maxItems":4,"description":"Focused exact replacements for propose_change.","items":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}}));
+    }
+    let required = if project_open && edit_intent && has_read_evidence {
+        json!(["action", "summary", "changes"])
+    } else {
+        json!(["action"])
+    };
+    json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
 
 fn scope_schema() -> Value {
@@ -232,9 +243,29 @@ fn parse_action(raw: &str) -> Result<AgentAction, &'static str> {
 }
 
 fn repair_instruction(reason: &str, edit_intent: bool, has_read_evidence: bool) -> String {
-    if edit_intent && has_read_evidence && (reason.contains("propose_change") || reason.contains("output limit")) {
+    if edit_intent && !has_read_evidence {
+        format!("Your previous response was invalid ({reason}). Do not propose the edit yet. Inspect first by returning exactly one tool object: {{\"action\":\"list_files\",\"path\":\"\"}}, {{\"action\":\"search_files\",\"query\":\"literal text\"}}, or {{\"action\":\"read_file\",\"path\":\"exact/project/path\"}}. No summary, changes, prose, or markdown.")
+    } else if edit_intent && has_read_evidence && (reason.contains("propose_change") || reason.contains("output limit")) {
         format!("Your previous response was invalid ({reason}). Return one minimal propose_change object. Include changes; each change needs path, old_text copied exactly from inspected content, and new_text. Keep summary to one short sentence. Do not repeat rationale. No prose or markdown.")
     } else { format!("Your previous response was invalid ({reason}). Return exactly one JSON object matching the schema. No prose or markdown.") }
+}
+
+fn response_shape(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let fenced = trimmed.starts_with("```") && trimmed.ends_with("```");
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Object(object)) => {
+            let mut keys = object.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let action = object.get("action").and_then(Value::as_str).unwrap_or("missing-or-non-string");
+            format!("json-object(action={action}, keys={}, chars={})", keys.join(","), trimmed.chars().count())
+        }
+        Ok(value) => format!("json-{}(chars={})", match value {
+            Value::Null => "null", Value::Bool(_) => "boolean", Value::Number(_) => "number",
+            Value::String(_) => "string", Value::Array(_) => "array", Value::Object(_) => unreachable!(),
+        }, trimmed.chars().count()),
+        Err(_) => format!("non-json(fenced={fenced}, chars={})", trimmed.chars().count()),
+    }
 }
 
 fn provider_error(provider: &impl ModelProvider, ollama: &'static str, remote: &'static str) -> String {
@@ -260,6 +291,7 @@ async fn chat_turn(provider: &impl ModelProvider, model: &str, messages: &[ChatM
 
 async fn agent_turn(provider: &impl ModelProvider, model: &str, exchange: &mut Vec<ChatMessage>, project_open: bool, edit_intent: bool, has_read_evidence: bool, answer_allowed: bool, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<(ChatPayloadResponse, AgentAction), String> {
     let temperature = model_profiles::adaptation(model).protocol_temperature.unwrap_or(PROTOCOL_TEMPERATURE);
+    let mut last_failure = None;
     for attempt in 0..=MAX_REPAIRS {
         let stage = if attempt == 0 { "STRUCTURED".to_owned() } else { format!("REPAIR {attempt}/{MAX_REPAIRS}") };
         let result = chat_turn(provider, model, exchange, agent_schema(project_open, edit_intent, has_read_evidence, answer_allowed), temperature, &stage, trace).await?;
@@ -268,6 +300,7 @@ async fn agent_turn(provider: &impl ModelProvider, model: &str, exchange: &mut V
         match parsed {
             Ok(action) => { debug_log(trace, "protocol", format!("JSON parsing: PASSED\nSchema validation: PASSED\nSemantic validation: PASSED\nSelected action: {}", action_name(&action))); return Ok((result, action)); }
             Err(reason) => {
+                last_failure = Some((reason, response_shape(&result.message.content)));
                 let diagnostic = match serde_json::from_str::<Value>(&result.message.content) {
                     Err(error) => format!("JSON parsing: FAILED — {error}\nSchema validation: not run\nSemantic validation: not run"),
                     Ok(_) => match serde_json::from_str::<AgentReply>(&result.message.content) {
@@ -284,9 +317,13 @@ async fn agent_turn(provider: &impl ModelProvider, model: &str, exchange: &mut V
             }
         }
     }
-    Err(provider_error(provider,
-        "The local model could not produce a valid structured response after two retries.",
-        "The selected model could not produce a valid structured response after two retries."))
+    if provider.metadata().id == OLLAMA_PROVIDER_ID {
+        let detail = last_failure.map(|(reason, shape)| format!(" Last failure: {reason}. Response shape: {shape}.")).unwrap_or_default();
+        let state = if edit_intent && has_read_evidence { "post-read proposal" } else if edit_intent { "pre-read inspection" } else { "answer/tool" };
+        Err(format!("The local model could not produce a valid structured response after two retries. Failed state: {state}.{detail}"))
+    } else {
+        Err("The selected model could not produce a valid structured response after two retries.".into())
+    }
 }
 
 fn action_name(action: &AgentAction) -> &'static str {
@@ -665,7 +702,7 @@ mod tests {
     #[test]
     fn personality_is_separate_from_protocol_defaults() {
         assert!(CORE_AGENT_INSTRUCTIONS.contains("cannot apply changes"));
-        assert!(CORE_AGENT_INSTRUCTIONS.contains("exact old_text"));
+        assert!(CORE_AGENT_INSTRUCTIONS.contains("old_text must be exact"));
         assert!(CORE_AGENT_INSTRUCTIONS.contains("Never ask the user to provide project content"));
         assert!(CORE_AGENT_INSTRUCTIONS.contains("least expensive relevant tool"));
         assert!(DEFAULT_PERSONALITY.contains("concise by default"));
@@ -746,7 +783,18 @@ mod tests {
         assert!(error.contains("Do not put it in 'summary'"));
         let schema = agent_schema(false, false, false, true);
         assert!(schema["properties"]["answer"]["description"].as_str().unwrap().contains("Required response text"));
-        assert!(schema["properties"]["summary"]["description"].as_str().unwrap().contains("Never use this for action=answer"));
+        assert!(schema["properties"].get("summary").is_none());
+    }
+
+    #[test]
+    fn structured_failure_diagnostics_report_shape_without_content() {
+        let private = "private repository content";
+        let json = format!(r#"{{"action":"propose_change","summary":"{private}"}}"#);
+        let shape = response_shape(&json);
+        assert!(shape.contains("action=propose_change"));
+        assert!(shape.contains("keys=action,summary"));
+        assert!(!shape.contains(private));
+        assert_eq!(response_shape("```json\n{}\n```"), "non-json(fenced=true, chars=14)");
     }
 
     #[test]
@@ -758,8 +806,14 @@ mod tests {
         assert!(!actions(true, false, true, true).contains(&"propose_change".to_owned()));
         assert!(!actions(true, true, false, true).contains(&"answer".to_owned()));
         assert!(!actions(true, true, false, true).contains(&"propose_change".to_owned()));
-        assert!(actions(true, true, true, true).contains(&"propose_change".to_owned()));
-        assert!(!actions(true, true, true, true).contains(&"answer".to_owned()));
+        assert_eq!(actions(true, true, true, true), vec!["propose_change"]);
+        let before_read = agent_schema(true, true, false, false);
+        assert!(before_read["properties"].get("summary").is_none());
+        assert!(before_read["properties"].get("changes").is_none());
+        let after_read = agent_schema(true, true, true, false);
+        assert_eq!(after_read["properties"]["changes"]["minItems"], 1);
+        assert_eq!(after_read["required"], json!(["action", "summary", "changes"]));
+        assert!(after_read["properties"].get("path").is_none());
     }
 
     #[test]
@@ -882,6 +936,29 @@ mod tests {
     }
 
     #[test]
+    fn premature_summary_only_edit_is_repaired_into_inspection_then_validated_proposal() {
+        let root = grounding_fixture("structured-edit");
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"propose_change","summary":"Change the heading."}"#,
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            r#"{"action":"propose_change","summary":"Change the heading.","changes":[{"path":"src/index.html","old_text":"<h1>Welcome</h1>","new_text":"<h1>Changed</h1>"}]}"#,
+        ]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "change the heading to Changed".into() }],
+            Some(root.clone()), None, None, None,
+        )).unwrap();
+        let proposal = response.proposal.expect("valid edit should create a proposal");
+        assert_eq!(proposal.changes[0].path, "src/index.html");
+        assert_eq!(proposal.changes[0].replacements, 1);
+        assert!(response.activity.iter().any(|item| item.label == "Read: src/index.html"));
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), "<h1>Welcome</h1>");
+        let formats = provider.formats.lock().unwrap();
+        assert!(formats[0]["properties"].get("changes").is_none());
+        assert!(formats[2]["properties"].get("changes").is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn malformed_or_oversized_proposals_get_minimal_guidance() {
         for raw in [
             r#"{"action":"propose_change","summary":"Update heading."}"#.to_owned(),
@@ -893,6 +970,10 @@ mod tests {
             assert!(error.contains("one short sentence"));
         }
         assert_eq!(agent_schema(true, true, true, false)["properties"]["summary"]["maxLength"], 160);
+        let inspect_first = repair_instruction("invalid proposal", true, false);
+        assert!(inspect_first.contains("Do not propose the edit yet"));
+        assert!(inspect_first.contains("read_file"));
+        assert!(inspect_first.contains("No summary, changes"));
         let repair = repair_instruction("response exceeded the model output limit", true, true);
         assert!(repair.contains("minimal propose_change"));
         assert!(repair.contains("Do not repeat rationale"));
@@ -973,6 +1054,22 @@ mod tests {
         )).expect("named-file summary should complete");
         assert!(response.activity.iter().any(|item| item.label == "Read: src/index.html"));
         assert!(!response.content.to_ascii_lowercase().contains("provide the file"));
+    }
+
+    #[test]
+    #[ignore = "requires local Ollama with qwen2.5-coder:7b"]
+    fn local_structured_edit_calibration_acceptance() {
+        let root = std::fs::canonicalize(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/agent-benchmark"))
+            .expect("agent benchmark fixture must exist");
+        let response = tauri::async_runtime::block_on(run_agent(OLLAMA_PROVIDER_ID,
+            "qwen2.5-coder:7b".into(),
+            vec![ChatMessage { role: "user".into(), content: "change the main heading to \"Welcome to the AIIDE Sandbox\". make only that change and prepare it for review".into() }],
+            Some(root), None, None, None,
+        )).expect("structured edit should complete");
+        let proposal = response.proposal.expect("edit must produce a validated proposal");
+        assert_eq!(proposal.changes.len(), 1);
+        assert_eq!(proposal.changes[0].path, "src/index.html");
+        assert_eq!(proposal.changes[0].replacements, 1);
     }
 
     #[test]
