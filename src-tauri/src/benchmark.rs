@@ -48,6 +48,12 @@ fn concise_error(error: &str) -> String {
 
 fn repair_count(trace: &str) -> usize { trace.matches("[AIIDE][repair] ").count() }
 
+fn edit_mismatch(after: &str) -> &'static str {
+    if after.contains(OLD_HEADING) { "intended heading unchanged; other content changed" }
+    else if !after.contains(NEW_HEADING) { "incorrect or missing heading replacement" }
+    else { "unexpected additional change beyond the heading replacement" }
+}
+
 fn classify(model: &str, case: Case, elapsed: u128, outcome: Result<BenchmarkAgentOutput, BenchmarkAgentFailure>, fixture_before: &str, fixture_after: &str) -> BenchmarkResult {
     let mut result = BenchmarkResult { model: model.into(), case: case.id().into(), passed: false, duration_ms: elapsed,
         tool_calls: 0, repair_count: 0, final_action: "error".into(), failure_reason: None };
@@ -73,7 +79,8 @@ fn classify(model: &str, case: Case, elapsed: u128, outcome: Result<BenchmarkAge
             Some(proposal) if proposal.changes.len() != 1 => Some("proposal did not contain exactly one file change"),
             Some(proposal) if proposal.changes[0].path != EXPECTED_PATH => Some("proposal targeted the wrong file"),
             Some(proposal) if proposal.changes[0].replacements != 1 => Some("proposal was not one focused replacement"),
-            Some(proposal) if proposal.changes[0].before != fixture_before || proposal.changes[0].after != fixture_before.replacen(OLD_HEADING, NEW_HEADING, 1) => Some("proposal did not match the expected heading replacement"),
+            Some(proposal) if proposal.changes[0].before != fixture_before => Some("proposal was based on a different fixture snapshot"),
+            Some(proposal) if proposal.changes[0].after != fixture_before.replacen(OLD_HEADING, NEW_HEADING, 1) => Some(edit_mismatch(&proposal.changes[0].after)),
             Some(_) if fixture_after != fixture_before => Some("benchmark modified the fixture"),
             Some(_) => None,
         },
@@ -195,7 +202,27 @@ mod tests {
         }), &before, &before);
         assert!(!result.passed);
         assert_eq!(result.final_action, "propose_change");
-        assert_eq!(result.failure_reason.as_deref(), Some("proposal did not match the expected heading replacement"));
+        assert_eq!(result.failure_reason.as_deref(), Some("incorrect or missing heading replacement"));
+    }
+
+    #[test]
+    fn edit_mismatch_categories_do_not_expose_proposal_content() {
+        let before = format!("<title>OrbitNote</title>\n{OLD_HEADING}\n<footer>Keep</footer>");
+        let cases = [
+            (before.replacen("<title>OrbitNote</title>", "<title>Changed</title>", 1), "intended heading unchanged; other content changed"),
+            (before.replacen(OLD_HEADING, "<h1>Different</h1>", 1), "incorrect or missing heading replacement"),
+            (before.replacen(OLD_HEADING, NEW_HEADING, 1).replacen("<footer>Keep</footer>", "<footer>Changed</footer>", 1), "unexpected additional change beyond the heading replacement"),
+        ];
+        for (after, expected_reason) in cases {
+            let proposal = PendingProposal { summary: "Edit".into(), changes: vec![PendingChange {
+                path: EXPECTED_PATH.into(), before: before.clone(), after: after.clone(), replacements: 1,
+            }] };
+            let result = classify("m", Case::Edit, 1, Ok(BenchmarkAgentOutput {
+                content: "ready".into(), activity: vec!["Read: src/index.html".into()], proposal: Some(proposal), trace: String::new(),
+            }), &before, &before);
+            assert_eq!(result.failure_reason.as_deref(), Some(expected_reason));
+            assert!(!result.failure_reason.unwrap().contains(&after));
+        }
     }
 
     #[test]
