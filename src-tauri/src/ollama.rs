@@ -662,14 +662,20 @@ pub(crate) struct BenchmarkAgentOutput {
     pub trace: String,
 }
 
-pub(crate) async fn run_benchmark_agent(provider: &str, model: &str, root: std::path::PathBuf, prompt: &str) -> Result<BenchmarkAgentOutput, String> {
+pub(crate) struct BenchmarkAgentFailure {
+    pub error: String,
+    pub trace: String,
+}
+
+pub(crate) async fn run_benchmark_agent(provider: &str, model: &str, root: std::path::PathBuf, prompt: &str) -> Result<BenchmarkAgentOutput, BenchmarkAgentFailure> {
     let trace = Arc::new(Mutex::new(TraceBuffer::default()));
     let response = run_agent(provider,
         model.to_owned(),
         vec![ChatMessage { role: "user".into(), content: prompt.to_owned() }],
         Some(root), None, None, Some(&trace),
-    ).await?;
+    ).await;
     let report = trace.lock().map(|buffer| buffer.lines.join("\n\n")).unwrap_or_default();
+    let response = response.map_err(|error| BenchmarkAgentFailure { error, trace: report.clone() })?;
     Ok(BenchmarkAgentOutput {
         content: response.content,
         activity: response.activity.into_iter().map(|item| item.label).collect(),
@@ -1133,6 +1139,8 @@ mod tests {
     fn local_structured_edit_calibration_acceptance() {
         let root = std::fs::canonicalize(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/agent-benchmark"))
             .expect("agent benchmark fixture must exist");
+        let path = root.join("src/index.html");
+        let before = std::fs::read_to_string(&path).expect("fixture target must exist");
         let response = tauri::async_runtime::block_on(run_agent(OLLAMA_PROVIDER_ID,
             "qwen2.5-coder:7b".into(),
             vec![ChatMessage { role: "user".into(), content: "change the main heading to \"Welcome to the AIIDE Sandbox\". make only that change and prepare it for review".into() }],
@@ -1142,6 +1150,9 @@ mod tests {
         assert_eq!(proposal.changes.len(), 1);
         assert_eq!(proposal.changes[0].path, "src/index.html");
         assert_eq!(proposal.changes[0].replacements, 1);
+        assert_eq!(proposal.changes[0].before, before);
+        assert_eq!(proposal.changes[0].after, before.replacen("<h1>OrbitNote</h1>", "<h1>Welcome to the AIIDE Sandbox</h1>", 1));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before, "proposal must not write before Apply");
     }
 
     #[test]
