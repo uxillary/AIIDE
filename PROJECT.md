@@ -8,11 +8,11 @@ This project is a free, local-first AI coding companion for working directly wit
 
 The goal is to provide a practical alternative to token/credit-based coding agents for everyday development work.
 
-A user should be able to open a local project folder, describe a change in natural language, allow an AI agent to inspect the repository, review its proposed changes, apply those changes safely, test them, and optionally commit or publish the result through Git/GitHub.
+A user should be able to open a local project folder, describe or select a change, review a verified target and proposed content, apply an assembled diff with approval, run authorised tests, and eventually prepare a commit or optional GitHub pull request. AIIDE manages that workflow; Elma assists with understanding and code generation. These are intended capabilities, not a claim that the full workflow exists today.
 
 The application should feel closer to a lightweight combination of:
 
-- an AI coding agent
+- a local AI coding assistant
 - GitHub Desktop
 - a focused code review/diff tool
 - a small amount of VS Code-style project awareness
@@ -31,9 +31,9 @@ Cloud coding agents are extremely capable, but frequent use can become limited b
 
 Local AI models have become capable enough to handle many everyday development tasks without requiring paid inference.
 
-This project aims to make those models useful through a polished coding-agent interface rather than simply providing another AI chat window.
+This project aims to make those models useful through an application-led engineering workflow rather than simply providing another AI chat window.
 
-The AI needs to understand and interact with an actual repository.
+The application must supply verified repository context and control changes. A small model should not be responsible for finding an exact original source target on its own.
 
 ---
 
@@ -44,14 +44,14 @@ The application should eventually allow a user to:
 1. Open a local project folder.
 2. Detect whether the folder is a Git repository.
 3. Understand the project's file structure.
-4. Give the AI a natural-language development task.
-5. Allow the AI to search and inspect relevant files.
-6. Allow the AI to propose modifications.
-7. Apply modifications safely.
+4. Describe a development task to Elma or choose a file and source range directly.
+5. Discover relevant files and verify source references in the application.
+6. Let Elma analyse supplied code and generate replacement content for a verified target.
+7. Assemble and apply modifications safely after approval.
 8. Display exactly what changed.
 9. Accept or reject changes.
-10. Run project commands, builds, or tests.
-11. Allow the AI to diagnose and potentially repair failures.
+10. Run controlled, authorised builds or tests.
+11. Let Elma explain failures and suggest fixes for user review.
 12. Commit successful changes using Git.
 13. Optionally push branches and create GitHub pull requests.
 14. Maintain useful project context between sessions.
@@ -79,28 +79,11 @@ Optional cloud AI providers may be supported later through user-provided API cre
 
 ## Safe by Default
 
-The AI should not receive unrestricted control over the computer.
-
-Instead, the agent should interact with the project through a controlled collection of tools.
-
-Potential tools include:
-
-- `list_files`
-- `search_files`
-- `read_file`
-- `write_file`
-- `apply_patch`
-- `git_status`
-- `git_diff`
-- `run_command`
-- `run_tests`
-- `run_build`
-
-Potentially destructive operations should require appropriate safeguards or user approval.
+The model must not receive unrestricted control over the computer or repository. AIIDE owns bounded repository inspection, verified source selection, deterministic edits, diffs, snapshot and path validation, and controlled test commands. Model-generated content and requests are untrusted. The user approves changes before application and external publishing actions. Ambiguous source targets require explicit selection; Elma must not invent original text or silently choose one.
 
 ## Reviewable
 
-AI-generated changes should be transparent.
+Changes, whether AI-generated or user-authored, should be transparent.
 
 The user should be able to see:
 
@@ -124,7 +107,7 @@ Models and providers should be interchangeable through a common provider interfa
 
 # 5. Initial Model Strategy
 
-The initial local inference provider will likely be **Ollama**.
+The current local inference provider is **Ollama**.
 
 The initial coding model should be selected based on the best balance between:
 
@@ -170,7 +153,7 @@ Cloud support is not required for the first release.
 
 # 6. Proposed Technology Stack
 
-The current preferred stack is:
+The implemented core stack and longer-term integration options are:
 
 ### Desktop Application
 
@@ -231,21 +214,17 @@ Instead, the application should progressively retrieve context.
 Example:
 
 ```text
-User Prompt
+User request or selected source range
     ↓
-Repository metadata
+AIIDE repository metadata, search, and candidate discovery
     ↓
-File tree
+Verified file and source references
     ↓
-Agent searches repository
+User selection when candidates are ambiguous
     ↓
-Agent identifies likely relevant files
+Relevant code supplied to Elma when generation is needed
     ↓
-Relevant files/sections retrieved
-    ↓
-Agent creates plan
-    ↓
-Agent proposes patches
+AIIDE assembles and validates a reviewable change
 ```
 
 This should improve:
@@ -311,73 +290,44 @@ Personal portfolio website.
 - Do not edit generated files.
 ```
 
-This gives the local agent persistent knowledge without repeatedly rediscovering fundamental project information.
+This would give AIIDE and Elma persistent project knowledge without repeatedly rediscovering fundamental information.
 
 The exact format should be determined during development.
 
 ---
 
-# 9. Agent Architecture
+# 9. Application-Led Architecture
 
-The AI model should reason about tasks while the application controls what actions can actually occur.
+AIIDE manages the engineering workflow. It owns repository discovery and contextual retrieval, verified file and source references, deterministic file creation and editing, diff assembly, snapshot and path validation, explicit review, and controlled authorised test execution. Git branches, commits, and optional GitHub pull request preparation come later.
+
+Elma interprets requests, analyses relevant supplied code, generates replacement content, helps choose among verified candidates, explains changes and test failures, and suggests fixes. Local models such as Qwen through Ollama should be interchangeable. Elma cannot invent original source text, silently choose ambiguous targets, directly write arbitrary files, or execute unrestricted commands.
 
 Conceptually:
 
 ```text
-USER
+USER REQUEST / SOURCE SELECTION
    ↓
-AGENT
+AIIDE DISCOVERY + VERIFIED TARGET
    ↓
-TOOL REQUEST
+ELMA CONTENT GENERATION (OPTIONAL)
    ↓
-APPLICATION PERMISSION / VALIDATION
+AIIDE DETERMINISTIC ASSEMBLY + VALIDATION
    ↓
-TOOL EXECUTION
+USER REVIEW + APPROVAL
    ↓
-RESULT
-   ↓
-AGENT
+AIIDE APPLICATION / AUTHORISED VERIFICATION
 ```
 
 Example interaction:
 
 ```text
-User:
-"Make the project cards more compact."
-
-Agent:
-Needs repository context.
-
-Tool:
-search_files("project")
-
-Agent:
-Identifies relevant page and stylesheet.
-
-Tool:
-read_file(...)
-read_file(...)
-
-Agent:
-Creates modification plan.
-
-Tool:
-apply_patch(...)
-
-Application:
-Displays diff.
-
-User:
-Accepts changes.
-
-Tool:
-run_command("npm run build")
-
-Application:
-Build succeeds.
-
-User:
-Commits changes.
+User selects a file and source range.
+AIIDE captures and verifies the original snapshot.
+User supplies replacement content, or Elma generates it from the selected code.
+AIIDE builds the pending change and displays its diff.
+User approves Apply; AIIDE revalidates the snapshot before writing.
+User authorises a configured build or test command when that stage exists.
+AIIDE reports the result; Elma may explain a failure.
 ```
 
 ---
@@ -504,7 +454,7 @@ The application should eventually distinguish between operations such as:
 
 - run build
 - run tests
-- execute terminal command
+- run an authorised, controlled project command
 
 ### Git
 
@@ -517,18 +467,18 @@ The application should eventually distinguish between operations such as:
 - create pull request
 - interact with GitHub
 
-Users may eventually be able to configure which actions require approval.
+File changes require explicit review and approval. Command execution must be constrained to controlled, authorised commands. Remote publishing requires user approval. Any future permission settings must preserve these boundaries.
 
 ---
 
 # 14. Checkpoints
 
-Before substantial modifications, the application should create a recoverable checkpoint.
+Before substantial modifications, the application should provide a recoverable checkpoint. Snapshot validation must prevent overwriting work that changed after review.
 
-After an agent task:
+After a change task:
 
 ```text
-AI changed 4 files
+Pending change: 4 files
 
 +84
 -31
@@ -540,106 +490,47 @@ Build: Passed
 [ Revert Session ]
 ```
 
-This should make experimentation safe and encourage users to let the agent attempt more substantial work.
+This should make review and recovery clear without implying autonomous application.
 
 ---
 
-# 15. Autonomous Behaviour
+# 15. Previous Autonomous-Agent Experiments
 
-The first version should remain strongly user-controlled.
-
-Later versions may introduce configurable automation such as:
-
-```text
-[ ] Automatically apply patches
-[ ] Automatically run tests
-[ ] Attempt to repair failed tests
-[ ] Automatically commit successful tasks
-```
-
-Full autonomy should never be necessary to use the application.
+The existing bounded Elma proposal path is an implemented experiment, not the intended basis for reliable editing. Experiments on `fix/reliable-editing` improved source validation, but real-world acceptance still failed when the small local model chose incorrect source targets. That branch is historical/experimental and is not approved for merging. Keep its findings; build the new application-led path on `main` in scoped stages. Automatic application, repair, commits, and unrestricted commands are not the active direction.
 
 ---
 
-# 16. Initial MVP
+# 16. Revised Development Roadmap
 
-The first milestone should remain deliberately small.
+These milestones are planned work. Current behavior is described in [codex/CONTEXT.md](codex/CONTEXT.md) and must be checked against current code.
 
-## V0.1
+## Milestone 1: Minimal regression protection
 
-- Open a project folder.
-- Detect Git repository.
-- Display project file tree.
-- Display current Git branch.
-- Display Git status.
-- Connect to local Ollama installation.
-- Select supported local model.
-- Send prompt to local model.
-- Allow agent to search repository.
-- Allow agent to read relevant files.
-- Generate file modifications.
-- Apply modifications safely.
-- Display diff.
-- Accept changes.
-- Revert changes.
-- Run a configured build/test command.
-- Display command result.
-- Create Git commit.
+Protect the current passing repository-inspection, proposal-validation, and approval behavior with a small, focused regression baseline. Keep tests meaningful; do not weaken them to make CI pass.
 
-A GitHub account should **not** be required for V0.1.
+## Milestone 2: Deterministic change engine
 
-A local Git repository should be enough.
+Let the user select a verified project file and source range for edits, or a validated project-relative path for creation, and provide content without AI. AIIDE owns original text capture, deterministic creation and editing, snapshot and path checks, pending change assembly, diff display, and explicit Apply/Reject. Resolve ambiguous ranges through user selection.
 
----
+## Milestone 3: Elma-generated replacement content
 
-# 17. V0.2
+Supply Elma with the verified selected target and relevant context. Elma generates replacement code while AIIDE retains the original source, assembles the change, validates it, and presents it for user approval.
 
-Potential additions:
+## Milestone 4: Repository intelligence and candidate discovery
 
-- create Git branches
-- GitHub authentication
-- push branches
-- create pull requests
-- persistent project instructions
-- better session history
-- repository indexing improvements
+Add application-owned search and contextual retrieval that present verified files and source candidates. Elma may help rank or explain candidates; ambiguity remains visible to the user.
+
+## Milestone 5: Controlled verification and multi-file editing
+
+Support assembled multi-file changes, recoverable checkpoints, and tests/builds through controlled, authorised commands. Show command results and let Elma explain failures and suggest reviewed fixes.
+
+## Milestone 6: Git and optional GitHub workflow
+
+Prepare branches, commits, and optional GitHub pull requests under explicit user control. Publishing and other external actions require approval. A GitHub account is not required for the core local workflow.
 
 ---
 
-# 18. V0.3
-
-Potential additions:
-
-- multi-step autonomous agent loop
-- test → diagnose → repair workflow
-- checkpoints
-- session restoration
-- better context retrieval
-- command permission system
-- model performance presets
-
----
-
-# 19. V1.0
-
-Potential goals:
-
-- polished Windows installer
-- model management
-- multiple AI providers
-- configurable permissions
-- robust project indexing
-- GitHub integration
-- persistent project context
-- session history
-- safe autonomous workflows
-- onboarding
-- documentation
-- GitHub release
-
----
-
-# 20. Non-Goals
+# 17. Non-Goals
 
 To prevent uncontrolled scope growth, the initial project is **not** intended to:
 
@@ -653,11 +544,11 @@ To prevent uncontrolled scope growth, the initial project is **not** intended to
 - autonomously execute arbitrary commands without safeguards
 - reproduce every feature of commercial coding agents
 
-The focus is the AI-assisted modification workflow.
+The focus is the application-managed, AI-assisted modification workflow.
 
 ---
 
-# 21. Development Principles
+# 18. Development Principles
 
 During development:
 
@@ -668,83 +559,21 @@ During development:
 5. Treat repository safety as a core feature.
 6. Make every AI modification reviewable.
 7. Avoid unnecessary dependencies.
-8. Maintain clear separation between UI, agent, model provider, filesystem and Git functionality.
+8. Maintain clear separation between UI, Elma, model provider, filesystem and Git functionality.
 9. Do not add features solely because competing coding agents have them.
 10. Keep the application useful on normal consumer hardware.
 
 ---
 
-# 22. First Development Milestone
+# 19. Current Baseline and Development Order
 
-Do **not** begin by building the autonomous AI agent.
+The application already has a Tauri shell, open-folder workflow, Git status and branch display, file tree, Ollama conversation, bounded repository inspection, and an approved one-file exact-replacement proposal path. This is the baseline to protect, not completion of the application-led editing architecture.
 
-First prove that the desktop application can reliably interact with a real development project.
-
-The first milestone is:
-
-```text
-Launch application
-        ↓
-Open Folder
-        ↓
-Select Git repository
-        ↓
-Display repository name
-        ↓
-Display current branch
-        ↓
-Display Git status
-        ↓
-Display file tree
-```
-
-Once this works reliably, integrate Ollama.
-
-Then:
-
-```text
-Repository
-    +
-Ollama
-    ↓
-Ask AI about repository
-```
-
-Only after repository-aware conversation works should the application be allowed to modify files.
-
-This reduces the number of difficult systems being developed simultaneously.
+Follow the six milestones in Section 16. Start with regression protection, then a user-selected deterministic change engine before adding Elma-generated content. Repository intelligence, controlled verification, multi-file changes, and Git/GitHub workflow follow in that order. Packaging, onboarding, persistence, model management, and broader platform support remain later product decisions.
 
 ---
 
-# 23. Current Development Order
-
-The intended order is:
-
-```text
-01  Repository + project planning
-02  Tauri application shell
-03  Open-folder workflow
-04  Git detection
-05  File tree
-06  Git status / branch
-07  Ollama connection
-08  Basic repository-aware AI conversation
-09  Repository search tools
-10  Controlled file editing
-11  Diff review
-12  Revert/checkpoint system
-13  Build/test commands
-14  Git commits
-15  GitHub integration
-16  Multi-step agent behaviour
-17  Packaging + release
-```
-
-Do not skip directly to autonomous agent functionality.
-
----
-
-# 24. Open Decisions
+# 20. Open Decisions
 
 These decisions have deliberately **not** been locked yet:
 
@@ -755,8 +584,8 @@ These decisions have deliberately **not** been locked yet:
 - Final persistence system
 - Monaco vs alternative diff viewer
 - Exact checkpoint implementation
-- Agent protocol
-- Tool-call format
+- Elma interaction protocol for verified targets
+- Candidate presentation and source-range selection
 - GitHub CLI vs direct GitHub API
 - Distribution/installer method
 - Whether macOS/Linux support belongs in V1
@@ -766,9 +595,9 @@ These should be decided through prototypes and testing rather than prematurely.
 
 ---
 
-# 25. Long-Term Vision
+# 21. Long-Term Vision
 
-The application should become a genuinely useful open-source coding companion rather than simply a demonstration of local AI.
+The application should become a useful open-source coding companion rather than simply a demonstration of local AI.
 
 A developer should eventually be able to install it, open an existing project and say:
 
@@ -776,15 +605,14 @@ A developer should eventually be able to install it, open an existing project an
 
 The application should:
 
-1. understand the repository,
-2. locate relevant code,
-3. formulate a plan,
-4. modify the appropriate files,
-5. show what it changed,
-6. run the build,
-7. diagnose failures when appropriate,
-8. allow the user to review everything,
-9. and commit the finished work.
+1. discover relevant repository context and present verified source candidates,
+2. obtain an explicit target selection when needed,
+3. let Elma generate code for verified targets,
+4. assemble and validate changes deterministically,
+5. show the diff and obtain approval before applying changes,
+6. run an authorised build and present its result,
+7. let Elma explain failures and suggest reviewed fixes,
+8. prepare a commit and optional pull request under user control.
 
 The core promise is:
 

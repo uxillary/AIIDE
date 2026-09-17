@@ -13,7 +13,7 @@ Use this map to choose a starting point, then read only the files relevant to th
 | General UI/layout | `src/App.tsx`, relevant component, `src/styles.css` | Rust only if backend data or behavior changes |
 | Build/dependencies | `package.json` or `src-tauri/Cargo.toml` | Relevant Vite, TypeScript, ESLint, or Tauri config; lockfile only for dependency work |
 
-`src/` is the React/TypeScript/Vite frontend: `components/` renders UI, `services/` wraps frontend calls, and `types/` defines contracts. `src-tauri/src/` is the Rust/Tauri backend: `project.rs` owns opened-project/Git inspection, `repository.rs` is the trusted read-only filesystem boundary, `ollama.rs` owns local model networking and the bounded agent loop, and `lib.rs` registers commands. `main.rs` launches Tauri. `src-tauri/capabilities/` and `tauri.conf.json` configure desktop behavior.
+`src/` is the React/TypeScript/Vite frontend: `components/` renders UI, `services/` wraps frontend calls, and `types/` defines contracts. `src-tauri/src/` is the Rust/Tauri backend: `project.rs` owns opened-project/Git inspection, `repository.rs` owns bounded repository inspection and validation/application of approved one-file proposals, `ollama.rs` owns local model networking and the current bounded agent loop, and `lib.rs` registers commands. `main.rs` launches Tauri. `src-tauri/capabilities/` and `tauri.conf.json` configure desktop behavior.
 
 Rust unit and opt-in local Ollama acceptance tests currently live in `ollama.rs` and `repository.rs`; there is no separate frontend test tree. Check `package.json` for current npm scripts and `Cargo.toml` for Rust dependencies. `README.md` describes current features; `PROJECT.md` is active product vision, not routine startup context.
 
