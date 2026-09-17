@@ -1,4 +1,6 @@
 import type { Region } from './geometry'
+import type { Layout } from './alignment'
+import { drawPlacement } from './render'
 
 export function cropToCanvas(image: ImageBitmap, region: Region): HTMLCanvasElement {
   const canvas = document.createElement('canvas')
@@ -15,8 +17,17 @@ export function pngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
   return new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('PNG export failed.')), 'image/png'))
 }
 
-export async function downloadRegion(image: ImageBitmap, region: Region, sourceName: string): Promise<void> {
-  const blob = await pngBlob(cropToCanvas(image, region))
+export function alignedCanvas(image: ImageBitmap, layout: Layout, id: string): HTMLCanvasElement {
+  const canvas = document.createElement('canvas')
+  canvas.width = layout.width; canvas.height = layout.height
+  const context = canvas.getContext('2d')
+  if (!context) throw new Error('Canvas is unavailable in this browser.')
+  drawPlacement(context, image, layout.placements[id] ?? null)
+  return canvas
+}
+
+export async function downloadRegion(image: ImageBitmap, region: Region, sourceName: string, layout?: Layout): Promise<void> {
+  const blob = await pngBlob(layout ? alignedCanvas(image, layout, region.id) : cropToCanvas(image, region))
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   const base = sourceName.replace(/\.png$/i, '').replace(/[^a-z0-9_-]+/gi, '-').replace(/^-|-$/g, '') || 'sprite'

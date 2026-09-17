@@ -1,4 +1,4 @@
-export type Region = { id: string; name: string; x: number; y: number; width: number; height: number }
+export type Region = { id: string; name: string; x: number; y: number; width: number; height: number; anchorX?: number; anchorY?: number }
 export type Point = { x: number; y: number }
 export type Size = { width: number; height: number }
 export type Handle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'

@@ -1,7 +1,9 @@
-import { useEffect, useRef } from 'react'
+import { memo, useEffect, useRef } from 'react'
 import type { Region } from './geometry'
+import type { Placement } from './alignment'
+import { drawPlacement } from './render'
 
-export function SpriteCanvas({ image, region, width, height, className = '' }: { image: ImageBitmap; region?: Region; width: number; height: number; className?: string }) {
+export function SpriteCanvas({ image, region, placement, width, height, guides = false, anchorX = 0, anchorY = 0, className = '' }: { image: ImageBitmap; region?: Region; placement?: Placement | null; width: number; height: number; guides?: boolean; anchorX?: number; anchorY?: number; className?: string }) {
   const ref = useRef<HTMLCanvasElement>(null)
   useEffect(() => {
     const canvas = ref.current
@@ -9,12 +11,21 @@ export function SpriteCanvas({ image, region, width, height, className = '' }: {
     if (!canvas || !context) return
     context.clearRect(0, 0, width, height)
     context.imageSmoothingEnabled = false
-    if (region) context.drawImage(image, region.x, region.y, region.width, region.height, Math.floor((width - region.width) / 2), Math.floor((height - region.height) / 2), region.width, region.height)
-  }, [image, region, width, height])
+    if (placement !== undefined) drawPlacement(context, image, placement)
+    else if (region) context.drawImage(image, region.x, region.y, region.width, region.height, Math.floor((width - region.width) / 2), Math.floor((height - region.height) / 2), region.width, region.height)
+    if (guides) {
+      context.save()
+      context.strokeStyle = '#4ddaa8'; context.lineWidth = 1; context.setLineDash([4, 4])
+      context.beginPath(); context.moveTo(anchorX + 0.5, 0); context.lineTo(anchorX + 0.5, height)
+      context.moveTo(0, anchorY + 0.5); context.lineTo(width, anchorY + 0.5); context.stroke()
+      context.setLineDash([]); context.fillStyle = '#ffdd77'; context.fillRect(anchorX - 2, anchorY - 2, 5, 5)
+      context.restore()
+    }
+  }, [image, region, placement, width, height, guides, anchorX, anchorY])
   return <canvas ref={ref} width={width} height={height} className={className} />
 }
 
-export function Thumbnail({ image, region }: { image: ImageBitmap; region: Region }) {
+export const Thumbnail = memo(function Thumbnail({ image, region }: { image: ImageBitmap; region: Region }) {
   const ref = useRef<HTMLCanvasElement>(null)
   useEffect(() => {
     const canvas = ref.current
@@ -28,4 +39,4 @@ export function Thumbnail({ image, region }: { image: ImageBitmap; region: Regio
     context.drawImage(image, region.x, region.y, region.width, region.height, Math.floor((canvas.width - width) / 2), Math.floor((canvas.height - height) / 2), width, height)
   }, [image, region])
   return <canvas ref={ref} width={52} height={52} className="thumbnail checker" aria-hidden="true" />
-}
+})
