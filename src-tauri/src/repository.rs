@@ -6,6 +6,9 @@ use tauri::State;
 
 use crate::project::{OpenProject, IGNORED};
 
+#[allow(dead_code)] // Discovery is request-local infrastructure; no UI or model caller exists yet.
+pub mod candidates;
+
 pub const MAX_TOOL_CALLS: usize = 8;
 pub const MAX_CONTEXT_BYTES: usize = 48_000;
 const MAX_READ_BYTES: usize = 12_000;
