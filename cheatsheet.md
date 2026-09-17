@@ -76,8 +76,20 @@ git status
 # ── RUN ELMA / AIIDE ─────────────────────────────
 
 npm run tauri dev
+
 change the main heading to "Welcome to the AIIDE Sandbox". make only that change and prepare it for review
 
 benchmark
 
 npm run benchmark -- --model qwen2.5-coder:7b --case edit
+
+cd C:\Users\trigg\Documents\GitHub\AIIDE
+
+git switch tools-workshop
+
+cd tools\sprite-workshop
+
+npm run dev
+
+npm install --no-package-lock
+npm run dev
