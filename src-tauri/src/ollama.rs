@@ -972,6 +972,7 @@ mod tests {
     #[test]
     fn premature_summary_only_edit_is_repaired_into_inspection_then_validated_proposal() {
         let root = grounding_fixture("structured-edit");
+        let pending = PendingChanges::default();
         let provider = StubProvider::new(&["test-model"], &[
             r#"{"action":"propose_change","summary":"Change the heading."}"#,
             r#"{"action":"read_file","path":"src/index.html"}"#,
@@ -979,11 +980,14 @@ mod tests {
         ]);
         let response = tauri::async_runtime::block_on(run_agent_with_provider(
             &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "change the heading to Changed".into() }],
-            Some(root.clone()), None, None, None,
+            Some(root.clone()), Some(&pending), None, None,
         )).unwrap();
         let proposal = response.proposal.expect("valid edit should create a proposal");
         assert_eq!(proposal.changes[0].path, "src/index.html");
         assert_eq!(proposal.changes[0].replacements, 1);
+        let stored = pending.0.lock().unwrap();
+        let stored = stored.as_ref().expect("validated edit should remain pending for approval");
+        assert_eq!(stored.changes[0].after, proposal.changes[0].after);
         assert!(response.activity.iter().any(|item| item.label == "Read: src/index.html"));
         assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), "<h1>Welcome</h1>");
         let formats = provider.formats.lock().unwrap();
