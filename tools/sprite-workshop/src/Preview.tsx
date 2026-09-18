@@ -3,7 +3,7 @@ import type { Region } from './geometry'
 import type { Placement } from './alignment'
 import { drawPlacement } from './render'
 
-export function SpriteCanvas({ image, region, placement, width, height, guides = false, anchorX = 0, anchorY = 0, className = '' }: { image: ImageBitmap; region?: Region; placement?: Placement | null; width: number; height: number; guides?: boolean; anchorX?: number; anchorY?: number; className?: string }) {
+export function SpriteCanvas({ image, region, placement, onionPlacement, width, height, guides = false, anchorX = 0, anchorY = 0, className = '' }: { image: ImageBitmap; region?: Region; placement?: Placement | null; onionPlacement?: Placement | null; width: number; height: number; guides?: boolean; anchorX?: number; anchorY?: number; className?: string }) {
   const ref = useRef<HTMLCanvasElement>(null)
   useEffect(() => {
     const canvas = ref.current
@@ -11,6 +11,11 @@ export function SpriteCanvas({ image, region, placement, width, height, guides =
     if (!canvas || !context) return
     context.clearRect(0, 0, width, height)
     context.imageSmoothingEnabled = false
+    if (onionPlacement) {
+      context.globalAlpha = 0.35
+      drawPlacement(context, image, onionPlacement)
+      context.globalAlpha = 1
+    }
     if (placement !== undefined) drawPlacement(context, image, placement)
     else if (region) context.drawImage(image, region.x, region.y, region.width, region.height, Math.floor((width - region.width) / 2), Math.floor((height - region.height) / 2), region.width, region.height)
     if (guides) {
@@ -21,7 +26,7 @@ export function SpriteCanvas({ image, region, placement, width, height, guides =
       context.setLineDash([]); context.fillStyle = '#ffdd77'; context.fillRect(anchorX - 2, anchorY - 2, 5, 5)
       context.restore()
     }
-  }, [image, region, placement, width, height, guides, anchorX, anchorY])
+  }, [image, region, placement, onionPlacement, width, height, guides, anchorX, anchorY])
   return <canvas ref={ref} width={width} height={height} className={className} />
 }
 
