@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
 import { boundedRegion, clamp, fitZoom, regionFromCorners, resizeRegion, screenToImage, zoomAt } from './geometry'
 import type { Handle, Point, Region } from './geometry'
-import { downloadAlignedSlot, downloadRegion } from './export'
+import { downloadAlignedSlot, downloadAnimation, downloadRegion, validateAnimation } from './export'
 import { loadPng } from './image'
 import type { SourceImage } from './image'
 import { SpriteCanvas, Thumbnail } from './Preview'
@@ -21,12 +21,12 @@ type Drag =
 
 const HANDLES: Handle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w']
 const EMPTY_SLOTS = Array<string | null>(8).fill(null)
-const PANEL_KEYS = ['frames', 'inspection', 'alignment', 'offsets', 'preview', 'slots'] as const
+const PANEL_KEYS = ['frames', 'inspection', 'alignment', 'offsets', 'preview', 'slots', 'export'] as const
 type PanelKey = typeof PANEL_KEYS[number]
 type PanelVisibility = Record<PanelKey, boolean>
 type WorkshopLayout = { panels: PanelVisibility; leftWidth: number; rightWidth: number }
 const DEFAULT_LAYOUT: WorkshopLayout = {
-  panels: { frames: true, inspection: true, alignment: true, offsets: true, preview: true, slots: true },
+  panels: { frames: true, inspection: true, alignment: true, offsets: true, preview: true, slots: true, export: true },
   leftWidth: 255,
   rightWidth: 320,
 }
@@ -71,6 +71,9 @@ export default function App() {
   const [slots, setSlots] = useState<(string | null)[]>(EMPTY_SLOTS)
   const [activeSlot, setActiveSlot] = useState(0)
   const [fps, setFps] = useState(8)
+  const [animationName, setAnimationName] = useState('animation')
+  const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
   const [playing, setPlaying] = useState(false)
   const [reducedMotion, setReducedMotion] = useState(false)
   const [alignmentMode, setAlignmentMode] = useState<AlignmentMode>('bottom')
@@ -111,6 +114,7 @@ export default function App() {
   const imageSize = source ? { width: source.width, height: source.height } : null
   const assigned = useMemo(() => slots.map(id => regions.find(region => region.id === id) ?? null), [slots, regions])
   const layout = useMemo(() => calculateLayout(assigned, offsets, { mode: alignmentMode, padding, minWidth, minHeight }), [assigned, offsets, alignmentMode, padding, minWidth, minHeight])
+  const exportIssue = source ? validateAnimation(slots, regions, layout, animationName, fps) : 'Import a PNG before exporting.'
   const referenceSlot = referenceSlotFor(activeSlot, onionReference, fixedReferenceSlot)
   const previewScale = alignmentScale(alignmentZoom, layout, alignmentViewport)
   const baselineY = clamp(layout.anchorY + baselineOffset, 0, layout.height - 1)
@@ -211,6 +215,7 @@ export default function App() {
       sourceRef.current?.bitmap.close()
       sourceRef.current = loaded
       setSource(loaded); setPixels({ data: imageData.data, width: loaded.width, height: loaded.height }); setRegions([]); setSelectedId(null); setSlots([...EMPTY_SLOTS]); setOffsets(emptyOffsets()); setSuggestions([]); setSelectedSuggestion(null); setDeleted(null); setActiveSlot(0); setPlaying(false); nextNumber.current = 1
+      setAnimationName(loaded.name.replace(/\.png$/i, '') || 'animation'); setExportError(null)
       window.requestAnimationFrame(() => fit(loaded))
     } catch (cause) { if (request === loadCounter.current) setError(cause instanceof Error ? cause.message : 'Could not load the image.') }
   }
@@ -359,12 +364,20 @@ export default function App() {
     catch (cause) { setError(cause instanceof Error ? cause.message : 'Export failed.') }
   }
 
+  async function exportAnimation() {
+    if (!source || exporting) return
+    setExportError(null); setError(null); setExporting(true)
+    try { await downloadAnimation(source.bitmap, slots, regions, layout, animationName, fps); setNotice('Downloaded animation PNG sprite sheet and JSON metadata.') }
+    catch (cause) { setExportError(cause instanceof Error ? cause.message : 'Animation export failed.') }
+    finally { setExporting(false) }
+  }
+
   return <div className="workshop">
     <header className="topbar">
       <div className="brand"><span className="brand-icon" aria-hidden="true">▦</span><span><strong>SPRITE WORKSHOP</strong><small>AiiDE / developer utility</small></span></div>
       <div className="header-actions"><span className="local-badge"><i /> LOCAL ONLY</span><div className="layout-actions"><button className="small" onClick={() => setWorkshopLayout(previous => ({ ...previous, panels: { ...DEFAULT_LAYOUT.panels } }))}>Expand all</button><button className="small" onClick={() => { setAlignmentExpanded(false); setWorkshopLayout(previous => ({ ...previous, panels: Object.fromEntries(PANEL_KEYS.map(key => [key, false])) as PanelVisibility })) }}>Collapse all</button><button className="small" onClick={() => { setAlignmentExpanded(false); setWorkshopLayout({ panels: { ...DEFAULT_LAYOUT.panels }, leftWidth: DEFAULT_LAYOUT.leftWidth, rightWidth: DEFAULT_LAYOUT.rightWidth }) }}>Reset layout</button></div><input ref={fileRef} type="file" accept="image/png,.png" className="visually-hidden" aria-label="Import PNG" onChange={event => { void importFile(event.target.files?.[0]); event.target.value = '' }} /><button className="primary" onClick={() => fileRef.current?.click()}>Import PNG</button></div>
     </header>
-    <div className="intro"><div><span className="eyebrow">FRAME EXTRACTION / MILESTONE 02</span><h1>Shape each frame by hand.</h1><p>Map regions, inspect conservative suggestions, and align an eight-frame loop without changing source pixels.</p></div><div className="source-meta"><span>SOURCE</span><strong>{source?.name ?? 'No image loaded'}</strong><small>{source ? `${source.width} × ${source.height} px · PNG` : 'Drop a PNG onto the canvas to begin'}</small></div></div>
+    <div className="intro"><div><span className="eyebrow">FRAME EXTRACTION / MILESTONE 03</span><h1>Shape each frame by hand.</h1><p>Map regions, align an eight-frame loop, and export a transparent sprite sheet with metadata.</p></div><div className="source-meta"><span>SOURCE</span><strong>{source?.name ?? 'No image loaded'}</strong><small>{source ? `${source.width} × ${source.height} px · PNG` : 'Drop a PNG onto the canvas to begin'}</small></div></div>
     {(error || notice || deleted) && <div className={error ? 'message error' : 'message'} role={error ? 'alert' : 'status'}>{error ?? notice}{deleted && <button className="undo-button" onClick={undoDelete}>Undo deletion of {deleted.region.name}</button>}<button aria-label="Dismiss message" onClick={() => { setError(null); setNotice(null); setDeleted(null) }}>×</button></div>}
     <main className="workspace" style={workspaceStyle}>
       <aside className="panel frames-panel" aria-label="Frames and suggestions"><PanelHeader id="frames" eyebrow="01 / REGIONS" title={`Frame list · ${regions.length}`} expanded={workshopLayout.panels.frames} onToggle={() => togglePanel('frames')} extra={<button className="small" disabled={!source} onClick={addFrame}>+ Add</button>} />
@@ -421,6 +434,14 @@ export default function App() {
           <div className="play-controls"><button aria-label="Previous frame" disabled={!source} onClick={() => setActiveSlot(index => (index + 7) % 8)}>‹</button><button className="play-button" disabled={!assigned.some(Boolean) || reducedMotion} onClick={() => setPlaying(value => !value)}>{playing ? 'Pause' : 'Play'}</button><button aria-label="Next frame" disabled={!source} onClick={() => setActiveSlot(index => (index + 1) % 8)}>›</button><label>FPS <input type="number" min="1" max="24" value={fps} onChange={event => setFps(clamp(Number(event.target.value) || 1, 1, 24))} /></label></div>
           {reducedMotion && <p className="motion-note">Automatic playback is off because reduced motion is enabled. Step through frames manually.</p>}
           <div className="slot-grid">{slots.map((id, index) => <label key={index} className={activeSlot === index ? 'slot active' : 'slot'}><span>{String(index + 1).padStart(2, '0')}</span><select aria-label={`Animation frame ${index + 1}`} value={id ?? ''} onFocus={() => setActiveSlot(index)} onChange={event => { const value = event.target.value || null; setSlots(previous => previous.map((item, itemIndex) => itemIndex === index ? value : item)); setOffsets(previous => previous.map((offset, itemIndex) => itemIndex === index ? { x: 0, y: 0 } : offset)); setActiveSlot(index) }}><option value="">Empty</option>{regions.map(region => <option key={region.id} value={region.id}>{region.name}</option>)}</select></label>)}</div><button className="fill-button" disabled={!regions.length} onClick={() => { setSlots(Array.from({ length: 8 }, (_, index) => regions[index]?.id ?? null)); setOffsets(emptyOffsets()); setActiveSlot(0) }}>Fill slots from frame list</button>
+        </div>
+        <PanelHeader id="export" eyebrow="04 / OUTPUT" title="Export Animation" expanded={workshopLayout.panels.export} onToggle={() => togglePanel('export')} />
+        <div id="panel-export" className="panel-section export-panel" hidden={!workshopLayout.panels.export}>
+          <label className="field"><span>Animation name</span><input value={animationName} maxLength={100} onChange={event => { setAnimationName(event.target.value); setExportError(null) }} /></label>
+          <p className="export-summary">{slots.filter(Boolean).length}/8 frames · {fps} FPS · {layout.width * 8} × {layout.height} px sheet<br />Horizontal · {layout.width} × {layout.height} px per frame</p>
+          <p className="section-help">Downloads a transparent PNG and matching JSON. Frames are ordered by slot, with zero-based sheet rectangles and a duration of 1000 / FPS milliseconds.</p>
+          {(exportError || exportIssue) && <p className="export-error" role="alert">{exportError ?? exportIssue}</p>}
+          <button className="primary export-button" disabled={!source || exporting} onClick={() => void exportAnimation()}>{exporting ? 'Preparing export…' : 'Export Animation · PNG + JSON'}</button>
         </div>
       </aside>
     </main>

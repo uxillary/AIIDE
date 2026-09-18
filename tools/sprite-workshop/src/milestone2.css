@@ -63,6 +63,10 @@
 .nudge-controls { display: flex; gap: 4px; }
 .nudge-controls button { flex: 1; min-width: 0; border: 1px solid #455948; border-radius: 5px; background: #1f3023; padding: 6px 2px; color: #d0e8d2; font-size: 11px; }
 .aligned-export { width: 100%; margin: 0 0 10px; }
+.export-panel .field { margin-bottom: 12px; }
+.export-summary { margin: 0 0 10px; color: #bceac4; font: 11px/1.7 ui-monospace,monospace; }
+.export-error { margin: 10px 0; border: 1px solid #91514b; border-radius: 5px; background: #392421; padding: 8px; color: #f6c0b9; font-size: 11px; line-height: 1.4; }
+.export-button { width: 100%; }
 @media (max-width: 820px) { .detector { max-height: 350px; } }
 
 /* Keep scrollbars within the workshop surfaces; native form controls retain their own styling. */
