@@ -35,11 +35,38 @@
 .check-field.guides { align-self: end; min-height: 33px; }
 .alignment-controls .layout-size { margin: 0; color: #bceac4; font: 10px ui-monospace,monospace; }
 .alignment-controls .motion-note { margin: 0; }
-.alignment-preview { height: 190px; display: grid; place-items: center; overflow: hidden; border: 1px solid #4a5f4b; border-radius: 6px; color: #607b68; font: 11px ui-monospace,monospace; cursor: move; touch-action: none; }
-.alignment-preview canvas { display: block; max-width: 90%; max-height: 90%; image-rendering: pixelated; }
+.alignment-view { margin-bottom: 13px; border: 1px solid #344c3a; border-radius: 7px; background: #1a281e; overflow: hidden; }
+.alignment-toolbar { display: flex; flex-wrap: wrap; gap: 4px; padding: 7px; }
+.alignment-toolbar button { min-height: 27px; border: 1px solid #455948; border-radius: 5px; background: #1f3023; padding: 4px 7px; color: #d0e8d2; font-size: 10px; }
+.alignment-toolbar button.active { border-color: #8be5a4; background: #294b33; }
+.alignment-toolbar output { align-self: center; color: #cce6d0; font: 11px ui-monospace, monospace; white-space: nowrap; }
+.alignment-toolbar button:last-child { margin-left: auto; }
+.alignment-preview { position: relative; height: 300px; overflow: hidden; border-block: 1px solid #4a5f4b; color: #607b68; font: 11px ui-monospace,monospace; cursor: move; touch-action: none; user-select: none; }
+.alignment-preview.pan-mode { cursor: grab; }
+.alignment-preview>span { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); white-space: nowrap; }
+.alignment-surface { position: absolute; left: 50%; top: 50%; box-shadow: 0 0 0 1px #8ba995, 0 8px 25px #0008; }
+.alignment-surface canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; }
+.alignment-grid { position: absolute; inset: 0; background-image: linear-gradient(to right, #ccefc144 1px, transparent 1px), linear-gradient(to bottom, #ccefc144 1px, transparent 1px); pointer-events: none; }
+.alignment-centre, .alignment-baseline { position: absolute; z-index: 2; pointer-events: none; }
+.alignment-centre { top: 0; bottom: 0; border-left: 1px dashed #60e7b5; }
+.alignment-baseline { left: 0; right: 0; border-top: 1px dashed #f2ce80; }
+.alignment-anchor { position: absolute; z-index: 3; width: 11px; height: 11px; border: 2px solid #ffe69a; border-radius: 50%; background: #173322; box-shadow: 0 0 0 1px #142116; transform: translate(-50%, -50%); pointer-events: none; }
+.alignment-guide-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 9px; }
+.alignment-guide-controls .check-field { font-size: 10px; white-space: nowrap; }
+.alignment-guide-controls .baseline-field { width: 100%; }
+.alignment-guide-controls .baseline-field input { max-width: 110px; }
+.alignment-view.expanded { position: fixed; z-index: 30; inset: 5vh 5vw; display: flex; flex-direction: column; margin: 0; border: 1px solid #6d9e79; box-shadow: 0 0 0 100vmax #000b, 0 20px 80px #000c; }
+.alignment-view.expanded .alignment-preview { flex: 1; height: auto; min-height: 0; }
+.alignment-view.expanded .alignment-guide-controls { flex: none; }
 .alignment-preview:focus-visible { outline: 2px solid #7de5ae; outline-offset: 2px; }
 .offset-fields { margin-top: 0; }
 .nudge-controls { display: flex; gap: 4px; }
 .nudge-controls button { flex: 1; min-width: 0; border: 1px solid #455948; border-radius: 5px; background: #1f3023; padding: 6px 2px; color: #d0e8d2; font-size: 11px; }
 .aligned-export { width: 100%; margin: 0 0 10px; }
 @media (max-width: 820px) { .detector { max-height: 350px; } }
+
+/* Keep scrollbars within the workshop surfaces; native form controls retain their own styling. */
+.workshop, .detail-panel, .frames-list, .detector, .suggestion-list { scrollbar-width: thin; scrollbar-color: #667d6a #202a23; }
+.workshop::-webkit-scrollbar, .detail-panel::-webkit-scrollbar, .frames-list::-webkit-scrollbar, .detector::-webkit-scrollbar, .suggestion-list::-webkit-scrollbar { width: 8px; height: 8px; }
+.workshop::-webkit-scrollbar-track, .detail-panel::-webkit-scrollbar-track, .frames-list::-webkit-scrollbar-track, .detector::-webkit-scrollbar-track, .suggestion-list::-webkit-scrollbar-track { background: #202a23; }
+.workshop::-webkit-scrollbar-thumb, .detail-panel::-webkit-scrollbar-thumb, .frames-list::-webkit-scrollbar-thumb, .detector::-webkit-scrollbar-thumb, .suggestion-list::-webkit-scrollbar-thumb { border: 2px solid #202a23; border-radius: 8px; background: #667d6a; }

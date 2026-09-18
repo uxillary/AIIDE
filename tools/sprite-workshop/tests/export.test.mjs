@@ -25,7 +25,7 @@ test('PNG crop draws only the selected source pixels on a transparent canvas', a
   assert.deepEqual(calls.at(-1), ['toBlob', 'image/png'])
 })
 
-test('aligned PNG uses the preview placement on a transparent shared canvas', () => {
+test('aligned PNG uses the shared canvas placement without preview guides', () => {
   const calls = []
   const canvas = { width: 0, height: 0, getContext: () => ({ set imageSmoothingEnabled(value) { calls.push(['smoothing', value]) }, drawImage: (...args) => calls.push(['drawImage', ...args]) }) }
   globalThis.document = { createElement: () => canvas }

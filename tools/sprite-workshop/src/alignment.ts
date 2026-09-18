@@ -6,6 +6,21 @@ export type AlignmentMode = 'bottom' | 'center'
 export type AlignmentOptions = { mode: AlignmentMode; padding: number; minWidth: number; minHeight: number }
 export type Placement = { source: Bounds; x: number; y: number }
 export type Layout = { width: number; height: number; anchorX: number; anchorY: number; placements: (Placement | null)[] }
+export type AlignmentZoom = 'fit' | 1 | 2 | 4 | 8
+
+export function alignmentScale(zoom: AlignmentZoom, canvas: { width: number; height: number }, viewport: { width: number; height: number }): number {
+  if (zoom !== 'fit') return zoom
+  const available = Math.min((viewport.width - 24) / canvas.width, (viewport.height - 24) / canvas.height)
+  return available >= 1 ? Math.max(1, Math.floor(available)) : Math.max(0.01, available)
+}
+
+export function alignmentDragOffset(start: Point, dx: number, dy: number, scale: number): Point {
+  return { x: Math.max(-4096, Math.min(4096, start.x + Math.round(dx / scale))), y: Math.max(-4096, Math.min(4096, start.y + Math.round(dy / scale))) }
+}
+
+export function referenceSlotFor(active: number, mode: 'previous' | 'fixed', fixedSlot: number): number {
+  return mode === 'previous' ? (active + 7) % 8 : fixedSlot
+}
 
 export const emptyOffsets = (): Point[] => Array.from({ length: 8 }, () => ({ x: 0, y: 0 }))
 

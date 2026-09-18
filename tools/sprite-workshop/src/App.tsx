@@ -5,8 +5,8 @@ import { downloadAlignedSlot, downloadRegion } from './export'
 import { loadPng } from './image'
 import type { SourceImage } from './image'
 import { SpriteCanvas, Thumbnail } from './Preview'
-import { calculateLayout, emptyOffsets } from './alignment'
-import type { AlignmentMode, Pixels } from './alignment'
+import { alignmentDragOffset, alignmentScale, calculateLayout, emptyOffsets, referenceSlotFor } from './alignment'
+import type { AlignmentMode, AlignmentZoom, Pixels } from './alignment'
 import { acceptSuggestion, alphaSuggestions, gridSuggestions, rejectSuggestion } from './detection'
 import type { GridOptions } from './detection'
 import { removeFrame, restoreFrame } from './frameActions'
@@ -42,11 +42,20 @@ export default function App() {
   const [alignmentMode, setAlignmentMode] = useState<AlignmentMode>('bottom')
   const [offsets, setOffsets] = useState<Point[]>(emptyOffsets)
   const [onion, setOnion] = useState(false)
-  const [onionReference, setOnionReference] = useState<'previous' | 'first'>('previous')
+  const [onionReference, setOnionReference] = useState<'previous' | 'fixed'>('previous')
+  const [fixedReferenceSlot, setFixedReferenceSlot] = useState(0)
   const [padding, setPadding] = useState(8)
   const [minWidth, setMinWidth] = useState(0)
   const [minHeight, setMinHeight] = useState(0)
-  const [guides, setGuides] = useState(true)
+  const [centreGuide, setCentreGuide] = useState(true)
+  const [baselineGuide, setBaselineGuide] = useState(true)
+  const [pixelGrid, setPixelGrid] = useState(false)
+  const [baselineOffset, setBaselineOffset] = useState(0)
+  const [alignmentZoom, setAlignmentZoom] = useState<AlignmentZoom>('fit')
+  const [alignmentPan, setAlignmentPan] = useState<Point>({ x: 0, y: 0 })
+  const [alignmentPanMode, setAlignmentPanMode] = useState(false)
+  const [alignmentExpanded, setAlignmentExpanded] = useState(false)
+  const [alignmentViewport, setAlignmentViewport] = useState({ width: 288, height: 300 })
   const [zoom, setZoom] = useState(1)
   const [pan, setPan] = useState<Point>({ x: 0, y: 0 })
   const [mode, setMode] = useState<'select' | 'pan'>('select')
@@ -57,9 +66,10 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
+  const alignmentPreviewRef = useRef<HTMLDivElement>(null)
   const sourceCanvasRef = useRef<HTMLCanvasElement>(null)
   const dragRef = useRef<Drag | null>(null)
-  const alignmentDrag = useRef<{ x: number; y: number; offset: Point } | null>(null)
+  const alignmentDrag = useRef<{ kind: 'move' | 'pan'; x: number; y: number; offset: Point; slot: number; scale: number } | null>(null)
   const nextNumber = useRef(1)
   const loadCounter = useRef(0)
   const selected = regions.find(region => region.id === selectedId) ?? null
@@ -67,7 +77,17 @@ export default function App() {
   const imageSize = source ? { width: source.width, height: source.height } : null
   const assigned = useMemo(() => slots.map(id => regions.find(region => region.id === id) ?? null), [slots, regions])
   const layout = useMemo(() => calculateLayout(assigned, offsets, { mode: alignmentMode, padding, minWidth, minHeight }), [assigned, offsets, alignmentMode, padding, minWidth, minHeight])
-  const referenceSlot = onionReference === 'first' ? 0 : (activeSlot + 7) % 8
+  const referenceSlot = referenceSlotFor(activeSlot, onionReference, fixedReferenceSlot)
+  const previewScale = alignmentScale(alignmentZoom, layout, alignmentViewport)
+  const baselineY = clamp(layout.anchorY + baselineOffset, 0, layout.height - 1)
+
+  useEffect(() => {
+    const preview = alignmentPreviewRef.current
+    if (!preview) return
+    const observer = new ResizeObserver(() => setAlignmentViewport({ width: preview.clientWidth, height: preview.clientHeight }))
+    observer.observe(preview)
+    return () => observer.disconnect()
+  }, [alignmentExpanded])
 
   useEffect(() => () => { sourceRef.current?.bitmap.close() }, [])
   useEffect(() => {
@@ -212,13 +232,12 @@ export default function App() {
 
   function moveAlignment(event: React.PointerEvent<HTMLDivElement>) {
     const drag = alignmentDrag.current
-    if (!drag || !assigned[activeSlot]) return
-    const canvas = event.currentTarget.querySelector('canvas')
-    if (!canvas) return
-    const rect = canvas.getBoundingClientRect()
-    const dx = Math.round((event.clientX - drag.x) * layout.width / rect.width)
-    const dy = Math.round((event.clientY - drag.y) * layout.height / rect.height)
-    setOffsets(previous => previous.map((offset, index) => index === activeSlot ? { x: clamp(drag.offset.x + dx, -4096, 4096), y: clamp(drag.offset.y + dy, -4096, 4096) } : offset))
+    if (!drag) return
+    const dx = event.clientX - drag.x, dy = event.clientY - drag.y
+    if (drag.kind === 'pan') { setAlignmentPan({ x: drag.offset.x + dx, y: drag.offset.y + dy }); return }
+    if (!assigned[drag.slot]) return
+    const next = alignmentDragOffset(drag.offset, dx, dy, drag.scale)
+    setOffsets(previous => previous.map((offset, index) => index === drag.slot ? next : offset))
   }
 
   function deleteFrame(id: string) {
@@ -303,11 +322,26 @@ export default function App() {
           <p className="help">This PNG exports the source crop only. Animation offsets are set and exported separately below.</p>
         </div> : <div className="panel-empty details-empty"><span>◇</span><strong>Select a frame</strong><p>Draw on the canvas or choose a frame from the list to edit its exact coordinates.</p></div>}
         <div className="animation"><div className="animation-head"><span className="eyebrow">03 / ANIMATION ALIGNMENT</span><h2>Eight-frame loop</h2><p>Assign crops, then place each slot on one pixel canvas. Drag the preview or use exact offsets.</p></div>
-          <div className="alignment-controls"><label className="field"><span>Initial anchor</span><select value={alignmentMode} onChange={event => setAlignmentMode(event.target.value as AlignmentMode)}><option value="bottom">Bottom centre</option><option value="center">Centre</option></select></label><button className="small" disabled={!assigned.some(Boolean)} onClick={() => setOffsets(emptyOffsets())}>Align all to anchor</button><div className="field-grid"><label className="field"><span>Padding</span><input type="number" min="0" max="256" value={padding} onChange={event => setPadding(clamp(Number(event.target.value) || 0, 0, 256))} /></label><label className="field"><span>Min width</span><input type="number" min="0" max="4096" value={minWidth} onChange={event => setMinWidth(clamp(Number(event.target.value) || 0, 0, 4096))} /></label><label className="field"><span>Min height</span><input type="number" min="0" max="4096" value={minHeight} onChange={event => setMinHeight(clamp(Number(event.target.value) || 0, 0, 4096))} /></label><label className="check-field guides"><input type="checkbox" checked={guides} onChange={event => setGuides(event.target.checked)} /> Show anchor</label></div><p className="layout-size">Shared canvas: {layout.width} × {layout.height} px</p></div>
-          <div className="alignment-preview checker" tabIndex={assigned[activeSlot] ? 0 : -1} role="group" aria-label={`Animation slot ${activeSlot + 1} alignment preview. Drag or press arrow keys to move one pixel.`} onKeyDown={event => { const directions: Record<string, Point> = { ArrowLeft: { x: -1, y: 0 }, ArrowRight: { x: 1, y: 0 }, ArrowUp: { x: 0, y: -1 }, ArrowDown: { x: 0, y: 1 } }; const direction = directions[event.key]; if (direction) { event.preventDefault(); nudge(direction.x, direction.y) } }} onPointerDown={event => { if (!assigned[activeSlot] || event.button !== 0) return; setPlaying(false); alignmentDrag.current = { x: event.clientX, y: event.clientY, offset: offsets[activeSlot] }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.focus() }} onPointerMove={moveAlignment} onPointerUp={event => { alignmentDrag.current = null; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }} onPointerCancel={() => { alignmentDrag.current = null }}>
-            {source && assigned[activeSlot] ? <SpriteCanvas image={source.bitmap} placement={layout.placements[activeSlot]} onionPlacement={onion && !playing && referenceSlot !== activeSlot ? layout.placements[referenceSlot] : null} width={layout.width} height={layout.height} guides={guides} anchorX={layout.anchorX} anchorY={layout.anchorY} /> : <span>{source ? 'Assign a frame below' : 'No source image'}</span>}
+          <div className="alignment-controls"><label className="field"><span>Initial anchor</span><select value={alignmentMode} onChange={event => setAlignmentMode(event.target.value as AlignmentMode)}><option value="bottom">Bottom centre</option><option value="center">Centre</option></select></label><button className="small" disabled={!assigned.some(Boolean)} onClick={() => setOffsets(emptyOffsets())}>Align all to anchor</button><div className="field-grid"><label className="field"><span>Padding</span><input type="number" min="0" max="256" value={padding} onChange={event => setPadding(clamp(Number(event.target.value) || 0, 0, 256))} /></label><label className="field"><span>Min width</span><input type="number" min="0" max="4096" value={minWidth} onChange={event => setMinWidth(clamp(Number(event.target.value) || 0, 0, 4096))} /></label><label className="field"><span>Min height</span><input type="number" min="0" max="4096" value={minHeight} onChange={event => setMinHeight(clamp(Number(event.target.value) || 0, 0, 4096))} /></label></div><p className="layout-size">Shared canvas: {layout.width} × {layout.height} px</p></div>
+          <div className={alignmentExpanded ? 'alignment-view expanded' : 'alignment-view'}>
+            <div className="alignment-toolbar" aria-label="Alignment preview controls">
+              {(['fit', 1, 2, 4, 8] as const).map(value => <button key={value} className={alignmentZoom === value ? 'active' : ''} aria-pressed={alignmentZoom === value} onClick={() => { setAlignmentZoom(value); setAlignmentPan({ x: 0, y: 0 }) }}>{value === 'fit' ? 'Fit' : `${value}×`}</button>)}
+              <button className={alignmentPanMode ? 'active' : ''} aria-pressed={alignmentPanMode} onClick={() => setAlignmentPanMode(value => !value)}>Pan</button>
+              {alignmentExpanded && <><button aria-label="Previous alignment slot" onClick={() => setActiveSlot(index => (index + 7) % 8)}>‹</button><output>Slot {activeSlot + 1} · X {offsets[activeSlot].x} / Y {offsets[activeSlot].y} px</output><button aria-label="Next alignment slot" onClick={() => setActiveSlot(index => (index + 1) % 8)}>›</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(-1, 0)} aria-label="Nudge left one pixel">←</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(0, -1)} aria-label="Nudge up one pixel">↑</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(0, 1)} aria-label="Nudge down one pixel">↓</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(1, 0)} aria-label="Nudge right one pixel">→</button></>}
+              <button onClick={() => setAlignmentExpanded(value => !value)}>{alignmentExpanded ? 'Close' : 'Expand'}</button>
+            </div>
+            <div ref={alignmentPreviewRef} className={alignmentPanMode ? 'alignment-preview checker pan-mode' : 'alignment-preview checker'} tabIndex={assigned[activeSlot] ? 0 : -1} role="group" aria-label={`Animation slot ${activeSlot + 1} alignment preview. Drag to align, use Pan to move the view, or press arrow keys to move one source pixel.`} onKeyDown={event => { const directions: Record<string, Point> = { ArrowLeft: { x: -1, y: 0 }, ArrowRight: { x: 1, y: 0 }, ArrowUp: { x: 0, y: -1 }, ArrowDown: { x: 0, y: 1 } }; const direction = directions[event.key]; if (direction) { event.preventDefault(); nudge(direction.x, direction.y) } }} onPointerDown={event => { if (!assigned[activeSlot] || event.button > 1) return; event.preventDefault(); const panning = alignmentPanMode || event.button === 1; if (!panning) setPlaying(false); alignmentDrag.current = { kind: panning ? 'pan' : 'move', x: event.clientX, y: event.clientY, offset: panning ? alignmentPan : offsets[activeSlot], slot: activeSlot, scale: previewScale }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.focus() }} onPointerMove={moveAlignment} onPointerUp={event => { alignmentDrag.current = null; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }} onPointerCancel={() => { alignmentDrag.current = null }}>
+              {source && assigned[activeSlot] ? <div className="alignment-surface" style={{ width: layout.width * previewScale, height: layout.height * previewScale, transform: `translate(calc(-50% + ${alignmentPan.x}px), calc(-50% + ${alignmentPan.y}px))` }}>
+                <SpriteCanvas image={source.bitmap} placement={layout.placements[activeSlot]} onionPlacement={onion && !playing && referenceSlot !== activeSlot ? layout.placements[referenceSlot] : null} width={layout.width} height={layout.height} />
+                {pixelGrid && previewScale >= 2 && <div className="alignment-grid" style={{ backgroundSize: `${previewScale}px ${previewScale}px` }} />}
+                {centreGuide && <div className="alignment-centre" style={{ left: layout.anchorX * previewScale }} />}
+                {baselineGuide && <div className="alignment-baseline" style={{ top: baselineY * previewScale }} />}
+                <div className="alignment-anchor" style={{ left: layout.anchorX * previewScale, top: layout.anchorY * previewScale }} title={`Anchor ${layout.anchorX}, ${layout.anchorY}`} />
+              </div> : <span>{source ? 'Assign a frame below' : 'No source image'}</span>}
+            </div>
+            <div className="alignment-guide-controls"><label className="check-field"><input type="checkbox" checked={centreGuide} onChange={event => setCentreGuide(event.target.checked)} /> Centre line</label><label className="check-field"><input type="checkbox" checked={baselineGuide} onChange={event => setBaselineGuide(event.target.checked)} /> Baseline</label><label className="check-field"><input type="checkbox" checked={pixelGrid} onChange={event => setPixelGrid(event.target.checked)} /> Pixel grid (2×+)</label><label className="field baseline-field"><span>Baseline Y (canvas px)</span><input type="number" min="0" max={layout.height - 1} value={baselineY} onChange={event => setBaselineOffset(clamp(Number(event.target.value) || 0, 0, layout.height - 1) - layout.anchorY)} /></label></div>
           </div>
-          <div className="alignment-controls"><div className="field-grid offset-fields">{(['x', 'y'] as const).map(key => <label className="field" key={key}><span>Slot {activeSlot + 1} {key.toUpperCase()} offset</span><input type="number" min="-4096" max="4096" disabled={!assigned[activeSlot]} value={offsets[activeSlot][key]} onChange={event => editOffset(key, event.target.value)} /></label>)}</div><div className="nudge-controls"><button disabled={!assigned[activeSlot]} onClick={() => nudge(-1, 0)} aria-label="Nudge left one pixel">←</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(0, -1)} aria-label="Nudge up one pixel">↑</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(0, 1)} aria-label="Nudge down one pixel">↓</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(1, 0)} aria-label="Nudge right one pixel">→</button><button disabled={!assigned[activeSlot]} onClick={() => setOffsets(previous => previous.map((offset, index) => index === activeSlot ? { x: 0, y: 0 } : offset))}>Reset slot</button></div><label className="check-field"><input type="checkbox" checked={onion} onChange={event => setOnion(event.target.checked)} /> Onion skin</label><label className="field"><span>Compare with</span><select value={onionReference} disabled={!onion} onChange={event => setOnionReference(event.target.value as 'previous' | 'first')}><option value="previous">Previous slot</option><option value="first">First slot</option></select></label><p className="motion-note">Offsets can move pixels outside the canvas. Increase minimum size or padding if artwork is clipped.</p></div>
+          <div className="alignment-controls"><div className="field-grid offset-fields">{(['x', 'y'] as const).map(key => <label className="field" key={key}><span>Slot {activeSlot + 1} {key.toUpperCase()} offset (px)</span><input type="number" min="-4096" max="4096" disabled={!assigned[activeSlot]} value={offsets[activeSlot][key]} onChange={event => editOffset(key, event.target.value)} /></label>)}</div><div className="nudge-controls"><button disabled={!assigned[activeSlot]} onClick={() => nudge(-1, 0)} aria-label="Nudge left one pixel">←</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(0, -1)} aria-label="Nudge up one pixel">↑</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(0, 1)} aria-label="Nudge down one pixel">↓</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(1, 0)} aria-label="Nudge right one pixel">→</button><button disabled={!assigned[activeSlot]} onClick={() => setOffsets(previous => previous.map((offset, index) => index === activeSlot ? { x: 0, y: 0 } : offset))}>Reset slot</button></div><label className="check-field"><input type="checkbox" checked={onion} onChange={event => setOnion(event.target.checked)} /> Onion skin</label><label className="field"><span>Compare with</span><select value={onionReference} disabled={!onion} onChange={event => setOnionReference(event.target.value as 'previous' | 'fixed')}><option value="previous">Previous slot</option><option value="fixed">Fixed slot</option></select></label>{onionReference === 'fixed' && <label className="field"><span>Reference slot</span><select value={fixedReferenceSlot} disabled={!onion} onChange={event => setFixedReferenceSlot(Number(event.target.value))}>{slots.map((id, index) => <option key={index} value={index}>{`Slot ${index + 1}${id ? ` · ${assigned[index]?.name ?? 'Frame'}` : ' · Empty'}`}</option>)}</select></label>}<p className="motion-note">{onion && referenceSlot === activeSlot ? 'Choose another reference slot to see a comparison. ' : ''}Offsets can move pixels outside the canvas. Increase minimum size or padding if artwork is clipped.</p></div>
           <button className="small aligned-export" disabled={!assigned[activeSlot] || !source} onClick={() => void exportAligned()}>Export aligned slot PNG</button>
           <div className="play-controls"><button aria-label="Previous frame" disabled={!source} onClick={() => setActiveSlot(index => (index + 7) % 8)}>‹</button><button className="play-button" disabled={!assigned.some(Boolean) || reducedMotion} onClick={() => setPlaying(value => !value)}>{playing ? 'Pause' : 'Play'}</button><button aria-label="Next frame" disabled={!source} onClick={() => setActiveSlot(index => (index + 1) % 8)}>›</button><label>FPS <input type="number" min="1" max="24" value={fps} onChange={event => setFps(clamp(Number(event.target.value) || 1, 1, 24))} /></label></div>
           {reducedMotion && <p className="motion-note">Automatic playback is off because reduced motion is enabled. Step through frames manually.</p>}

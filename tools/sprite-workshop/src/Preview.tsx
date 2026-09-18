@@ -3,7 +3,7 @@ import type { Region } from './geometry'
 import type { Placement } from './alignment'
 import { drawPlacement } from './render'
 
-export function SpriteCanvas({ image, region, placement, onionPlacement, width, height, guides = false, anchorX = 0, anchorY = 0, className = '' }: { image: ImageBitmap; region?: Region; placement?: Placement | null; onionPlacement?: Placement | null; width: number; height: number; guides?: boolean; anchorX?: number; anchorY?: number; className?: string }) {
+export function SpriteCanvas({ image, region, placement, onionPlacement, width, height, className = '' }: { image: ImageBitmap; region?: Region; placement?: Placement | null; onionPlacement?: Placement | null; width: number; height: number; className?: string }) {
   const ref = useRef<HTMLCanvasElement>(null)
   useEffect(() => {
     const canvas = ref.current
@@ -18,15 +18,7 @@ export function SpriteCanvas({ image, region, placement, onionPlacement, width, 
     }
     if (placement !== undefined) drawPlacement(context, image, placement)
     else if (region) context.drawImage(image, region.x, region.y, region.width, region.height, Math.floor((width - region.width) / 2), Math.floor((height - region.height) / 2), region.width, region.height)
-    if (guides) {
-      context.save()
-      context.strokeStyle = '#4ddaa8'; context.lineWidth = 1; context.setLineDash([4, 4])
-      context.beginPath(); context.moveTo(anchorX + 0.5, 0); context.lineTo(anchorX + 0.5, height)
-      context.moveTo(0, anchorY + 0.5); context.lineTo(width, anchorY + 0.5); context.stroke()
-      context.setLineDash([]); context.fillStyle = '#ffdd77'; context.fillRect(anchorX - 2, anchorY - 2, 5, 5)
-      context.restore()
-    }
-  }, [image, region, placement, onionPlacement, width, height, guides, anchorX, anchorY])
+  }, [image, region, placement, onionPlacement, width, height])
   return <canvas ref={ref} width={width} height={height} className={className} />
 }
 
