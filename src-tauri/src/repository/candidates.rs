@@ -135,6 +135,18 @@ impl CandidateRegistry {
         Some(&self.snapshots[candidate.snapshot_index].text)
     }
 
+    /// Recheck the captured file before a candidate ID is reported as selected.
+    pub fn verify_current(&self, root: &Path, id: &str) -> Result<&Candidate, String> {
+        let candidate = self.candidate(id).ok_or("Unknown candidate ID.")?;
+        let full = resolve(root, &candidate.path).map_err(|_| "Candidate source is stale or unavailable.")?;
+        if protected(&full) { return Err("Candidate source is stale or unavailable.".into()); }
+        let current = read_text_file(&full).map_err(|_| "Candidate source is stale or unavailable.")?;
+        if current != self.snapshots[candidate.snapshot_index].text {
+            return Err("Candidate source changed since discovery. Inspect it again.".into());
+        }
+        Ok(candidate)
+    }
+
     pub fn model_view(&self) -> Vec<CandidateView> {
         self.candidates.iter().map(|candidate| {
             let snapshot = &self.snapshots[candidate.snapshot_index].text;
