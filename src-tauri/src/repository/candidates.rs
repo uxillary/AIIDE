@@ -11,6 +11,7 @@ pub const MAX_CANDIDATE_CONTEXT_BYTES: usize = 120;
 pub const MAX_CANDIDATE_EXCERPT_BYTES: usize = 160;
 pub const MAX_CANDIDATE_PATH_BYTES: usize = 512;
 const MAX_HEADING_INLINE_DEPTH: usize = 8;
+const MAX_HEADING_INLINE_TAGS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +81,7 @@ impl Default for CandidateRegistry {
 pub struct CandidateView {
     pub id: String,
     pub role: CandidateRole,
+    pub role_index: usize,
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
@@ -150,10 +152,17 @@ impl CandidateRegistry {
     }
 
     pub fn model_view(&self) -> Vec<CandidateView> {
+        let mut role_counts = [0; 3];
         self.candidates.iter().map(|candidate| {
             let snapshot = &self.snapshots[candidate.snapshot_index].text;
+            let role_slot = match candidate.role {
+                CandidateRole::DocumentTitle => 0,
+                CandidateRole::HeadingOne => 1,
+                CandidateRole::Paragraph => 2,
+            };
+            role_counts[role_slot] += 1;
             CandidateView {
-                id: candidate.id.clone(), role: candidate.role, path: candidate.path.clone(),
+                id: candidate.id.clone(), role: candidate.role, role_index: role_counts[role_slot], path: candidate.path.clone(),
                 start_line: line_at(snapshot, candidate.range.start),
                 end_line: line_at(snapshot, candidate.range.end.saturating_sub(1)),
                 description: candidate.description.to_owned(),
@@ -245,7 +254,7 @@ fn heading_inline_element(name: &str) -> bool {
 }
 
 struct OpenElement { name: String, hidden: bool }
-struct OpenCandidate { role: CandidateRole, start: usize, depth: usize, supported: bool }
+struct OpenCandidate { role: CandidateRole, start: usize, depth: usize, inline_tags: usize, supported: bool }
 
 fn extract_html(text: &str, limit: usize) -> Vec<(CandidateRole, Range<usize>)> {
     let mut found = Vec::new();
@@ -296,9 +305,11 @@ fn extract_html(text: &str, limit: usize) -> Vec<(CandidateRole, Range<usize>)> 
         }
         let hidden = hidden_attribute(tag.attributes);
         if let Some(candidate) = &mut active {
+            candidate.inline_tags += 1;
             let supported_inline = candidate.role == CandidateRole::HeadingOne
                 && heading_inline_element(&name) && !hidden && !tag.self_closing
-                && stack.len().saturating_sub(candidate.depth) < MAX_HEADING_INLINE_DEPTH;
+                && stack.len().saturating_sub(candidate.depth) < MAX_HEADING_INLINE_DEPTH
+                && candidate.inline_tags <= MAX_HEADING_INLINE_TAGS;
             if !supported_inline { candidate.supported = false; }
         }
         let excluded = stack.iter().any(|open| open.hidden || matches!(open.name.as_str(), "head" | "script" | "style" | "template" | "noscript" | "svg" | "textarea"));
@@ -310,7 +321,7 @@ fn extract_html(text: &str, limit: usize) -> Vec<(CandidateRole, Range<usize>)> 
         };
         if active.is_none() && !hidden && !tag.self_closing {
             if let Some(role) = role {
-                active = Some(OpenCandidate { role, start: tag.end, depth: stack.len() + 1, supported: true });
+                active = Some(OpenCandidate { role, start: tag.end, depth: stack.len() + 1, inline_tags: 0, supported: true });
             }
         }
         if !tag.self_closing && !void_element(&name) {
@@ -367,7 +378,7 @@ mod tests {
 
     #[test]
     fn multiline_heading_with_inline_span_keeps_exact_source_and_intro_paragraph() {
-        let html = "<head><title>Notes that stay out of your way</title></head>\n<body>\n<h1>\n  Notes that don't become 🌍\n  <span>another unfinished project.</span>\n</h1>\n<p class=\"hero-text\">Introductory copy.</p>\n</body>";
+        let html = "<head><title>OrbitNote — Notes that stay out of your way</title></head>\n<body>\n<h1>\n  Notes that don't become\n  <span>another unfinished project.</span>\n</h1>\n<p class=\"hero-text\">\n  OrbitNote is a simple place to capture ideas, organise projects,\n  and pretend you definitely remember where you put that important\n  note from three weeks ago.\n</p>\n</body>";
         let root = fixture(html);
         let mut registry = CandidateRegistry::new();
         assert_eq!(registry.discover_html(&root, "page.html").unwrap(), 3);
@@ -375,9 +386,9 @@ mod tests {
         assert_eq!(views.iter().map(|view| view.role).collect::<Vec<_>>(), [CandidateRole::DocumentTitle, CandidateRole::HeadingOne, CandidateRole::Paragraph]);
         assert_ne!(views[0].id, views[1].id);
         for (view, original) in views.iter().zip([
-            "Notes that stay out of your way",
-            "\n  Notes that don't become 🌍\n  <span>another unfinished project.</span>\n",
-            "Introductory copy.",
+            "OrbitNote — Notes that stay out of your way",
+            "\n  Notes that don't become\n  <span>another unfinished project.</span>\n",
+            "\n  OrbitNote is a simple place to capture ideas, organise projects,\n  and pretend you definitely remember where you put that important\n  note from three weeks ago.\n",
         ]) {
             let candidate = registry.candidate(&view.id).unwrap();
             let start = html.find(original).unwrap();
@@ -386,6 +397,9 @@ mod tests {
             assert_eq!(&registry.snapshot_for(&view.id).unwrap()[candidate.range()], original);
         }
         assert_eq!((views[0].start_line, views[1].start_line, views[2].start_line), (1, 3, 7));
+        assert_eq!((views[0].role_index, views[1].role_index, views[2].role_index), (1, 1, 1));
+        assert!(views[1].excerpt.contains("another unfinished project."));
+        assert!(views[2].excerpt.contains("OrbitNote is a simple place"));
         assert!(views[2].before_context.contains("hero-text"));
         assert!(views.iter().all(|view| view.before_context.len() <= MAX_CANDIDATE_CONTEXT_BYTES));
         fs::remove_dir_all(root).unwrap();
@@ -394,7 +408,8 @@ mod tests {
     #[test]
     fn unsupported_hidden_malformed_and_deep_heading_markup_stays_excluded() {
         let deep = format!("<h1>{}deep{}</h1>", "<span>".repeat(MAX_HEADING_INLINE_DEPTH + 1), "</span>".repeat(MAX_HEADING_INLINE_DEPTH + 1));
-        let html = format!("<h1>safe <em>emphasis</em></h1><h1>link <a href=\"#\">text</a></h1><h1>hidden <span hidden>text</span></h1><h1>broken <span>text</h1>{deep}");
+        let many = format!("<h1>{}</h1>", "<span>x</span>".repeat(MAX_HEADING_INLINE_TAGS + 1));
+        let html = format!("<h1>safe <em>emphasis</em></h1><h1>link <a href=\"#\">text</a></h1><h1>hidden <span hidden>text</span></h1><h1>broken <span>text</h1>{deep}{many}");
         let found = extract_html(&html, MAX_CANDIDATES);
         assert_eq!(found.len(), 1);
         assert_eq!(&html[found[0].1.clone()], "safe <em>emphasis</em>");
@@ -408,6 +423,7 @@ mod tests {
         assert_eq!(registry.discover_html(&root, "page.html").unwrap(), 3);
         let views = registry.model_view();
         assert_eq!(views.iter().map(|view| view.role).collect::<Vec<_>>(), [CandidateRole::HeadingOne, CandidateRole::Paragraph, CandidateRole::Paragraph]);
+        assert_eq!(views.iter().map(|view| view.role_index).collect::<Vec<_>>(), [1, 1, 2]);
         assert!(views.windows(2).all(|pair| pair[0].id != pair[1].id));
         assert!(views.windows(2).all(|pair| registry.candidate(&pair[0].id).unwrap().range().start < registry.candidate(&pair[1].id).unwrap().range().start));
         assert!(registry.candidate("unknown").is_none());

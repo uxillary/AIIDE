@@ -150,14 +150,14 @@ async fn select_candidate(provider: &impl ModelProvider, model: &str, prompt: &s
     let candidates = serde_json::to_string(&views).map_err(|_| "Could not prepare candidate views.")?;
     let schema = selection_schema();
     let messages = [
-        ChatMessage { role: "system".into(), content: "Select a verified source target for the user's request using only the listed candidate IDs. Return exactly one JSON object: {\"result\":\"selected\",\"candidate_id\":\"<listed ID>\"}, {\"result\":\"ambiguous\"}, or {\"result\":\"no_match\"}. If several plausible targets remain and the request does not distinguish them, return ambiguous. Do not invent an ID, source text, replacement code, or a proposal.".into() },
+        ChatMessage { role: "system".into(), content: "Select a verified source target for the user's request using only the listed candidate IDs. Compare each candidate's role, roleIndex (its position among candidates of that role), path, lines, excerpt, and bounded preceding context with the request. A document title, visible h1 heading, and paragraph are distinct targets. Return exactly one JSON object: {\"result\":\"selected\",\"candidate_id\":\"<listed ID>\"}, {\"result\":\"ambiguous\"}, or {\"result\":\"no_match\"}. If several plausible targets remain and the request does not distinguish them, return ambiguous. Do not invent an ID, source text, replacement code, or a proposal.".into() },
         ChatMessage { role: "user".into(), content: format!("Request: {prompt}\nVerified candidates: {candidates}") },
     ];
     // Keep candidate excerpts, source context, and the user's request out of the debug trace.
     debug_log(trace, "selection", format!("Selection call started\nCandidate count: {}\nSchema supplied: {schema}", views.len()));
     let started = Instant::now();
     let response = provider.infer(InferenceRequest { model, messages: &messages, format: schema, temperature: PROTOCOL_TEMPERATURE }).await.map_err(|error| {
-        debug_log(trace, "selection", format!("Selection call failed after {}ms\nValidation: not run\nError: {error}", started.elapsed().as_millis()));
+        debug_log(trace, "selection", format!("Selection call failed after {}ms\nValidation: not run\nProvider error kind: {:?}", started.elapsed().as_millis(), error.kind));
         error.to_string()
     })?;
     debug_log(trace, "selection", format!("Selection response received in {}ms", started.elapsed().as_millis()));
@@ -826,12 +826,14 @@ mod tests {
             self.formats.lock().unwrap().push(request.format.clone());
             self.requests.lock().unwrap().push(request.messages.to_vec());
             let mut response = self.responses.lock().unwrap().pop_front().ok_or_else(|| ProviderFailure::new(ProviderErrorKind::Api, "No stub response configured."))?;
-            if response.message.content == "__SELECT_FIRST__" || response.message.content == "__SELECT_HEADING__" {
+            if matches!(response.message.content.as_str(), "__SELECT_FIRST__" | "__SELECT_HEADING__" | "__SELECT_PARAGRAPH__") {
                 let payload = request.messages.last().unwrap().content.split_once("Verified candidates: ").unwrap().1;
                 let views: Value = serde_json::from_str(payload).unwrap();
-                let selected = if response.message.content == "__SELECT_HEADING__" {
-                    views.as_array().unwrap().iter().find(|view| view["role"] == "heading_one").unwrap()
-                } else { &views[0] };
+                let selected = match response.message.content.as_str() {
+                    "__SELECT_HEADING__" => views.as_array().unwrap().iter().find(|view| view["role"] == "heading_one").unwrap(),
+                    "__SELECT_PARAGRAPH__" => views.as_array().unwrap().iter().find(|view| view["role"] == "paragraph" && view["roleIndex"] == 1).unwrap(),
+                    _ => &views[0],
+                };
                 response.message.content = format!("{{\"result\":\"selected\",\"candidate_id\":\"{}\"}}", selected["id"].as_str().unwrap());
             }
             Ok(response)
@@ -1079,6 +1081,37 @@ mod tests {
     }
 
     #[test]
+    fn introductory_paragraph_selection_uses_role_order_without_writing() {
+        let root = grounding_fixture("selection-intro-paragraph");
+        let original = "<title>OrbitNote — Notes that stay out of your way</title>\n<h1>\n Notes that don't become\n <span>another unfinished project.</span>\n</h1>\n<p class=\"hero-text\">OrbitNote is a simple place to capture ideas.</p>\n<p>Later copy.</p>";
+        std::fs::write(root.join("src/index.html"), original).unwrap();
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            "__SELECT_PARAGRAPH__",
+        ]);
+        let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Select the introductory paragraph in src/index.html".into() }],
+            Some(root.clone()), None, None, Some(&trace),
+        )).unwrap();
+        assert!(response.content.contains("Paragraph text"));
+        assert!(response.content.contains("lines 6–6"));
+        assert!(response.proposal.is_none());
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), original);
+        let requests = provider.requests.lock().unwrap();
+        let presented = &requests[1][1].content;
+        assert!(presented.contains("\"role\":\"paragraph\",\"roleIndex\":1"));
+        assert!(presented.contains("\"role\":\"paragraph\",\"roleIndex\":2"));
+        assert!(presented.contains("OrbitNote is a simple place"));
+        let report = trace.lock().unwrap().lines.join("\n");
+        assert!(report.contains("Structured action: selected"));
+        assert!(report.contains("Validation: passed"));
+        assert!(!report.contains("OrbitNote is a simple place"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn selection_ambiguity_and_no_match_request_clarification_without_editing() {
         for (label, reply, expected) in [
             ("ambiguous", r#"{"result":"ambiguous"}"#, "Please clarify"),
@@ -1136,6 +1169,27 @@ mod tests {
         assert!(report.contains("Candidate ID: unverified"));
         assert!(report.contains("Validation: failed\nError: Unknown candidate ID."));
         assert!(!report.contains("\"candidate_id\":\"unknown\""));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selection_trace_reports_provider_failure_without_response_content() {
+        let root = grounding_fixture("selection-provider-error");
+        let mut registry = CandidateRegistry::new();
+        registry.discover_html(&root, "src/index.html").unwrap();
+        let provider = StubProvider::new(&["test-model"], &[]);
+        let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let error = tauri::async_runtime::block_on(select_candidate(
+            &provider, "test-model", "Select the heading", &root, &registry, Some(&trace),
+        )).unwrap_err();
+        assert_eq!(error, "No stub response configured.");
+        let report = trace.lock().unwrap().lines.join("\n");
+        assert!(report.contains("Selection call started"));
+        assert!(report.contains("Schema supplied:"));
+        assert!(report.contains("Selection call failed after"));
+        assert!(report.contains("Validation: not run"));
+        assert!(report.contains("Provider error kind: Api"));
+        assert!(!report.contains(&error));
         std::fs::remove_dir_all(root).unwrap();
     }
 
