@@ -10,6 +10,7 @@ pub const MAX_CANDIDATE_SOURCE_BYTES: usize = 4_096;
 pub const MAX_CANDIDATE_CONTEXT_BYTES: usize = 120;
 pub const MAX_CANDIDATE_EXCERPT_BYTES: usize = 160;
 pub const MAX_CANDIDATE_PATH_BYTES: usize = 512;
+const MAX_HEADING_INLINE_DEPTH: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +85,7 @@ pub struct CandidateView {
     pub end_line: usize,
     pub description: String,
     pub excerpt: String,
+    pub before_context: String,
 }
 
 impl CandidateRegistry {
@@ -156,6 +158,7 @@ impl CandidateRegistry {
                 end_line: line_at(snapshot, candidate.range.end.saturating_sub(1)),
                 description: candidate.description.to_owned(),
                 excerpt: excerpt(&candidate.original),
+                before_context: candidate.before_context.clone(),
             }
         }).collect()
     }
@@ -237,6 +240,10 @@ fn void_element(name: &str) -> bool {
     matches!(name, "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta" | "param" | "source" | "track" | "wbr")
 }
 
+fn heading_inline_element(name: &str) -> bool {
+    matches!(name, "span" | "em" | "strong" | "b" | "i" | "small" | "mark" | "code")
+}
+
 struct OpenElement { name: String, hidden: bool }
 struct OpenCandidate { role: CandidateRole, start: usize, depth: usize, supported: bool }
 
@@ -287,7 +294,13 @@ fn extract_html(text: &str, limit: usize) -> Vec<(CandidateRole, Range<usize>)> 
             stack.pop();
             continue;
         }
-        if let Some(candidate) = &mut active { candidate.supported = false; }
+        let hidden = hidden_attribute(tag.attributes);
+        if let Some(candidate) = &mut active {
+            let supported_inline = candidate.role == CandidateRole::HeadingOne
+                && heading_inline_element(&name) && !hidden && !tag.self_closing
+                && stack.len().saturating_sub(candidate.depth) < MAX_HEADING_INLINE_DEPTH;
+            if !supported_inline { candidate.supported = false; }
+        }
         let excluded = stack.iter().any(|open| open.hidden || matches!(open.name.as_str(), "head" | "script" | "style" | "template" | "noscript" | "svg" | "textarea"));
         let role = match name.as_str() {
             "title" if !stack.iter().any(|open| open.hidden || matches!(open.name.as_str(), "body" | "script" | "style" | "template" | "noscript" | "svg" | "textarea")) => Some(CandidateRole::DocumentTitle),
@@ -295,7 +308,6 @@ fn extract_html(text: &str, limit: usize) -> Vec<(CandidateRole, Range<usize>)> 
             "p" if !excluded => Some(CandidateRole::Paragraph),
             _ => None,
         };
-        let hidden = hidden_attribute(tag.attributes);
         if active.is_none() && !hidden && !tag.self_closing {
             if let Some(role) = role {
                 active = Some(OpenCandidate { role, start: tag.end, depth: stack.len() + 1, supported: true });
@@ -354,6 +366,41 @@ mod tests {
     }
 
     #[test]
+    fn multiline_heading_with_inline_span_keeps_exact_source_and_intro_paragraph() {
+        let html = "<head><title>Notes that stay out of your way</title></head>\n<body>\n<h1>\n  Notes that don't become 🌍\n  <span>another unfinished project.</span>\n</h1>\n<p class=\"hero-text\">Introductory copy.</p>\n</body>";
+        let root = fixture(html);
+        let mut registry = CandidateRegistry::new();
+        assert_eq!(registry.discover_html(&root, "page.html").unwrap(), 3);
+        let views = registry.model_view();
+        assert_eq!(views.iter().map(|view| view.role).collect::<Vec<_>>(), [CandidateRole::DocumentTitle, CandidateRole::HeadingOne, CandidateRole::Paragraph]);
+        assert_ne!(views[0].id, views[1].id);
+        for (view, original) in views.iter().zip([
+            "Notes that stay out of your way",
+            "\n  Notes that don't become 🌍\n  <span>another unfinished project.</span>\n",
+            "Introductory copy.",
+        ]) {
+            let candidate = registry.candidate(&view.id).unwrap();
+            let start = html.find(original).unwrap();
+            assert_eq!(candidate.range(), start..start + original.len());
+            assert_eq!(candidate.original(), original);
+            assert_eq!(&registry.snapshot_for(&view.id).unwrap()[candidate.range()], original);
+        }
+        assert_eq!((views[0].start_line, views[1].start_line, views[2].start_line), (1, 3, 7));
+        assert!(views[2].before_context.contains("hero-text"));
+        assert!(views.iter().all(|view| view.before_context.len() <= MAX_CANDIDATE_CONTEXT_BYTES));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsupported_hidden_malformed_and_deep_heading_markup_stays_excluded() {
+        let deep = format!("<h1>{}deep{}</h1>", "<span>".repeat(MAX_HEADING_INLINE_DEPTH + 1), "</span>".repeat(MAX_HEADING_INLINE_DEPTH + 1));
+        let html = format!("<h1>safe <em>emphasis</em></h1><h1>link <a href=\"#\">text</a></h1><h1>hidden <span hidden>text</span></h1><h1>broken <span>text</h1>{deep}");
+        let found = extract_html(&html, MAX_CANDIDATES);
+        assert_eq!(found.len(), 1);
+        assert_eq!(&html[found[0].1.clone()], "safe <em>emphasis</em>");
+    }
+
+    #[test]
     fn repeated_text_has_separate_candidates_and_unknown_ids_fail_closed() {
         let html = "<h1>Repeat</h1><p>Repeat</p><p>Repeat</p>";
         let root = fixture(html);
@@ -376,8 +423,10 @@ mod tests {
         let html = "<!-- <h1>comment</h1> --><script>const x = '<h1>script</h1>';</script><div hidden><h1>hidden</h1></div><h1 aria-hidden = 'true'>hidden</h1><h1 style='display: none'>hidden</h1><h1>nested <em>word</em></h1><p>unclosed<h1>valid</h1><p>final</p>";
         let root = fixture(html);
         let mut registry = CandidateRegistry::new();
-        assert_eq!(registry.discover_html(&root, "page.html").unwrap(), 0);
-        assert!(registry.model_view().is_empty());
+        assert_eq!(registry.discover_html(&root, "page.html").unwrap(), 1);
+        let view = &registry.model_view()[0];
+        assert_eq!(view.role, CandidateRole::HeadingOne);
+        assert_eq!(registry.candidate(&view.id).unwrap().original(), "nested <em>word</em>");
         fs::remove_dir_all(root).unwrap();
 
         let html = "<h1>valid</h1><p>text <strong>inside</strong></p><p>final</p>";

@@ -148,19 +148,40 @@ fn resolve_selection(raw: &str, registry: &CandidateRegistry, root: &std::path::
 async fn select_candidate(provider: &impl ModelProvider, model: &str, prompt: &str, root: &std::path::Path, registry: &CandidateRegistry, trace: Option<&Trace>) -> Result<SelectionOutcome, String> {
     let views = registry.model_view();
     let candidates = serde_json::to_string(&views).map_err(|_| "Could not prepare candidate views.")?;
+    let schema = selection_schema();
     let messages = [
         ChatMessage { role: "system".into(), content: "Select a verified source target for the user's request using only the listed candidate IDs. Return exactly one JSON object: {\"result\":\"selected\",\"candidate_id\":\"<listed ID>\"}, {\"result\":\"ambiguous\"}, or {\"result\":\"no_match\"}. If several plausible targets remain and the request does not distinguish them, return ambiguous. Do not invent an ID, source text, replacement code, or a proposal.".into() },
         ChatMessage { role: "user".into(), content: format!("Request: {prompt}\nVerified candidates: {candidates}") },
     ];
-    debug_log(trace, "selection", format!("Candidate selection requested: {} bounded candidates", views.len()));
-    // Keep candidate excerpts and the user's request out of the debug trace.
-    let response = provider.infer(InferenceRequest { model, messages: &messages, format: selection_schema(), temperature: PROTOCOL_TEMPERATURE }).await.map_err(|error| error.to_string())?;
-    if response.done_reason.as_deref() == Some("length") { return Err("Candidate selection response was malformed.".into()); }
-    let outcome = resolve_selection(&response.message.content, registry, root)?;
+    // Keep candidate excerpts, source context, and the user's request out of the debug trace.
+    debug_log(trace, "selection", format!("Selection call started\nCandidate count: {}\nSchema supplied: {schema}", views.len()));
+    let started = Instant::now();
+    let response = provider.infer(InferenceRequest { model, messages: &messages, format: schema, temperature: PROTOCOL_TEMPERATURE }).await.map_err(|error| {
+        debug_log(trace, "selection", format!("Selection call failed after {}ms\nValidation: not run\nError: {error}", started.elapsed().as_millis()));
+        error.to_string()
+    })?;
+    debug_log(trace, "selection", format!("Selection response received in {}ms", started.elapsed().as_millis()));
+    if response.done_reason.as_deref() == Some("length") {
+        debug_log(trace, "selection", "Structured action: unavailable\nValidation: failed\nError: Candidate selection response was malformed.");
+        return Err("Candidate selection response was malformed.".into());
+    }
+    let action = serde_json::from_str::<SelectionReply>(response.message.content.trim()).ok();
+    let action_name = action.as_ref().map_or("malformed", |reply| match reply.result.as_str() {
+        "selected" => "selected", "ambiguous" => "ambiguous", "no_match" => "no_match", _ => "invalid",
+    });
+    let id = if action_name == "selected" {
+        action.as_ref().and_then(|reply| reply.candidate_id.as_deref())
+            .filter(|id| registry.candidate(id).is_some()).unwrap_or("unverified")
+    } else { "none" };
+    debug_log(trace, "selection", format!("Structured action: {action_name}\nCandidate ID: {id}"));
+    let outcome = resolve_selection(&response.message.content, registry, root).map_err(|error| {
+        debug_log(trace, "selection", format!("Validation: failed\nError: {error}"));
+        error
+    })?;
     debug_log(trace, "selection", match &outcome {
-        SelectionOutcome::Selected(view) => format!("Selected ID {} at {}:{}", view.id, view.path, view.start_line),
-        SelectionOutcome::Ambiguous => "Ambiguous candidates; clarification required".into(),
-        SelectionOutcome::NoMatch => "No matching candidate".into(),
+        SelectionOutcome::Selected(view) => format!("Validation: passed\nSelected ID: {} at {}:{}", view.id, view.path, view.start_line),
+        SelectionOutcome::Ambiguous => "Validation: passed\nAmbiguous candidates; clarification required".into(),
+        SelectionOutcome::NoMatch => "Validation: passed\nNo matching candidate".into(),
     });
     Ok(outcome)
 }
@@ -805,10 +826,13 @@ mod tests {
             self.formats.lock().unwrap().push(request.format.clone());
             self.requests.lock().unwrap().push(request.messages.to_vec());
             let mut response = self.responses.lock().unwrap().pop_front().ok_or_else(|| ProviderFailure::new(ProviderErrorKind::Api, "No stub response configured."))?;
-            if response.message.content == "__SELECT_FIRST__" {
+            if response.message.content == "__SELECT_FIRST__" || response.message.content == "__SELECT_HEADING__" {
                 let payload = request.messages.last().unwrap().content.split_once("Verified candidates: ").unwrap().1;
                 let views: Value = serde_json::from_str(payload).unwrap();
-                response.message.content = format!("{{\"result\":\"selected\",\"candidate_id\":\"{}\"}}", views[0]["id"].as_str().unwrap());
+                let selected = if response.message.content == "__SELECT_HEADING__" {
+                    views.as_array().unwrap().iter().find(|view| view["role"] == "heading_one").unwrap()
+                } else { &views[0] };
+                response.message.content = format!("{{\"result\":\"selected\",\"candidate_id\":\"{}\"}}", selected["id"].as_str().unwrap());
             }
             Ok(response)
         }
@@ -1025,6 +1049,36 @@ mod tests {
     }
 
     #[test]
+    fn nested_heading_selection_uses_active_registry_and_traces_structured_outcome() {
+        let root = grounding_fixture("selection-nested-heading");
+        let original = "<title>Notes</title>\n<h1>\n Notes <span>for everyone</span>\n</h1>\n<p class=\"hero-text\">An introduction.</p>";
+        std::fs::write(root.join("src/index.html"), original).unwrap();
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            "__SELECT_HEADING__",
+        ]);
+        let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Select the main visible page heading in src/index.html".into() }],
+            Some(root.clone()), None, None, Some(&trace),
+        )).unwrap();
+        assert!(response.content.contains("Visible h1 heading"));
+        assert!(response.content.contains("lines 2–3"));
+        assert!(response.proposal.is_none());
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), original);
+        let report = trace.lock().unwrap().lines.join("\n");
+        assert!(report.contains("Selection call started"));
+        assert!(report.contains("Schema supplied:"));
+        assert!(report.contains("Selection response received in"));
+        assert!(report.contains("Structured action: selected"));
+        assert!(report.contains("Candidate ID: c"));
+        assert!(report.contains("Validation: passed"));
+        assert!(!report.contains("Notes <span>for everyone</span>"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn selection_ambiguity_and_no_match_request_clarification_without_editing() {
         for (label, reply, expected) in [
             ("ambiguous", r#"{"result":"ambiguous"}"#, "Please clarify"),
@@ -1063,6 +1117,25 @@ mod tests {
         assert_eq!(resolve_selection(&format!(r#"{{"result":"selected","candidate_id":"{id}"}}"#), &second, &root).unwrap_err(), "Unknown candidate ID.");
         std::fs::write(root.join("src/index.html"), "<h1>Changed</h1>").unwrap();
         assert_eq!(resolve_selection(&format!(r#"{{"result":"selected","candidate_id":"{id}"}}"#), &first, &root).unwrap_err(), "Candidate source changed since discovery. Inspect it again.");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selection_trace_reports_validation_failure_without_raw_model_content() {
+        let root = grounding_fixture("selection-trace-error");
+        let mut registry = CandidateRegistry::new();
+        registry.discover_html(&root, "src/index.html").unwrap();
+        let provider = StubProvider::new(&["test-model"], &[r#"{"result":"selected","candidate_id":"unknown"}"#]);
+        let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let error = tauri::async_runtime::block_on(select_candidate(
+            &provider, "test-model", "Select the heading", &root, &registry, Some(&trace),
+        )).unwrap_err();
+        assert_eq!(error, "Unknown candidate ID.");
+        let report = trace.lock().unwrap().lines.join("\n");
+        assert!(report.contains("Structured action: selected"));
+        assert!(report.contains("Candidate ID: unverified"));
+        assert!(report.contains("Validation: failed\nError: Unknown candidate ID."));
+        assert!(!report.contains("\"candidate_id\":\"unknown\""));
         std::fs::remove_dir_all(root).unwrap();
     }
 
