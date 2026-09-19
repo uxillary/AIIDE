@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useCallback, useState } from 'react'
 import { Elma } from './components/Elma'
 import { LocalChat } from './components/LocalChat'
 import { ChangesPanel, type ChangeHistoryEntry } from './components/ChangesPanel'
@@ -7,6 +7,7 @@ import { ProjectSidebar } from './components/ProjectSidebar'
 import { applyPendingChange, chooseProject, refreshProject, rejectPendingChange } from './services/project'
 import type { PendingProposal } from './types/ai'
 import type { ProjectInfo } from './types/project'
+import type { GitStatus } from './types/git'
 
 export default function App() {
   const [project, setProject] = useState<ProjectInfo | null>(null)
@@ -59,9 +60,13 @@ export default function App() {
     finally { setChangeBusy(false) }
   }
 
+  const updateGitSummary = useCallback((status: GitStatus) => {
+    setProject(current => current?.repository ? { ...current, repository: { ...current.repository, branch: status.branch, changedFiles: status.files.length } } : current)
+  }, [])
+
   return <div className="app-shell">
     <header className="topbar"><div className="brand"><span className="brand-mark"><Elma state="idle" size="tiny" /></span><span className="brand-elma">ELMA</span><span className="brand-heart" aria-hidden="true">♥</span><span className="brand-aiide">AIIDE</span><span className="brand-project">{project?.name ?? 'No project open'}</span></div><div className="workspace-status"><span className="status-dot" />LOCAL WORKSPACE</div></header>
-    <div className="workspace"><ProjectSidebar project={project} onOpen={openProject} onViewFile={setViewedFile} busy={busy} /><div className="center-workspace"><LocalChat projectOpen={Boolean(project)} projectBusy={busy} onOpenProject={openProject} onProposal={next => { setProposal(next); setChangeError(null) }} changeState={changeState} />{viewedFile && <FileViewer path={viewedFile} onClose={() => setViewedFile(null)} />}</div><ChangesPanel proposal={proposal} history={history} busy={changeBusy} error={changeError} onApply={() => void applyChange()} onReject={() => void rejectChange()} /></div>
+    <div className="workspace"><ProjectSidebar project={project} onOpen={openProject} onViewFile={setViewedFile} busy={busy} /><div className="center-workspace"><LocalChat projectOpen={Boolean(project)} projectBusy={busy} onOpenProject={openProject} onProposal={next => { setProposal(next); setChangeError(null) }} changeState={changeState} />{viewedFile && <FileViewer path={viewedFile} onClose={() => setViewedFile(null)} />}</div><ChangesPanel projectPath={project?.path ?? null} hasRepository={Boolean(project?.repository)} proposal={proposal} history={history} busy={changeBusy} error={changeError} onApply={() => void applyChange()} onReject={() => void rejectChange()} onGitStatus={updateGitSummary} /></div>
     {error && <div role="alert" className="border-t border-red-900 bg-stone-900 px-4 py-2 text-xs text-red-400">Could not open project: {error}</div>}
     <footer className="footer"><span>{project ? 'LOCAL AI · REVIEWABLE CHANGES' : 'LOCAL AI · NO PROJECT OPEN'}</span><span>{project?.repository ? `${project.repository.branch} · ${project.repository.changedFiles ? `${project.repository.changedFiles} changed` : 'Clean'}` : 'No project open'}</span></footer>
   </div>
