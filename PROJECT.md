@@ -1,621 +1,171 @@
-# Local AI Coding Companion
+# AIIDE product vision and roadmap
 
-> Working title. Final product name and branding are still to be decided.
+## Product identity
 
-## 1. Project Overview
+AIIDE is a Windows-first desktop AI development companion. Elma is the user-facing assistant. AIIDE owns project access, validation, review, approval, Git operations, and other consequential actions; Elma helps the user understand a repository and generate content within those boundaries.
 
-This project is a free, local-first AI coding companion for working directly with software projects and Git repositories.
-
-The goal is to provide a practical alternative to token/credit-based coding agents for everyday development work.
-
-A user should be able to open a local project folder, describe or select a change, review a verified target and proposed content, apply an assembled diff with approval, run authorised tests, and eventually prepare a commit or optional GitHub pull request. AIIDE manages that workflow; Elma assists with understanding and code generation. These are intended capabilities, not a claim that the full workflow exists today.
-
-The application should feel closer to a lightweight combination of:
-
-- a local AI coding assistant
-- GitHub Desktop
-- a focused code review/diff tool
-- a small amount of VS Code-style project awareness
-
-It is **not intended to become a full IDE**.
-
-The application should remain focused on the workflow:
+The intended workflow remains:
 
 **Open → Ask → Inspect → Edit → Review → Test → Commit**
 
----
+The product should combine local and optional cloud AI assistance, repository-aware coding, reviewable file modification, Git and GitHub workflows, image generation and future visual capabilities, and a cohesive desktop interface. It is not intended to become a full IDE or a full graphics editor.
 
-# 2. Core Problem
+## Product principles
 
-Cloud coding agents are extremely capable, but frequent use can become limited by subscriptions, token allowances, credits, rate limits, or internet access.
+1. Users control project modifications and external actions.
+2. Consequential actions require explicit approval.
+3. AI suggestions are distinct from verified application actions.
+4. AIIDE owns deterministic validation; model output is untrusted.
+5. Operation is local-first where practical.
+6. Cloud services are optional and clearly identified.
+7. Text, image, and future vision providers remain replaceable.
+8. The interface stays chat-first and avoids unnecessary permanent complexity.
+9. Dependencies, downloads, licences, storage, and hardware requirements are transparent.
+10. Reliable behaviour comes before feature expansion.
+11. Interaction and visual design are accessible and consistent.
+12. Privacy-sensitive data stays bounded; credentials and source context are not exposed unnecessarily.
 
-Local AI models have become capable enough to handle many everyday development tasks without requiring paid inference.
+The application should hide incidental technical complexity without hiding decisions that affect files, privacy, cost, downloads, hardware, Git history, or remote services. Elma never claims that an operation succeeded until AIIDE confirms it.
 
-This project aims to make those models useful through an application-led engineering workflow rather than simply providing another AI chat window.
+## Status vocabulary
 
-The application must supply verified repository context and control changes. A small model should not be responsible for finding an exact original source target on its own.
+- **IMPLEMENTED** — functionality exists in the named branch.
+- **VERIFIED** — the stated test or acceptance evidence passed; this does not imply release readiness beyond that evidence.
+- **EXPERIMENTAL** — implemented, but not sufficiently validated for reliable release use.
+- **PLANNED** — approved direction that has not been implemented.
+- **PROPOSED** — an idea that still requires product or architectural decisions.
+- **DEFERRED** — deliberately outside the current scope.
 
----
+Statuses may be combined. Branch-specific functionality must not be presented as part of `main`.
 
-# 3. Primary Goals
+## Capability inventory
 
-The application should eventually allow a user to:
+| Capability | Branch and status | Evidence and limits |
+| --- | --- | --- |
+| Local project selection, bounded file tree, read-only file viewer, Git summary | `main` — **IMPLEMENTED**, **VERIFIED** | Rust path/read tests pass; frontend build checks the UI. Generated, sensitive, binary, non-UTF-8, oversized, traversal, and symlink-escape cases are bounded or rejected. |
+| Ollama text inference and model selection | `main` — **IMPLEMENTED**, **VERIFIED** deterministically, **EXPERIMENTAL** for model quality | The desktop UI connects to local Ollama and lists installed models. Provider/protocol tests pass; six opt-in live Ollama tests were not run in the 2026-09-19 audit. |
+| OpenRouter text inference | `main` — **IMPLEMENTED** backend, **VERIFIED** deterministically, **EXPERIMENTAL** | The Rust provider, API-key validation, response normalization, safe errors, and benchmark routing are tested. It is not selectable in the desktop UI, and no live OpenRouter acceptance was run. |
+| Repository-aware answers using list/search/read | `main` — **IMPLEMENTED**, **VERIFIED** deterministically, **EXPERIMENTAL** for broad model reliability | Bounded tools, evidence gating, retries, and grounding tests pass. Real model performance varies by model and prompt. |
+| Older exact-replacement proposal path | `main` — **IMPLEMENTED**, **VERIFIED** deterministically, **EXPERIMENTAL** | One existing UTF-8 file, up to four exact replacements, explicit Apply/Reject, and stale-snapshot protection. Small models have selected incorrect source targets in live experiments. |
+| Application-led editing | `main` — **IMPLEMENTED** narrow slice, **VERIFIED** deterministically, **EXPERIMENTAL** | AIIDE discovers bounded HTML title, `<h1>`, and paragraph candidates. The active edit slice supports a complete visible `<h1>` plain-text replacement; nested-markup preservation, arbitrary ranges, creation, and broad language support are not available. |
+| Pending change history | `main` — **IMPLEMENTED**, **VERIFIED** by build/unit boundary checks | Session-only applied/rejected summaries; not a durable recovery system. |
+| Local Git worktree and commits | `main` — **IMPLEMENTED**, **VERIFIED** deterministically, **EXPERIMENTAL** for release | Status, branch/detached state, staged and unstaged diffs, stage/unstage, approved commit with snapshot token, local history, and bounded commit details. It never pushes or amends. Hooks are disabled for AIIDE-created commits. |
+| GitHub integration | `main` — **PLANNED** | No authentication, remote metadata, issues, pull requests, push, or remote mutation exists. CLI versus direct API remains open. |
+| Agent Debug Mode | `main` — **IMPLEMENTED**, **VERIFIED** | Off by default; retains the latest trace in memory and mirrors it to the development terminal. Traces may contain private project context. |
+| Agent benchmark and model profiles | `main` — **IMPLEMENTED**, **VERIFIED** as a harness | Three controlled answer/lookup/edit cases protect grounding and no-write proposal behaviour. Live results are model- and runtime-specific and were not rerun during this documentation audit. |
+| Elma animation states | `main` — **IMPLEMENTED**, **VERIFIED** by frontend build | Sprite-sheet states: idle, thinking, working, inspecting, success, and error. CSS disables sprite animation for reduced-motion preference. |
+| General settings and onboarding | `main` — **PLANNED** | The chosen Ollama model is stored locally, but there is no settings page, capability manager, first-run flow, or secure credential UI. |
+| M08A image generation | `image-generation` only — **IMPLEMENTED**, **EXPERIMENTAL** | ComfyUI/SDXL provider, single job, state tracking, PNG preview, Save/Reject, safe save, temporary cleanup, and Chat/Image toggle are committed. The feature commit reports 81 Rust tests, lint, typecheck, build, and diff check passing; no live GPU generation succeeded because ComfyUI was unavailable. |
+| M08B image editing | **PLANNED** | Requires original preservation, edit-capable provider/model selection, preview, comparison, and approval. SDXL text-to-image alone does not provide this workflow. |
+| M08C image analysis | **PLANNED** | Requires a vision-capable provider/model and bounded project-image access. The current coding model must not be assumed to understand images. |
+| Sprite sheets, background removal, upscaling, variants, metadata, animation workflows | **PROPOSED** | Evaluate only after the core image workflow is reliable; AIIDE should not become a general graphics editor. |
+| Standalone Windows distribution and guided setup | **PLANNED** | Architecture direction is recorded in [codex/STANDALONE-DISTRIBUTION-DESIGN.md](codex/STANDALONE-DISTRIBUTION-DESIGN.md); no end-user installer or runtime manager exists yet. |
 
-1. Open a local project folder.
-2. Detect whether the folder is a Git repository.
-3. Understand the project's file structure.
-4. Describe a development task to Elma or choose a file and source range directly.
-5. Discover relevant files and verify source references in the application.
-6. Let Elma analyse supplied code and generate replacement content for a verified target.
-7. Assemble and apply modifications safely after approval.
-8. Display exactly what changed.
-9. Accept or reject changes.
-10. Run controlled, authorised builds or tests.
-11. Let Elma explain failures and suggest fixes for user review.
-12. Commit successful changes using Git.
-13. Optionally push branches and create GitHub pull requests.
-14. Maintain useful project context between sessions.
-15. Operate without paid AI inference.
+Current `main` verification on 2026-09-19: `cargo test --manifest-path src-tauri/Cargo.toml` passed 82 tests with 6 live Ollama tests ignored; frontend lint, typecheck, and production build also passed. Deterministic success is not a substitute for live acceptance.
 
----
+## Architecture
 
-# 4. Product Philosophy
+### Trust boundary
 
-## Local First
+The React/TypeScript frontend presents state and requests Tauri commands. Rust owns the opened-project identity, canonical path validation, bounded repository access, proposal assembly, stale-snapshot checks, file application, and local Git commands. Model responses, repository tool arguments, candidate choices, generated source, diffs supplied to a model, and provider errors are treated as untrusted data.
 
-The default experience should use a locally running AI model.
+Current repository limits live in `src-tauri/src/repository.rs`. Important properties include project-relative paths, protected-path checks, generated-directory exclusions, bounded file sizes and result counts, and rejection of binary/non-UTF-8 content. Apply rechecks the original snapshot and fails closed when it is stale.
 
-Code should not need to leave the user's computer for normal AI operations.
+### Text providers
 
-Internet access should be optional rather than a requirement.
+`src-tauri/src/model_provider.rs` defines the replaceable text-inference boundary. Ollama is the current desktop provider. OpenRouter implements the same internal request/response contract and is reachable from the benchmark, but desktop provider selection and credential management are unfinished.
 
-## Free to Use
+Provider support is capability-specific. A provider or model that can chat is not automatically suitable for structured edits, image generation, image editing, or vision. Model profiles describe compatibility with AIIDE's protocol rather than general model quality.
 
-The core application should not depend on paid API credits.
+### Repository inspection and editing
 
-Users should be able to install a supported local model and use the application without paying per request.
+Repository-aware chat uses a bounded loop of `list_files`, `search_files`, and `read_file`. The app supplies only project metadata automatically; source is retrieved on demand. Evidence gates prevent a repository-specific answer from completing without relevant inspection.
 
-Optional cloud AI providers may be supported later through user-provided API credentials.
+The current editing system has two paths:
 
-## Safe by Default
+1. A narrow application-led HTML heading path discovers candidates in Rust, exposes opaque verified IDs to the model, rechecks the selected candidate, asks the model only for replacement text, escapes it, and assembles a pending change.
+2. The older model-led fallback can propose exact replacements after inspection. Rust still validates path, uniqueness, size, snapshot, and no-op rules before creating a pending change.
 
-The model must not receive unrestricted control over the computer or repository. AIIDE owns bounded repository inspection, verified source selection, deterministic edits, diffs, snapshot and path validation, and controlled test commands. Model-generated content and requests are untrusted. The user approves changes before application and external publishing actions. Ambiguous source targets require explicit selection; Elma must not invent original text or silently choose one.
+Only Apply writes. Reject writes nothing. The deterministic candidate path is the architectural direction, but its present HTML `<h1>` slice is not a general editing engine. Future stages should expand application-owned target discovery, user disambiguation, generated content, multi-file assembly, controlled verification, and recoverable checkpoints without returning source-location authority to the model.
 
-## Reviewable
+### Git and GitHub
 
-Changes, whether AI-generated or user-authored, should be transparent.
+Local Git is independent from AI chat. AIIDE invokes the installed Git executable with explicit argument arrays and exact repository-relative paths. The current UI reads status/history, displays bounded diffs, stages or unstages selected files, previews the exact staged snapshot, requires confirmation, rechecks a snapshot token, and creates a local commit. It rejects detached-HEAD commits and conflicts. Elma may suggest a commit subject from a bounded staged diff through Ollama; failure preserves the user's message.
 
-The user should be able to see:
+No remote operation is implemented. Future branch creation, push, authentication, repository metadata, issues, and pull requests require separate commands, narrowly scoped credentials, explicit user intent, and confirmation at the remote mutation boundary. Secrets must use an operating-system-appropriate credential store and must never enter prompts, logs, diagnostics, or project files.
 
-- files inspected
-- files modified
-- lines added
-- lines removed
-- commands executed
-- command output
-- build/test results
+### Image capability family
 
-The user should remain in control of whether changes are kept.
+Image generation is separate from text inference because it is asynchronous, GPU-heavy, binary, previewable, and approval-driven. The `image-generation` branch therefore defines independent frontend and Rust image-provider contracts rather than adding binary lifecycle state to the text `ModelProvider`.
 
-## Model Agnostic
+M08A uses a fixed, core-node SDXL 1.0 ComfyUI workflow at 1024 × 1024, batch size 1, 30 steps, DPM++ 2M/Karras, CFG 7, and a random seed. It permits one active or reviewable job. AIIDE polls real states without invented percentages, downloads and validates a bounded PNG into AIIDE-owned temporary storage, and saves only after approval to a protected project-relative `.png` path. Collision naming is exclusive and non-destructive. Older ComfyUI versions may not safely cancel a running job; AIIDE does not use the global interrupt endpoint.
 
-The application should not be built around one specific AI model.
+The branch design is `codex/M08A-IMAGE-GENERATION-DESIGN.md` on `image-generation`. It is intentionally not copied to `main` before the feature merges.
 
-Models and providers should be interchangeable through a common provider interface.
+M08B should preserve the original image, show a before/after comparison, and require approval before replacement or saving. M08C should use a vision-capable provider to describe and reason about project images. Neither capability is supplied by the current SDXL text-to-image path.
 
----
+### Elma and interface
 
-# 5. Initial Model Strategy
+[codex/PERSONALITY.md](codex/PERSONALITY.md) is canonical. Elma is friendly, concise, calm, trustworthy, technically direct, and honest about uncertainty. Dry humour and slight sarcasm are welcome when they do not obscure an error or dismiss the user. Personality never overrides application state, safety, or verification.
 
-The current local inference provider is **Ollama**.
+UI principles:
 
-The initial coding model should be selected based on the best balance between:
+- chat-first interaction and minimal permanent navigation;
+- progressive disclosure rather than a wall of settings;
+- reusable proposal, Git, image, diagnostic, and future command-result cards;
+- consistent dark-theme styling and clear focus/disabled/error states;
+- accessible controls and reduced-motion support;
+- image generation inside the conversation rather than a separate graphics workspace;
+- onboarding consistent with the same restrained interaction model.
 
-- coding ability
-- tool use
-- reasoning
-- repository understanding
-- speed
-- VRAM usage
-- consumer hardware compatibility
+Future image work may add a distinct working/painting state for Elma, but it remains **PROPOSED** until assets, motion behaviour, and reduced-motion fallback are designed.
 
-Initial candidates include:
+## Distribution direction
 
-- Qwen coding models
-- Gemma
-- other capable coding-focused models available through Ollama
+The current supported environment is a developer checkout. Normal end users should not need to prepare Python environments, model folders, inference servers, environment variables, or command-line arguments.
 
-The initial development target includes hardware such as an RTX 3070 Ti with 8 GB VRAM, so the default model should remain practical on this class of consumer GPU.
+The preferred direction is a relatively small signed application installer plus optional capability setup. Existing compatible Ollama and ComfyUI installations should remain usable. AIIDE may later offer managed runtime/model installation with explicit consent, integrity checks, version compatibility, storage and hardware checks, lifecycle ownership, recovery, and clear uninstall/data-retention choices. Bundling every multi-gigabyte model in the primary installer is not the plan. Fully embedded inference remains an option to investigate, not a commitment.
 
-Larger models may be offered as optional "power" models for machines capable of running them.
+See [codex/STANDALONE-DISTRIBUTION-DESIGN.md](codex/STANDALONE-DISTRIBUTION-DESIGN.md) for the onboarding sequence, runtime responsibilities, security and licensing requirements, phases, and open questions.
 
-The model layer should eventually support:
+## Roadmap
 
-```text
-AI Provider
-│
-├── Local
-│   └── Ollama
-│       ├── Qwen coding models
-│       ├── Gemma
-│       └── other compatible models
-│
-└── Optional Cloud
-    ├── OpenAI
-    ├── Google
-    ├── Anthropic
-    └── other providers
-```
+Milestone identifiers before M08A are historical repository context; do not renumber completed work merely to make the roadmap look tidy. New milestone numbers should be assigned only when scope is approved.
 
-Cloud support is not required for the first release.
+### Immediate: M08A acceptance and stabilisation
 
----
+1. Run the documented live ComfyUI/SDXL flow on supported Windows hardware.
+2. Verify queue transitions, preview retrieval, Reject/no-write, Save, collision naming, cleanup, error recovery, and supported/unsupported cancellation.
+3. Record generation time, peak VRAM/system-memory behaviour, low-VRAM behaviour, and representative output quality.
+4. Fix confirmed defects with regression tests, rerun the full deterministic checks, and only then decide whether M08A is merge-ready.
 
-# 6. Proposed Technology Stack
+This is the recommended next implementation milestone because M08B, M08C, managed image-runtime setup, and public image claims all depend on a trustworthy M08A baseline.
 
-The implemented core stack and longer-term integration options are:
+### Next approved capability areas
 
-### Desktop Application
+- **M08B image editing** depends on M08A approval semantics and a researched edit-capable model/provider.
+- **M08C image analysis** depends on a bounded image-read contract and a researched vision provider.
+- **Editing reliability** expands application-owned candidate discovery, user disambiguation, supported languages/operations, and live acceptance before multi-file work.
+- **GitHub completion** adds authentication and read-only metadata before any approved remote mutation; local Git must remain usable without GitHub.
+- **Standalone distribution and guided onboarding** begin with detection and diagnostics, then optional managed installation. They depend on supported runtime/version matrices and licensing decisions.
+- **Packaging and release validation** follow installer selection, update policy, signing, clean-machine tests, accessibility review, privacy review, and recovery/uninstall acceptance.
 
-**Tauri**
+Controlled commands, multi-file edits, durable session recovery, and project-context persistence remain **PLANNED** but should not outrank current reliability and distribution foundations. A general IDE, unrestricted shell, autonomous publishing, hosted repositories, model training, and a full graphics editor are **DEFERRED**.
 
-Chosen to provide a native desktop application without requiring the overhead of a full Electron application.
+## Open decisions
 
-### Frontend
+- supported Windows versions, installer/update technology, code signing, and release channels;
+- whether AIIDE only detects existing engines or may install and manage selected versions;
+- supported Ollama, ComfyUI, model, driver, and GPU compatibility matrices;
+- model download source, integrity/signature policy, licence presentation, and redistribution eligibility;
+- secure OpenRouter and future GitHub credential storage and revocation;
+- GitHub CLI versus direct API, permission scopes, and remote-action confirmation design;
+- next application-led edit targets and how ambiguous candidates are presented;
+- checkpoint/recovery design for multi-file changes and dirty worktrees;
+- M08B edit model/provider and M08C vision provider;
+- persistence format for projects, sessions, settings, and capability installations;
+- macOS/Linux scope after the Windows release path is proven.
 
-- React
-- TypeScript
-- Tailwind CSS
-
-### Local AI
-
-- Ollama
-- interchangeable local models
-
-### Code Diff / Editing
-
-Potentially Monaco Editor or another suitable diff component.
-
-### Git
-
-Use the user's installed Git executable rather than implementing version control from scratch.
-
-### GitHub
-
-Initial GitHub integration may use the official GitHub CLI (`gh`).
-
-This could support operations such as:
-
-- authentication
-- pushing branches
-- repository information
-- creating pull requests
-
-A deeper GitHub API integration can be considered later if necessary.
-
-### Persistence
-
-Likely SQLite or a similarly lightweight local persistence system.
-
-### Repository Search
-
-Use efficient filesystem searching/indexing rather than sending entire repositories to the model.
-
-Potential tools include `ripgrep` and a lightweight project index.
-
----
-
-# 7. Repository Intelligence
-
-A major design goal is to avoid blindly sending an entire repository to the AI model.
-
-Instead, the application should progressively retrieve context.
-
-Example:
-
-```text
-User request or selected source range
-    ↓
-AIIDE repository metadata, search, and candidate discovery
-    ↓
-Verified file and source references
-    ↓
-User selection when candidates are ambiguous
-    ↓
-Relevant code supplied to Elma when generation is needed
-    ↓
-AIIDE assembles and validates a reviewable change
-```
-
-This should improve:
-
-- inference speed
-- context usage
-- model accuracy
-- compatibility with smaller local models
-
-Generated folders and irrelevant files should normally be ignored.
-
-Examples:
-
-- `.git`
-- `node_modules`
-- `dist`
-- `build`
-- binary files
-- generated assets
-- model files
-
-The application should respect `.gitignore` where appropriate.
-
----
-
-# 8. Project Context
-
-Projects should eventually be able to contain persistent instructions for the AI.
-
-For example:
-
-```text
-.ai/
-├── project.md
-├── context.json
-└── sessions/
-```
-
-A project context file could describe:
-
-```md
-# Project
-
-Personal portfolio website.
-
-## Stack
-
-- JavaScript
-- Tailwind
-- Cloudflare Pages
-
-## Design
-
-- Dark interface
-- Green accent
-- Minimal visual language
-
-## Rules
-
-- Preserve responsive behaviour.
-- Maintain accessibility.
-- Avoid unnecessary dependencies.
-- Do not edit generated files.
-```
-
-This would give AIIDE and Elma persistent project knowledge without repeatedly rediscovering fundamental information.
-
-The exact format should be determined during development.
-
----
-
-# 9. Application-Led Architecture
-
-AIIDE manages the engineering workflow. It owns repository discovery and contextual retrieval, verified file and source references, deterministic file creation and editing, diff assembly, snapshot and path validation, explicit review, and controlled authorised test execution. Git branches, commits, and optional GitHub pull request preparation come later.
-
-Elma interprets requests, analyses relevant supplied code, generates replacement content, helps choose among verified candidates, explains changes and test failures, and suggests fixes. Local models such as Qwen through Ollama should be interchangeable. Elma cannot invent original source text, silently choose ambiguous targets, directly write arbitrary files, or execute unrestricted commands.
-
-Conceptually:
-
-```text
-USER REQUEST / SOURCE SELECTION
-   ↓
-AIIDE DISCOVERY + VERIFIED TARGET
-   ↓
-ELMA CONTENT GENERATION (OPTIONAL)
-   ↓
-AIIDE DETERMINISTIC ASSEMBLY + VALIDATION
-   ↓
-USER REVIEW + APPROVAL
-   ↓
-AIIDE APPLICATION / AUTHORISED VERIFICATION
-```
-
-Example interaction:
-
-```text
-User selects a file and source range.
-AIIDE captures and verifies the original snapshot.
-User supplies replacement content, or Elma generates it from the selected code.
-AIIDE builds the pending change and displays its diff.
-User approves Apply; AIIDE revalidates the snapshot before writing.
-User authorises a configured build or test command when that stage exists.
-AIIDE reports the result; Elma may explain a failure.
-```
-
----
-
-# 10. Change Safety
-
-Every AI editing session should eventually have a reliable recovery mechanism.
-
-Possible implementation options include:
-
-- Git worktrees
-- temporary branches
-- Git stash
-- internal patch history
-
-The user should always have an obvious equivalent of:
-
-**Revert AI Changes**
-
-The application should avoid silently destroying existing uncommitted user work.
-
-Handling repositories that already contain uncommitted changes will therefore be an important design consideration.
-
----
-
-# 11. Interface Direction
-
-The interface should be focused rather than attempting to recreate an IDE.
-
-Potential desktop structure:
-
-```text
-┌──────────────────────────────────────────────────────────────┐
-│ PROJECT                                      MODEL ● LOCAL   │
-├────────────────┬─────────────────────────┬───────────────────┤
-│                │                         │                   │
-│ PROJECT        │ AI                      │ CHANGES           │
-│                │                         │                   │
-│ File tree      │ Conversation            │ Changed files     │
-│                │                         │                   │
-│ Git status     │ Agent activity          │ + additions       │
-│                │                         │ - removals        │
-│ Branch         │ Tool activity           │                   │
-│                │                         │ Diff              │
-│                │                         │                   │
-├────────────────┴─────────────────────────┴───────────────────┤
-│ Build ✓            Review Changes             Commit         │
-└──────────────────────────────────────────────────────────────┘
-```
-
-The three major concepts are:
-
-**Project / Agent / Changes**
-
-The interface should clearly communicate what the AI is currently doing.
-
-For example:
-
-- Searching repository
-- Reading `Projects.tsx`
-- Editing `styles.css`
-- Running build
-- Build failed
-- Diagnosing failure
-- Changes ready for review
-
----
-
-# 12. Operating Modes
-
-## Local Mode
-
-AI inference runs locally.
-
-Internet connectivity is unnecessary.
-
-Example:
-
-```text
-AI: Local
-Provider: Ollama
-Model: Qwen
-Internet: Off
-```
-
-## Connected Mode
-
-AI inference remains local, but internet-enabled development features are available.
-
-For example:
-
-- GitHub
-- Git push
-- pull requests
-
-## Hybrid Mode — Future
-
-Simple or private work could remain local while difficult tasks could optionally be sent to a user-configured cloud model.
-
-This is not required for the initial version.
-
----
-
-# 13. Permissions
-
-Different operations carry different risk levels.
-
-The application should eventually distinguish between operations such as:
-
-### Low Risk
-
-- list directory
-- search repository
-- read files
-- inspect Git status
-
-### Modification
-
-- modify files
-- create files
-- delete files
-
-### Execution
-
-- run build
-- run tests
-- run an authorised, controlled project command
-
-### Git
-
-- create branch
-- commit
-- push
-
-### Remote
-
-- create pull request
-- interact with GitHub
-
-File changes require explicit review and approval. Command execution must be constrained to controlled, authorised commands. Remote publishing requires user approval. Any future permission settings must preserve these boundaries.
-
----
-
-# 14. Checkpoints
-
-Before substantial modifications, the application should provide a recoverable checkpoint. Snapshot validation must prevent overwriting work that changed after review.
-
-After a change task:
-
-```text
-Pending change: 4 files
-
-+84
--31
-
-Build: Passed
-
-[ Review Changes ]
-[ Keep Changes ]
-[ Revert Session ]
-```
-
-This should make review and recovery clear without implying autonomous application.
-
----
-
-# 15. Previous Autonomous-Agent Experiments
-
-The existing bounded Elma proposal path is an implemented experiment, not the intended basis for reliable editing. Experiments on `fix/reliable-editing` improved source validation, but real-world acceptance still failed when the small local model chose incorrect source targets. That branch is historical/experimental and is not approved for merging. Keep its findings; build the new application-led path on `main` in scoped stages. Automatic application, repair, commits, and unrestricted commands are not the active direction.
-
----
-
-# 16. Revised Development Roadmap
-
-These milestones are planned work. Current behavior is described in [codex/CONTEXT.md](codex/CONTEXT.md) and must be checked against current code.
-
-## Milestone 1: Minimal regression protection
-
-Protect the current passing repository-inspection, proposal-validation, and approval behavior with a small, focused regression baseline. Keep tests meaningful; do not weaken them to make CI pass.
-
-## Milestone 2: Deterministic change engine
-
-Let the user select a verified project file and source range for edits, or a validated project-relative path for creation, and provide content without AI. AIIDE owns original text capture, deterministic creation and editing, snapshot and path checks, pending change assembly, diff display, and explicit Apply/Reject. Resolve ambiguous ranges through user selection.
-
-## Milestone 3: Elma-generated replacement content
-
-Supply Elma with the verified selected target and relevant context. Elma generates replacement code while AIIDE retains the original source, assembles the change, validates it, and presents it for user approval.
-
-## Milestone 4: Repository intelligence and candidate discovery
-
-Add application-owned search and contextual retrieval that present verified files and source candidates. Elma may help rank or explain candidates; ambiguity remains visible to the user.
-
-## Milestone 5: Controlled verification and multi-file editing
-
-Support assembled multi-file changes, recoverable checkpoints, and tests/builds through controlled, authorised commands. Show command results and let Elma explain failures and suggest reviewed fixes.
-
-## Milestone 6: Git and optional GitHub workflow
-
-Prepare branches, commits, and optional GitHub pull requests under explicit user control. Publishing and other external actions require approval. A GitHub account is not required for the core local workflow.
-
----
-
-# 17. Non-Goals
-
-To prevent uncontrolled scope growth, the initial project is **not** intended to:
-
-- replace VS Code
-- implement a complete code editor
-- host Git repositories
-- train its own AI model
-- implement its own version-control system
-- provide paid cloud inference
-- support every operating system immediately
-- autonomously execute arbitrary commands without safeguards
-- reproduce every feature of commercial coding agents
-
-The focus is the application-managed, AI-assisted modification workflow.
-
----
-
-# 18. Development Principles
-
-During development:
-
-1. Build the smallest working vertical slice first.
-2. Prefer existing reliable tools over recreating infrastructure.
-3. Keep AI providers interchangeable.
-4. Keep Git operations independent from AI logic.
-5. Treat repository safety as a core feature.
-6. Make every AI modification reviewable.
-7. Avoid unnecessary dependencies.
-8. Maintain clear separation between UI, Elma, model provider, filesystem and Git functionality.
-9. Do not add features solely because competing coding agents have them.
-10. Keep the application useful on normal consumer hardware.
-
----
-
-# 19. Current Baseline and Development Order
-
-The application already has a Tauri shell, open-folder workflow, Git status and branch display, file tree, Ollama conversation, bounded repository inspection, and an approved one-file exact-replacement proposal path. This is the baseline to protect, not completion of the application-led editing architecture.
-
-Follow the six milestones in Section 16. Start with regression protection, then a user-selected deterministic change engine before adding Elma-generated content. Repository intelligence, controlled verification, multi-file changes, and Git/GitHub workflow follow in that order. Packaging, onboarding, persistence, model management, and broader platform support remain later product decisions.
-
----
-
-# 20. Open Decisions
-
-These decisions have deliberately **not** been locked yet:
-
-- Product name
-- Branding
-- Exact local coding model
-- Exact Ollama model size
-- Final persistence system
-- Monaco vs alternative diff viewer
-- Exact checkpoint implementation
-- Elma interaction protocol for verified targets
-- Candidate presentation and source-range selection
-- GitHub CLI vs direct GitHub API
-- Distribution/installer method
-- Whether macOS/Linux support belongs in V1
-- Whether the project context format should become a reusable/open specification
-
-These should be decided through prototypes and testing rather than prematurely.
-
----
-
-# 21. Long-Term Vision
-
-The application should become a useful open-source coding companion rather than simply a demonstration of local AI.
-
-A developer should eventually be able to install it, open an existing project and say:
-
-> "Add a settings page matching the existing design. Don't introduce any new dependencies. Run the build when you're finished."
-
-The application should:
-
-1. discover relevant repository context and present verified source candidates,
-2. obtain an explicit target selection when needed,
-3. let Elma generate code for verified targets,
-4. assemble and validate changes deterministically,
-5. show the diff and obtain approval before applying changes,
-6. run an authorised build and present its result,
-7. let Elma explain failures and suggest reviewed fixes,
-8. prepare a commit and optional pull request under user control.
-
-The core promise is:
+The long-term promise remains:
 
 > **Your project. Your machine. Your model. You approve the changes.**
-
-No AI credits should be required for the core workflow.
