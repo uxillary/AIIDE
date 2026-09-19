@@ -9,6 +9,7 @@ use crate::model_profiles;
 use crate::model_provider::{InferenceRequest, InferenceResponse, ModelMessage, ModelProvider, OllamaProvider, ProviderErrorKind, SelectedProvider, OLLAMA_PROVIDER_ID};
 use crate::project::OpenProject;
 use crate::repository::{self, Activity, PendingChanges, PendingProposal, ProposedReplacement, ToolRequest};
+use crate::repository::candidates::{CandidateRegistry, CandidateRole, CandidateView};
 
 const MAX_MESSAGES: usize = 40;
 const MAX_MESSAGE_CHARS: usize = 12_000;
@@ -105,6 +106,159 @@ enum RequestScope { General, Repository, Unknown }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum RequestIntent { Answer, Edit }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectionReply { result: String, candidate_id: Option<String> }
+
+#[derive(Debug)]
+enum SelectionOutcome { Selected(CandidateView), Ambiguous, NoMatch }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplacementReply { replacement: String }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CandidateEditRoute { Legacy, Heading, Unsupported }
+
+fn candidate_heading_edit_route(prompt: &str, intent: RequestIntent) -> CandidateEditRoute {
+    if intent != RequestIntent::Edit { return CandidateEditRoute::Legacy; }
+    let lower = prompt.trim().to_ascii_lowercase();
+    let heading = ["main page heading", "main heading", "visible h1", "visible heading"]
+        .iter().any(|target| lower.contains(target));
+    if !heading { return CandidateEditRoute::Legacy; }
+    let structural = ["preserve", "retain", "span", "markup", "<h1", "html", " tag", "attribute", " class", "style", "format", "bold", "emphasis", "link"]
+        .iter().any(|term| lower.contains(term));
+    let direct_replacement = ["change", "replace", "rename", "set", "update"].iter().any(|verb| lower.contains(verb))
+        && (lower.contains(" to ") || lower.contains(" with "));
+    if structural || !direct_replacement { CandidateEditRoute::Unsupported } else { CandidateEditRoute::Heading }
+}
+
+fn requests_candidate_selection(prompt: &str, intent: RequestIntent) -> bool {
+    if intent != RequestIntent::Answer { return false; }
+    let lower = prompt.trim().to_ascii_lowercase();
+    lower.starts_with("select ") || lower.starts_with("identify the target")
+        || lower.starts_with("find the target") || (lower.starts_with("which ") && lower.contains(" should ") && (lower.contains(" edit") || lower.contains(" change")))
+}
+
+fn is_html_path(path: &str) -> bool {
+    std::path::Path::new(path).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm"))
+}
+
+fn selection_schema() -> Value {
+    json!({"type":"object","properties":{
+        "result":{"type":"string","enum":["selected","ambiguous","no_match"]},
+        "candidate_id":{"type":"string","description":"Required only for selected; copy one listed ID exactly."}
+    },"required":["result"],"additionalProperties":false})
+}
+
+fn replacement_schema() -> Value {
+    json!({"type":"object","properties":{
+        "replacement":{"type":"string","minLength":1,"maxLength":repository::MAX_PROPOSAL_BYTES}
+    },"required":["replacement"],"additionalProperties":false})
+}
+
+fn resolve_selection(raw: &str, registry: &CandidateRegistry, root: &std::path::Path) -> Result<SelectionOutcome, String> {
+    let reply: SelectionReply = serde_json::from_str(raw.trim()).map_err(|_| "Candidate selection response was malformed.")?;
+    match (reply.result.as_str(), reply.candidate_id) {
+        ("selected", Some(id)) if !id.is_empty() => {
+            let candidate = registry.verify_current(root, &id)?;
+            let view = registry.model_view().into_iter().find(|view| view.id == candidate.id()).ok_or("Unknown candidate ID.")?;
+            Ok(SelectionOutcome::Selected(view))
+        }
+        ("ambiguous", None) => Ok(SelectionOutcome::Ambiguous),
+        ("no_match", None) => Ok(SelectionOutcome::NoMatch),
+        _ => Err("Candidate selection response was malformed.".into()),
+    }
+}
+
+async fn select_candidate(provider: &impl ModelProvider, model: &str, prompt: &str, root: &std::path::Path, registry: &CandidateRegistry, required_role: Option<CandidateRole>, trace: Option<&Trace>) -> Result<SelectionOutcome, String> {
+    let views = registry.model_view().into_iter().filter(|view| required_role.is_none_or(|role| view.role == role)).collect::<Vec<_>>();
+    let candidates = serde_json::to_string(&views).map_err(|_| "Could not prepare candidate views.")?;
+    let schema = selection_schema();
+    let messages = [
+        ChatMessage { role: "system".into(), content: "Select a verified source target for the user's request using only the listed candidate IDs. Compare each candidate's role, roleIndex (its position among candidates of that role), path, lines, excerpt, and bounded preceding context with the request. A document title, visible h1 heading, and paragraph are distinct targets. When exactly one listed candidate has the requested role, select it rather than returning ambiguous. Return exactly one JSON object: {\"result\":\"selected\",\"candidate_id\":\"<listed ID>\"}, {\"result\":\"ambiguous\"}, or {\"result\":\"no_match\"}. If several plausible targets remain and the request does not distinguish them, return ambiguous. Do not invent an ID, source text, replacement code, or a proposal.".into() },
+        ChatMessage { role: "user".into(), content: format!("Request: {prompt}\nVerified candidates: {candidates}") },
+    ];
+    // Keep candidate excerpts, source context, and the user's request out of the debug trace.
+    debug_log(trace, "selection", format!("Selection call started\nCandidate count: {}\nSchema supplied: {schema}", views.len()));
+    let started = Instant::now();
+    let response = provider.infer(InferenceRequest { model, messages: &messages, format: schema, temperature: PROTOCOL_TEMPERATURE }).await.map_err(|error| {
+        debug_log(trace, "selection", format!("Selection call failed after {}ms\nValidation: not run\nProvider error kind: {:?}", started.elapsed().as_millis(), error.kind));
+        error.to_string()
+    })?;
+    debug_log(trace, "selection", format!("Selection response received in {}ms", started.elapsed().as_millis()));
+    if response.done_reason.as_deref() == Some("length") {
+        debug_log(trace, "selection", "Structured action: unavailable\nValidation: failed\nError: Candidate selection response was malformed.");
+        return Err("Candidate selection response was malformed.".into());
+    }
+    let action = serde_json::from_str::<SelectionReply>(response.message.content.trim()).ok();
+    let action_name = action.as_ref().map_or("malformed", |reply| match reply.result.as_str() {
+        "selected" => "selected", "ambiguous" => "ambiguous", "no_match" => "no_match", _ => "invalid",
+    });
+    let id = if action_name == "selected" {
+        action.as_ref().and_then(|reply| reply.candidate_id.as_deref())
+            .filter(|id| registry.candidate(id).is_some()).unwrap_or("unverified")
+    } else { "none" };
+    debug_log(trace, "selection", format!("Structured action: {action_name}\nCandidate ID: {id}"));
+    if action_name == "selected" && !views.iter().any(|view| Some(view.id.as_str()) == action.as_ref().and_then(|reply| reply.candidate_id.as_deref())) {
+        debug_log(trace, "selection", "Validation: failed\nError: Unknown candidate ID.");
+        return Err("Unknown candidate ID.".into());
+    }
+    let outcome = resolve_selection(&response.message.content, registry, root).map_err(|error| {
+        debug_log(trace, "selection", format!("Validation: failed\nError: {error}"));
+        error
+    })?;
+    debug_log(trace, "selection", match &outcome {
+        SelectionOutcome::Selected(view) => format!("Validation: passed\nSelected ID: {} at {}:{}", view.id, view.path, view.start_line),
+        SelectionOutcome::Ambiguous => "Validation: passed\nAmbiguous candidates; clarification required".into(),
+        SelectionOutcome::NoMatch => "Validation: passed\nNo matching candidate".into(),
+    });
+    Ok(outcome)
+}
+
+async fn generate_candidate_replacement(provider: &impl ModelProvider, model: &str, prompt: &str, root: &std::path::Path, registry: &CandidateRegistry, candidate_id: &str, trace: Option<&Trace>) -> Result<String, String> {
+    let candidate = registry.verify_current(root, candidate_id)?;
+    let schema = replacement_schema();
+    let messages = [
+        ChatMessage { role: "system".into(), content: "Generate only the complete plain-text replacement for the selected visible h1 content. Do not return HTML, markdown, a path, old text, a source range, a summary, or a proposal. Do not preserve or recreate nested markup. Return exactly one JSON object with the single field replacement.".into() },
+        ChatMessage { role: "user".into(), content: format!("Original request: {prompt}\n\nSelected h1 inner source:\n{}", candidate.original()) },
+    ];
+    debug_log(trace, "generation", format!("Candidate replacement call started\nSchema supplied: {schema}"));
+    let response = provider.infer(InferenceRequest { model, messages: &messages, format: schema, temperature: PROTOCOL_TEMPERATURE }).await
+        .map_err(|error| error.to_string())?;
+    if response.done_reason.as_deref() == Some("length") { return Err("Candidate replacement response was malformed.".into()); }
+    let reply: ReplacementReply = serde_json::from_str(response.message.content.trim())
+        .map_err(|_| "Candidate replacement response was malformed.".to_owned())?;
+    if reply.replacement.trim().is_empty() { return Err("Candidate replacement must not be empty.".into()); }
+    debug_log(trace, "generation", "Candidate replacement response validated");
+    Ok(reply.replacement)
+}
+
+async fn run_candidate_heading_edit(provider: &impl ModelProvider, model: String, prompt: &str, root: &std::path::Path, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<ChatResponse, String> {
+    if let Some(app) = app { let _ = app.emit("repository-inspection-start", ()); }
+    let mut registry = CandidateRegistry::new();
+    let count = repository::discover_html_candidates(root, &mut registry)?;
+    let activity_item = Activity { label: format!("Discovered {count} verified HTML targets") };
+    if let Some(app) = app { let _ = app.emit("repository-activity", &activity_item); }
+    let activity = vec![activity_item];
+    let selected = match select_candidate(provider, &model, prompt, root, &registry, Some(CandidateRole::HeadingOne), trace).await? {
+        SelectionOutcome::Selected(view) => view,
+        SelectionOutcome::Ambiguous => return Ok(ChatResponse { model, content: "I found multiple plausible visible headings. Please clarify which heading you mean.".into(), activity, proposal: None }),
+        SelectionOutcome::NoMatch => return Ok(ChatResponse { model, content: "I found no verified visible h1 matching that request.".into(), activity, proposal: None }),
+    };
+    if selected.role != CandidateRole::HeadingOne { return Err("Selected candidate is not a visible h1.".into()); }
+    let replacement = generate_candidate_replacement(provider, &model, prompt, root, &registry, &selected.id, trace).await?;
+    if let Some(app) = app { let _ = app.emit("proposal-validation-start", ()); }
+    let proposal = repository::validate_candidate_proposal(
+        root, &registry, &selected.id, format!("Update the visible h1 heading in {}.", selected.path), replacement,
+    )?;
+    if let Some(pending) = pending {
+        *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone());
+    }
+    debug_log(trace, "tool", "Candidate proposal validation: passed\nPending change creation: passed");
+    Ok(ChatResponse { model, content: "Done — have a wee look in Changes 👀".into(), activity, proposal: Some(proposal) })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RequestPlan { scope: RequestScope, intent: RequestIntent }
 
@@ -146,7 +300,8 @@ fn is_edit_clause(clause: &str) -> bool {
 fn classify_current_request(prompt: &str) -> RequestPlan {
     let text = prompt.trim().to_ascii_lowercase();
     let edit = text.split(['.', '!', '?', ';', '\n']).any(is_edit_clause);
-    let repository = edit || file_reference(prompt).is_some() || has_path_reference(prompt)
+    let selection = requests_candidate_selection(prompt, if edit { RequestIntent::Edit } else { RequestIntent::Answer });
+    let repository = edit || selection || file_reference(prompt).is_some() || has_path_reference(prompt)
         || ["this project", "the project", "look at the css", "look at the code", "source code", "codebase", "project structure", "repository structure", "repository", "what files", "which files", "list files", "files in ", "files are in ", "directory", "folder", "page heading", "mobile menu", "main heading", "signup form"].iter().any(|phrase| text.contains(phrase));
     let general = matches!(text.as_str(), "hey" | "hello" | "hi" | "how are you" | "how are you?")
         || text.starts_with("what is ") || text.starts_with("what's ") || text.starts_with("explain ");
@@ -489,6 +644,16 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
         return Ok(ChatResponse { model, content: if root.is_some() { "I can inspect this project and prepare focused changes for your review. Only the Apply button can write them." } else { "No project is open, so I cannot inspect or propose changes to files." }.into(), activity: vec![], proposal: None });
     }
     let plan = classify_current_request(&last_prompt);
+    match candidate_heading_edit_route(&last_prompt, plan.intent) {
+        CandidateEditRoute::Heading if root.is_some() => {
+            return run_candidate_heading_edit(provider, model, &last_prompt, root.as_deref().unwrap(), pending, app, debug_trace).await;
+        }
+        CandidateEditRoute::Unsupported if root.is_some() => {
+            return Ok(ChatResponse { model, content: "This first application-led heading editor only supports replacing the complete visible h1 content with plain text. It cannot preserve or rearrange nested markup.".into(), activity: vec![], proposal: None });
+        }
+        CandidateEditRoute::Legacy | CandidateEditRoute::Heading | CandidateEditRoute::Unsupported => {}
+    }
+    let selection_requested = requests_candidate_selection(&last_prompt, plan.intent);
     debug_log(debug_trace, "agent", format!("Current request plan: scope={:?}, intent={:?}", plan.scope, plan.intent));
     let mut exchange = Vec::new();
     exchange.push(ChatMessage { role: "system".into(), content: CORE_AGENT_INSTRUCTIONS.into() });
@@ -502,7 +667,7 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
     } else {
         exchange.push(ChatMessage { role: "system".into(), content: "No project is open. Repository tools are unavailable; answer normal chat directly.".into() });
     }
-    exchange.push(ChatMessage { role: "system".into(), content: format!("The final user message is the authoritative current task. Current request intent: {}. {}", if plan.intent == RequestIntent::Edit { "edit" } else { "inspect/answer only" }, if plan.intent == RequestIntent::Edit && root.is_some() { "Inspect the relevant target, then return a focused propose_change. Do not claim completion without a validated proposal." } else if plan.intent == RequestIntent::Edit { "No project is open, so explain that the requested edit cannot be prepared yet." } else { "Do not propose or prepare a change; answer the current request after any required inspection." }) });
+    exchange.push(ChatMessage { role: "system".into(), content: format!("The final user message is the authoritative current task. Current request intent: {}. {}", if plan.intent == RequestIntent::Edit { "edit" } else { "inspect/answer only" }, if selection_requested && root.is_some() { "This is a read-only target selection request. Identify and read the relevant HTML file with repository tools; AIIDE will discover verified candidates after the read. Do not propose a change." } else if plan.intent == RequestIntent::Edit && root.is_some() { "Inspect the relevant target, then return a focused propose_change. Do not claim completion without a validated proposal." } else if plan.intent == RequestIntent::Edit { "No project is open, so explain that the requested edit cannot be prepared yet." } else { "Do not propose or prepare a change; answer the current request after any required inspection." }) });
     exchange.extend(messages.into_iter().rev().take(12).collect::<Vec<_>>().into_iter().rev());
     let mut activity = Vec::new();
     let mut tool_cache: HashMap<String, (String, Activity)> = HashMap::new();
@@ -641,6 +806,19 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
         debug_log(debug_trace, "tool", format!("{}\nValidation/execution: {}\nCache: {}\nReturned: {} bytes\nDuration: {}ms\nNext stage: agent turn", request.tool, if output.starts_with("Error:") { &output } else { "passed" }, if reused { "reused successful result" } else { "executed" }, output.len(), tool_started.elapsed().as_millis()));
         if let Some(app) = app { let _ = app.emit("repository-activity", &event); }
         activity.push(event);
+        if selection_requested && useful && request.tool == "read_file" && is_html_path(&request.path)
+            && file_reference(&last_prompt).is_none_or(|name| std::path::Path::new(&request.path).file_name().is_some_and(|file| file.to_string_lossy().eq_ignore_ascii_case(&name))) {
+            let root = root.as_deref().expect("project is open for repository tools");
+            let mut registry = CandidateRegistry::new();
+            registry.discover_html(root, &request.path)?;
+            let outcome = select_candidate(provider, &model, &last_prompt, root, &registry, None, debug_trace).await?;
+            let content = match outcome {
+                SelectionOutcome::Selected(view) => format!("Verified target: {} ({}) in {} at lines {}–{}. This selection is read-only; no change is prepared.", view.id, view.description, view.path, view.start_line, view.end_line),
+                SelectionOutcome::Ambiguous => "I found multiple plausible targets. Please clarify which element or location you mean before I select one.".into(),
+                SelectionOutcome::NoMatch => "I found no verified target matching that request in the inspected file. Please specify another file or target.".into(),
+            };
+            return Ok(ChatResponse { model, content, activity, proposal: None });
+        }
         exchange.push(result.message);
         let unread = known_file_paths.iter().filter(|path| !read_paths.contains(path)).cloned().collect::<Vec<_>>().join(", ");
         exchange.push(ChatMessage { role: "user".into(), content: format!("{}\nCurrent request intent: {}.", tool_result_message(&request, useful, &output, &known_paths, &unread), if plan.intent == RequestIntent::Edit { "edit — inspect, then propose the focused change" } else { "inspect/answer only — do not propose a change" }) });
@@ -695,6 +873,7 @@ mod tests {
         models: Vec<String>,
         responses: Mutex<VecDeque<InferenceResponse>>,
         formats: Mutex<Vec<Value>>,
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
         inference_calls: AtomicUsize,
     }
 
@@ -709,6 +888,7 @@ mod tests {
                     done_reason: Some("stop".into()),
                 }).collect()),
                 formats: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
                 inference_calls: AtomicUsize::new(0),
             }
         }
@@ -726,7 +906,19 @@ mod tests {
         async fn infer(&self, request: InferenceRequest<'_>) -> Result<InferenceResponse, ProviderFailure> {
             self.inference_calls.fetch_add(1, Ordering::SeqCst);
             self.formats.lock().unwrap().push(request.format.clone());
-            self.responses.lock().unwrap().pop_front().ok_or_else(|| ProviderFailure::new(ProviderErrorKind::Api, "No stub response configured."))
+            self.requests.lock().unwrap().push(request.messages.to_vec());
+            let mut response = self.responses.lock().unwrap().pop_front().ok_or_else(|| ProviderFailure::new(ProviderErrorKind::Api, "No stub response configured."))?;
+            if matches!(response.message.content.as_str(), "__SELECT_FIRST__" | "__SELECT_HEADING__" | "__SELECT_PARAGRAPH__") {
+                let payload = request.messages.last().unwrap().content.split_once("Verified candidates: ").unwrap().1;
+                let views: Value = serde_json::from_str(payload).unwrap();
+                let selected = match response.message.content.as_str() {
+                    "__SELECT_HEADING__" => views.as_array().unwrap().iter().find(|view| view["role"] == "heading_one").unwrap(),
+                    "__SELECT_PARAGRAPH__" => views.as_array().unwrap().iter().find(|view| view["role"] == "paragraph" && view["roleIndex"] == 1).unwrap(),
+                    _ => &views[0],
+                };
+                response.message.content = format!("{{\"result\":\"selected\",\"candidate_id\":\"{}\"}}", selected["id"].as_str().unwrap());
+            }
+            Ok(response)
         }
     }
 
@@ -912,6 +1104,258 @@ mod tests {
     }
 
     #[test]
+    fn selection_is_reachable_after_html_read_and_returns_a_verified_id_without_a_proposal() {
+        let root = grounding_fixture("selection-valid");
+        std::fs::write(root.join("src/index.html"), "<title>Welcome</title><h1>Welcome</h1>").unwrap();
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            "__SELECT_FIRST__",
+        ]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Select the document title in index.html".into() }],
+            Some(root.clone()), None, None, None,
+        )).unwrap();
+        assert!(response.content.contains("Verified target: c"));
+        assert!(response.content.contains("Document title"));
+        assert!(response.proposal.is_none());
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(classify_current_request("Select the document title in index.html").scope, RequestScope::Repository);
+        assert!(!provider.formats.lock().unwrap()[0]["properties"]["action"]["enum"].as_array().unwrap().iter().any(|action| action == "answer"));
+        let requests = provider.requests.lock().unwrap();
+        let presented = &requests[1][1].content;
+        assert!(presented.contains("\"role\":\"document_title\""));
+        assert!(presented.contains("\"path\":\"src/index.html\""));
+        assert!(presented.contains("\"startLine\":1"));
+        assert!(presented.contains("\"description\":\"Document title\""));
+        assert!(presented.contains("\"excerpt\":\"Welcome\""));
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), "<title>Welcome</title><h1>Welcome</h1>");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nested_heading_selection_uses_active_registry_and_traces_structured_outcome() {
+        let root = grounding_fixture("selection-nested-heading");
+        let original = "<title>Notes</title>\n<h1>\n Notes <span>for everyone</span>\n</h1>\n<p class=\"hero-text\">An introduction.</p>";
+        std::fs::write(root.join("src/index.html"), original).unwrap();
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            "__SELECT_HEADING__",
+        ]);
+        let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Select the main visible page heading in src/index.html".into() }],
+            Some(root.clone()), None, None, Some(&trace),
+        )).unwrap();
+        assert!(response.content.contains("Visible h1 heading"));
+        assert!(response.content.contains("lines 2–3"));
+        assert!(response.proposal.is_none());
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), original);
+        let report = trace.lock().unwrap().lines.join("\n");
+        assert!(report.contains("Selection call started"));
+        assert!(report.contains("Schema supplied:"));
+        assert!(report.contains("Selection response received in"));
+        assert!(report.contains("Structured action: selected"));
+        assert!(report.contains("Candidate ID: c"));
+        assert!(report.contains("Validation: passed"));
+        assert!(!report.contains("Notes <span>for everyone</span>"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn introductory_paragraph_selection_uses_role_order_without_writing() {
+        let root = grounding_fixture("selection-intro-paragraph");
+        let original = "<title>OrbitNote — Notes that stay out of your way</title>\n<h1>\n Notes that don't become\n <span>another unfinished project.</span>\n</h1>\n<p class=\"hero-text\">OrbitNote is a simple place to capture ideas.</p>\n<p>Later copy.</p>";
+        std::fs::write(root.join("src/index.html"), original).unwrap();
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            "__SELECT_PARAGRAPH__",
+        ]);
+        let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Select the introductory paragraph in src/index.html".into() }],
+            Some(root.clone()), None, None, Some(&trace),
+        )).unwrap();
+        assert!(response.content.contains("Paragraph text"));
+        assert!(response.content.contains("lines 6–6"));
+        assert!(response.proposal.is_none());
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), original);
+        let requests = provider.requests.lock().unwrap();
+        let presented = &requests[1][1].content;
+        assert!(presented.contains("\"role\":\"paragraph\",\"roleIndex\":1"));
+        assert!(presented.contains("\"role\":\"paragraph\",\"roleIndex\":2"));
+        assert!(presented.contains("OrbitNote is a simple place"));
+        let report = trace.lock().unwrap().lines.join("\n");
+        assert!(report.contains("Structured action: selected"));
+        assert!(report.contains("Validation: passed"));
+        assert!(!report.contains("OrbitNote is a simple place"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selection_ambiguity_and_no_match_request_clarification_without_editing() {
+        for (label, reply, expected) in [
+            ("ambiguous", r#"{"result":"ambiguous"}"#, "Please clarify"),
+            ("no-match", r#"{"result":"no_match"}"#, "no verified target"),
+        ] {
+            let root = grounding_fixture(label);
+            let original = "<h1>Welcome</h1><h1>Welcome</h1>";
+            std::fs::write(root.join("src/index.html"), original).unwrap();
+            let provider = StubProvider::new(&["test-model"], &[
+                r#"{"action":"read_file","path":"src/index.html"}"#, reply,
+            ]);
+            let response = tauri::async_runtime::block_on(run_agent_with_provider(
+                &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Select the target in index.html".into() }],
+                Some(root.clone()), None, None, None,
+            )).unwrap();
+            assert!(response.content.contains(expected));
+            assert!(response.proposal.is_none());
+            assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), original);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn selection_rejects_unknown_ids_malformed_responses_other_requests_and_stale_source() {
+        let root = grounding_fixture("selection-rejection");
+        let mut first = CandidateRegistry::new();
+        first.discover_html(&root, "src/index.html").unwrap();
+        let id = first.model_view()[0].id.clone();
+        assert!(matches!(resolve_selection(&format!(r#"{{"result":"selected","candidate_id":"{id}"}}"#), &first, &root), Ok(SelectionOutcome::Selected(_))));
+        assert_eq!(resolve_selection(r#"{"result":"selected","candidate_id":"unknown"}"#, &first, &root).unwrap_err(), "Unknown candidate ID.");
+        for raw in ["not json", r#"{"result":"selected"}"#, r#"{"result":"ambiguous","candidate_id":"x"}"#, r#"{"result":"no_match","extra":1}"#] {
+            assert_eq!(resolve_selection(raw, &first, &root).unwrap_err(), "Candidate selection response was malformed.");
+        }
+        let mut second = CandidateRegistry::new();
+        second.discover_html(&root, "src/index.html").unwrap();
+        assert_eq!(resolve_selection(&format!(r#"{{"result":"selected","candidate_id":"{id}"}}"#), &second, &root).unwrap_err(), "Unknown candidate ID.");
+        std::fs::write(root.join("src/index.html"), "<h1>Changed</h1>").unwrap();
+        assert_eq!(resolve_selection(&format!(r#"{{"result":"selected","candidate_id":"{id}"}}"#), &first, &root).unwrap_err(), "Candidate source changed since discovery. Inspect it again.");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selection_trace_reports_validation_failure_without_raw_model_content() {
+        let root = grounding_fixture("selection-trace-error");
+        let mut registry = CandidateRegistry::new();
+        registry.discover_html(&root, "src/index.html").unwrap();
+        let provider = StubProvider::new(&["test-model"], &[r#"{"result":"selected","candidate_id":"unknown"}"#]);
+        let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let error = tauri::async_runtime::block_on(select_candidate(
+            &provider, "test-model", "Select the heading", &root, &registry, None, Some(&trace),
+        )).unwrap_err();
+        assert_eq!(error, "Unknown candidate ID.");
+        let report = trace.lock().unwrap().lines.join("\n");
+        assert!(report.contains("Structured action: selected"));
+        assert!(report.contains("Candidate ID: unverified"));
+        assert!(report.contains("Validation: failed\nError: Unknown candidate ID."));
+        assert!(!report.contains("\"candidate_id\":\"unknown\""));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selection_trace_reports_provider_failure_without_response_content() {
+        let root = grounding_fixture("selection-provider-error");
+        let mut registry = CandidateRegistry::new();
+        registry.discover_html(&root, "src/index.html").unwrap();
+        let provider = StubProvider::new(&["test-model"], &[]);
+        let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let error = tauri::async_runtime::block_on(select_candidate(
+            &provider, "test-model", "Select the heading", &root, &registry, None, Some(&trace),
+        )).unwrap_err();
+        assert_eq!(error, "No stub response configured.");
+        let report = trace.lock().unwrap().lines.join("\n");
+        assert!(report.contains("Selection call started"));
+        assert!(report.contains("Schema supplied:"));
+        assert!(report.contains("Selection call failed after"));
+        assert!(report.contains("Validation: not run"));
+        assert!(report.contains("Provider error kind: Api"));
+        assert!(!report.contains(&error));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn application_led_heading_edit_selects_an_id_and_generates_only_replacement_text() {
+        let root = grounding_fixture("candidate-heading-edit");
+        let original = "<head><title>OrbitNote</title><meta name=\"description\" content=\"Keep me\"></head>\n<body><h1 class=\"hero\">\n Notes <span>for everyone</span>\n</h1><p>Keep this too.</p></body>";
+        std::fs::write(root.join("src/index.html"), original).unwrap();
+        let pending = PendingChanges::default();
+        let provider = StubProvider::new(&["test-model"], &[
+            "__SELECT_HEADING__",
+            r#"{"replacement":"Welcome to OrbitNote 2.0"}"#,
+        ]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Change the main page heading to \"Welcome to OrbitNote 2.0\" without modifying anything else.".into() }],
+            Some(root.clone()), Some(&pending), None, None,
+        )).unwrap();
+        let proposal = response.proposal.expect("candidate edit should prepare a proposal");
+        assert_eq!(proposal.changes[0].path, "src/index.html");
+        assert_eq!(proposal.changes[0].before, original);
+        assert_eq!(proposal.changes[0].after, "<head><title>OrbitNote</title><meta name=\"description\" content=\"Keep me\"></head>\n<body><h1 class=\"hero\">Welcome to OrbitNote 2.0</h1><p>Keep this too.</p></body>");
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), original);
+        assert!(pending.0.lock().unwrap().is_some());
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 2);
+        let formats = provider.formats.lock().unwrap();
+        assert!(formats[0]["properties"].get("candidate_id").is_some());
+        assert_eq!(formats[1]["required"], json!(["replacement"]));
+        assert_eq!(formats[1]["properties"].as_object().unwrap().len(), 1);
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[0][1].content.contains("\"role\":\"heading_one\""));
+        assert!(!requests[0][1].content.contains("document_title") && !requests[0][1].content.contains("paragraph"));
+        assert!(!requests[1].iter().any(|message| message.content.contains("src/index.html")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn candidate_edit_failures_do_not_enter_the_legacy_proposal_path() {
+        for (label, selection, expected) in [
+            ("unknown", r#"{"result":"selected","candidate_id":"unknown"}"#, "Unknown candidate ID."),
+            ("malformed", "not json", "Candidate selection response was malformed."),
+        ] {
+            let root = grounding_fixture(label);
+            let pending = PendingChanges::default();
+            let provider = StubProvider::new(&["test-model"], &[selection]);
+            let error = match tauri::async_runtime::block_on(run_agent_with_provider(
+                &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Change the main heading to Changed".into() }],
+                Some(root.clone()), Some(&pending), None, None,
+            )) { Err(error) => error, Ok(_) => panic!("candidate selection failure must not prepare a proposal") };
+            assert_eq!(error, expected);
+            assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 1, "failure must not invoke legacy proposal generation");
+            assert!(pending.0.lock().unwrap().is_none());
+            assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), "<h1>Welcome</h1>");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        let root = grounding_fixture("malformed-replacement");
+        let provider = StubProvider::new(&["test-model"], &["__SELECT_HEADING__", r#"{"replacement":"Changed","path":"src/index.html"}"#]);
+        let error = match tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Change the main heading to Changed".into() }],
+            Some(root.clone()), None, None, None,
+        )) { Err(error) => error, Ok(_) => panic!("malformed replacement must not prepare a proposal") };
+        assert_eq!(error, "Candidate replacement response was malformed.");
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn heading_capability_gate_rejects_markup_work_and_leaves_other_edits_on_legacy() {
+        assert_eq!(candidate_heading_edit_route("Change the main page heading to Welcome", RequestIntent::Edit), CandidateEditRoute::Heading);
+        assert_eq!(candidate_heading_edit_route("Change the main heading to Welcome but preserve the span", RequestIntent::Edit), CandidateEditRoute::Unsupported);
+        assert_eq!(candidate_heading_edit_route("Improve the signup form accessibility", RequestIntent::Edit), CandidateEditRoute::Legacy);
+        let root = grounding_fixture("unsupported-heading-markup");
+        let provider = StubProvider::new(&["test-model"], &[]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Change the main heading to Welcome but preserve the span".into() }],
+            Some(root.clone()), None, None, None,
+        )).unwrap();
+        assert!(response.proposal.is_none());
+        assert!(response.content.contains("cannot preserve"));
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn named_file_refusal_cannot_complete_before_discovery_and_relevant_read() {
         let root = grounding_fixture("named-file");
         let provider = StubProvider::new(&["test-model"], &[
@@ -1006,7 +1450,7 @@ mod tests {
             r#"{"action":"propose_change","summary":"Change visible heading.","changes":[{"path":"src/index.html","old_text":"<h1>Welcome</h1>","new_text":"<h1>Changed</h1>"}]}"#,
         ]);
         let response = tauri::async_runtime::block_on(run_agent_with_provider(
-            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "change the visible heading to Changed".into() }],
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "replace the exact text Welcome with Changed".into() }],
             Some(root.clone()), None, None, None,
         )).unwrap();
         let proposal = response.proposal.expect("unique retry should produce a proposal");
@@ -1156,6 +1600,32 @@ mod tests {
         assert_eq!(proposal.changes[0].replacements, 1);
         assert_eq!(proposal.changes[0].before, before);
         assert_eq!(proposal.changes[0].after, before.replacen("<h1>OrbitNote</h1>", "<h1>Welcome to the AIIDE Sandbox</h1>", 1));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before, "proposal must not write before Apply");
+    }
+
+    #[test]
+    #[ignore = "requires local Ollama with qwen2.5-coder:7b and clean aiide-sandbox"]
+    fn local_application_led_orbitnote_acceptance() {
+        let root = std::fs::canonicalize(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../aiide-sandbox"))
+            .expect("aiide-sandbox must exist beside AIIDE");
+        let path = root.join("src/index.html");
+        let before = std::fs::read_to_string(&path).expect("sandbox page must exist");
+        let mut registry = CandidateRegistry::new();
+        repository::discover_html_candidates(&root, &mut registry).expect("sandbox must have one discoverable HTML file");
+        let heading = registry.model_view().into_iter().find(|candidate| candidate.role == CandidateRole::HeadingOne).expect("sandbox must have a visible h1");
+        let range = registry.candidate(&heading.id).unwrap().range();
+        let expected = format!("{}Welcome to OrbitNote 2.0{}", &before[..range.start], &before[range.end..]);
+        let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let response = tauri::async_runtime::block_on(run_agent(OLLAMA_PROVIDER_ID,
+            "qwen2.5-coder:7b".into(),
+            vec![ChatMessage { role: "user".into(), content: "Change the main page heading to \"Welcome to OrbitNote 2.0\" without modifying anything else.".into() }],
+            Some(root), None, None, Some(&trace),
+        )).expect("application-led edit should complete");
+        println!("{}", trace.lock().unwrap().lines.join("\n\n"));
+        let proposal = response.proposal.unwrap_or_else(|| panic!("edit should prepare a proposal; response: {}", response.content));
+        assert_eq!(proposal.changes[0].path, "src/index.html");
+        assert_eq!(proposal.changes[0].before, before);
+        assert_eq!(proposal.changes[0].after, expected);
         assert_eq!(std::fs::read_to_string(path).unwrap(), before, "proposal must not write before Apply");
     }
 
