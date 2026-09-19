@@ -11,3 +11,4 @@ export async function chooseProject(): Promise<ProjectInfo | null> {
 export const refreshProject = (path: string) => invoke<ProjectInfo>('inspect_project', { path })
 export const applyPendingChange = () => invoke<void>('apply_pending_change')
 export const rejectPendingChange = () => invoke<void>('reject_pending_change')
+export const viewRepositoryFile = (path: string) => invoke<{ content: string; truncated: boolean }>('view_repository_file', { path })

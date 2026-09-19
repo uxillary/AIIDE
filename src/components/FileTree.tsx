@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { TreeEntry } from '../types/project'
 
 type IconKind = 'folder' | 'file' | 'html' | 'css' | 'js' | 'ts' | 'json' | 'markdown' | 'image' | 'config'
@@ -26,20 +26,32 @@ export function FileIcon({ kind }: { kind: IconKind }) {
   return <svg className={`file-type-icon file-type-${kind}`} viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3.5 1.5h6l3 3v10h-9z" stroke="currentColor" strokeLinejoin="round"/><path d="M9.5 1.5v3h3" stroke="currentColor"/>{label[kind] && <text x="8" y="11.5" textAnchor="middle" fill="currentColor" fontSize="6" fontFamily="monospace" fontWeight="bold">{label[kind]}</text>}</svg>
 }
 
-function TreeNode({ entry, depth }: { entry: TreeEntry; depth: number }) {
+function TreeNode({ entry, depth, onView }: { entry: TreeEntry; depth: number; onView: (path: string) => void }) {
   const [expanded, setExpanded] = useState(depth < 1)
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
   const directory = entry.kind === 'directory'
+  useEffect(() => {
+    if (!menu) return
+    const close = () => setMenu(null)
+    window.addEventListener('click', close)
+    window.addEventListener('blur', close)
+    return () => { window.removeEventListener('click', close); window.removeEventListener('blur', close) }
+  }, [menu])
   return <li>
-    <button type="button" onClick={() => directory && setExpanded(!expanded)} className="tree-row" style={{ paddingLeft: `${12 + depth * 15}px` }} aria-expanded={directory ? expanded : undefined}>
+    <button type="button" onClick={() => directory ? setExpanded(!expanded) : onView(entry.relativePath)} onContextMenu={event => { if (!directory) { event.preventDefault(); setMenu({ x: Math.min(event.clientX, window.innerWidth - 184), y: Math.min(event.clientY, window.innerHeight - 80) }) } }} className="tree-row" style={{ paddingLeft: `${12 + depth * 15}px` }} aria-expanded={directory ? expanded : undefined}>
       <span className="tree-chevron" aria-hidden="true">{directory ? (expanded ? '▾' : '▸') : ''}</span>
       <FileIcon kind={fileIconKind(entry)} />
       <span className={`tree-name ${directory ? 'tree-name-folder' : ''}`}>{entry.name}</span>
     </button>
-    {directory && expanded && <ul>{entry.children?.map(child => <TreeNode key={child.relativePath} entry={child} depth={depth + 1} />)}{entry.truncated && <li className="tree-hint" style={{ paddingLeft: `${27 + depth * 15}px` }}>Further contents not loaded</li>}</ul>}
+    {menu && <div className="file-context-menu" role="menu" style={{ left: menu.x, top: menu.y }} onClick={event => event.stopPropagation()}>
+      <button role="menuitem" onClick={() => { onView(entry.relativePath); setMenu(null) }}><span aria-hidden="true">▤</span> View file</button>
+      <button role="menuitem" onClick={() => { void navigator.clipboard.writeText(entry.relativePath).catch(() => undefined); setMenu(null) }}><span aria-hidden="true">⧉</span> Copy relative path</button>
+    </div>}
+    {directory && expanded && <ul>{entry.children?.map(child => <TreeNode key={child.relativePath} entry={child} depth={depth + 1} onView={onView} />)}{entry.truncated && <li className="tree-hint" style={{ paddingLeft: `${27 + depth * 15}px` }}>Further contents not loaded</li>}</ul>}
   </li>
 }
 
-export function FileTree({ entries, truncated }: { entries: TreeEntry[]; truncated: boolean }) {
+export function FileTree({ entries, truncated, onView }: { entries: TreeEntry[]; truncated: boolean; onView: (path: string) => void }) {
   if (!entries.length) return <p className="px-4 py-3 text-xs text-stone-500">No visible files in this folder.</p>
-  return <div className="file-tree-scroll"><ul>{entries.map(entry => <TreeNode key={entry.relativePath} entry={entry} depth={0} />)}</ul>{truncated && <p className="tree-hint px-4 py-2">Tree limit reached. Some files are not shown.</p>}</div>
+  return <div className="file-tree-scroll"><ul>{entries.map(entry => <TreeNode key={entry.relativePath} entry={entry} depth={0} onView={onView} />)}</ul>{truncated && <p className="tree-hint px-4 py-2">Tree limit reached. Some files are not shown.</p>}</div>
 }
