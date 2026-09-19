@@ -126,3 +126,82 @@
   .intro p { max-width: 40ch; }
   .source-meta { display: none; }
 }
+
+/* Workflow tabs replace the former stack of collapsible side panels. */
+.workflow-tabs {
+  flex: none;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  border-bottom: 1px solid #314138;
+  background: #27322b;
+  padding: 0 18px;
+}
+.workflow-tabs button {
+  position: relative;
+  min-width: 0;
+  min-height: 46px;
+  border: 0;
+  border-radius: 0;
+  background: #171d19;
+  padding: 8px 12px;
+  color: #829488;
+  font: 700 11px ui-monospace, monospace;
+  letter-spacing: .08em;
+  white-space: nowrap;
+}
+.workflow-tabs button:hover { background: #1e2922; color: #c4d8c8; }
+.workflow-tabs button[aria-selected="true"] { background: #203528; color: #dff6e4; }
+.workflow-tabs button[aria-selected="true"]::after { content: ''; position: absolute; right: 12px; bottom: 0; left: 12px; height: 3px; border-radius: 3px 3px 0 0; background: #8be5a4; }
+.workflow-tabs button:focus-visible { z-index: 1; outline-offset: -3px; }
+
+.workspace {
+  grid-template-areas: "canvas resize tools";
+  grid-template-columns: minmax(320px, 1fr) 6px var(--right-width);
+}
+.canvas-panel { grid-area: canvas; }
+.sidebar-resizer { grid-area: resize; }
+.frames-panel, .detail-panel { grid-area: tools; border-right: 0; border-left: 1px solid #2a352d; }
+.frames-panel:not([hidden]) ~ .detail-panel { display: none; }
+.frames-panel, .detail-panel, .workflow-panel { min-width: 0; min-height: 0; }
+.frames-panel { overflow: auto; }
+.detail-panel { display: block; overflow: hidden; }
+.workflow-panel { height: 100%; overflow-y: auto; }
+.workflow-panel[hidden], .frames-panel[hidden] { display: none; }
+.section-heading { min-height: 66px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid #2b352e; padding: 12px 15px; }
+.section-heading h2 { margin: 5px 0 0; font-size: 14px; }
+.section-heading h2 em { margin-left: 5px; color: #7f9a85; font: normal 11px ui-monospace, monospace; }
+.tool-section { padding: 0 12px 14px; border-bottom: 1px solid #2b352e; }
+.tool-section > .section-heading { margin: 0 -12px 12px; }
+.details > .section-heading { margin: -15px -15px 15px; }
+.timeline .slot-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.timeline .slot { display: grid; grid-template-columns: auto minmax(0, 1fr); }
+.timeline .slot select { width: 100%; }
+.timeline .play-controls { margin-top: 0; }
+.export-actions { display: grid; gap: 8px; }
+.export-actions button { width: 100%; }
+.export-panel > .tool-section:last-child { border-bottom: 0; }
+.frames-list { flex: none; overflow: visible; }
+.detector { max-height: none; overflow: visible; }
+.alignment-view.expanded { position: relative; inset: auto; height: min(68vh, 760px); margin: 0; box-shadow: 0 10px 36px #0008; }
+
+@media (max-width: 900px) {
+  .workflow-tabs { padding-inline: 8px; }
+  .workspace { display: grid; grid-template-areas: "canvas" "tools"; grid-template-columns: minmax(0, 1fr); }
+  .canvas-panel { grid-area: canvas; height: min(58vh, 600px); min-height: 330px; }
+  .frames-panel, .detail-panel { grid-area: tools; min-height: 420px; max-height: none; overflow: visible; border-top: 1px solid #2a352d; border-left: 0; }
+  .workflow-panel { height: auto; overflow: visible; }
+}
+
+@media (max-width: 600px) {
+  .workflow-tabs { padding: 0; }
+  .workflow-tabs button { min-height: 44px; padding-inline: 5px; font-size: 10px; letter-spacing: .02em; }
+  .workspace { display: grid; }
+  .canvas-panel { order: initial; width: 100%; height: min(52vh, 500px); }
+  .frames-panel, .detail-panel { width: 100%; min-height: 360px; }
+  .timeline .slot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+}

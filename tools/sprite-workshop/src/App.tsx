@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, ReactNode } from 'react'
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { boundedRegion, clamp, fitZoom, regionFromCorners, resizeRegion, screenToImage, zoomAt } from './geometry'
 import type { Handle, Point, Region } from './geometry'
 import { downloadAlignedSlot, downloadAnimation, downloadRegion, validateAnimation } from './export'
@@ -21,40 +21,30 @@ type Drag =
 
 const HANDLES: Handle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w']
 const EMPTY_SLOTS = Array<string | null>(8).fill(null)
-const PANEL_KEYS = ['frames', 'inspection', 'alignment', 'offsets', 'preview', 'slots', 'export'] as const
-type PanelKey = typeof PANEL_KEYS[number]
-type PanelVisibility = Record<PanelKey, boolean>
-type WorkshopLayout = { panels: PanelVisibility; leftWidth: number; rightWidth: number }
-const DEFAULT_LAYOUT: WorkshopLayout = {
-  panels: { frames: true, inspection: true, alignment: true, offsets: true, preview: true, slots: true, export: true },
-  leftWidth: 255,
-  rightWidth: 320,
-}
-const LAYOUT_STORAGE_KEY = 'sprite-workshop-layout-v1'
+const WORKFLOW_TABS = [
+  { id: 'extract', label: '01 Extract' },
+  { id: 'inspect', label: '02 Inspect' },
+  { id: 'animate', label: '03 Animate' },
+  { id: 'export', label: '04 Export' },
+] as const
+type WorkflowTab = typeof WORKFLOW_TABS[number]['id']
+type WorkshopLayout = { rightWidth: number }
+const DEFAULT_LAYOUT: WorkshopLayout = { rightWidth: 380 }
+const LAYOUT_STORAGE_KEY = 'sprite-workshop-layout-v2'
 
 function readLayout(): WorkshopLayout {
   try {
     const saved = JSON.parse(window.localStorage.getItem(LAYOUT_STORAGE_KEY) ?? 'null') as Partial<WorkshopLayout> | null
     if (!saved || typeof saved !== 'object') return DEFAULT_LAYOUT
-    const panels = Object.fromEntries(PANEL_KEYS.map(key => [key, typeof saved.panels?.[key] === 'boolean' ? saved.panels[key] : true])) as PanelVisibility
     return {
-      panels,
-      leftWidth: typeof saved.leftWidth === 'number' && Number.isFinite(saved.leftWidth) ? clamp(saved.leftWidth, 200, 360) : DEFAULT_LAYOUT.leftWidth,
-      rightWidth: typeof saved.rightWidth === 'number' && Number.isFinite(saved.rightWidth) ? clamp(saved.rightWidth, 250, 420) : DEFAULT_LAYOUT.rightWidth,
+      rightWidth: typeof saved.rightWidth === 'number' && Number.isFinite(saved.rightWidth) ? clamp(saved.rightWidth, 320, 560) : DEFAULT_LAYOUT.rightWidth,
     }
   } catch { return DEFAULT_LAYOUT }
 }
 
-function PanelHeader({ id, title, eyebrow, expanded, onToggle, extra }: { id: PanelKey; title: string; eyebrow?: string; expanded: boolean; onToggle: () => void; extra?: ReactNode }) {
-  return <div className="collapsible-head">
-    <button className="panel-toggle" aria-expanded={expanded} aria-controls={`panel-${id}`} onClick={onToggle}>
-      <span className="panel-chevron" aria-hidden="true">⌄</span><span>{eyebrow && <span className="eyebrow">{eyebrow}</span>}<strong>{title}</strong></span>
-    </button>{extra}
-  </div>
-}
-
 export default function App() {
   const [workshopLayout, setWorkshopLayout] = useState(readLayout)
+  const [activeTab, setActiveTab] = useState<WorkflowTab>('extract')
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth)
   const [source, setSource] = useState<SourceImage | null>(null)
   const sourceRef = useRef<SourceImage | null>(null)
@@ -102,6 +92,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
   const stageRef = useRef<HTMLDivElement>(null)
   const alignmentPreviewRef = useRef<HTMLDivElement>(null)
   const sourceCanvasRef = useRef<HTMLCanvasElement>(null)
@@ -118,28 +109,37 @@ export default function App() {
   const referenceSlot = referenceSlotFor(activeSlot, onionReference, fixedReferenceSlot)
   const previewScale = alignmentScale(alignmentZoom, layout, alignmentViewport)
   const baselineY = clamp(layout.anchorY + baselineOffset, 0, layout.height - 1)
-  const leftWidth = Math.min(workshopLayout.leftWidth, Math.max(200, viewportWidth - workshopLayout.rightWidth - 332))
-  const rightWidth = Math.min(workshopLayout.rightWidth, Math.max(250, viewportWidth - leftWidth - 332))
-  const workspaceStyle = { '--left-width': `${leftWidth}px`, '--right-width': `${rightWidth}px` } as CSSProperties
+  const rightWidth = Math.min(workshopLayout.rightWidth, Math.max(320, viewportWidth - 480))
+  const workspaceStyle = { '--right-width': `${rightWidth}px` } as CSSProperties
 
-  function togglePanel(key: PanelKey) {
-    setWorkshopLayout(previous => ({ ...previous, panels: { ...previous.panels, [key]: !previous.panels[key] } }))
+  function selectTab(tab: WorkflowTab) {
+    setAlignmentExpanded(false)
+    setActiveTab(tab)
   }
 
-  function resizeSidebar(side: 'left' | 'right', width: number) {
-    const minimum = side === 'left' ? 200 : 250
-    const maximum = side === 'left' ? 360 : 420
-    const other = side === 'left' ? rightWidth : leftWidth
-    setWorkshopLayout(previous => ({ ...previous, [side === 'left' ? 'leftWidth' : 'rightWidth']: clamp(Math.round(width), minimum, Math.max(minimum, Math.min(maximum, window.innerWidth - other - 332))) }))
+  function handleTabKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>, index: number) {
+    let nextIndex = index
+    if (event.key === 'ArrowLeft') nextIndex = (index + WORKFLOW_TABS.length - 1) % WORKFLOW_TABS.length
+    else if (event.key === 'ArrowRight') nextIndex = (index + 1) % WORKFLOW_TABS.length
+    else if (event.key === 'Home') nextIndex = 0
+    else if (event.key === 'End') nextIndex = WORKFLOW_TABS.length - 1
+    else return
+    event.preventDefault()
+    selectTab(WORKFLOW_TABS[nextIndex].id)
+    tabRefs.current[nextIndex]?.focus()
   }
 
-  function resizeHandle(side: 'left' | 'right') {
-    const width = side === 'left' ? leftWidth : rightWidth
-    return <div className="sidebar-resizer" role="separator" tabIndex={0} aria-label={`Resize ${side} sidebar`} aria-orientation="vertical" aria-valuemin={side === 'left' ? 200 : 250} aria-valuemax={side === 'left' ? 360 : 420} aria-valuenow={width}
+  function resizeSidebar(width: number) {
+    setWorkshopLayout({ rightWidth: clamp(Math.round(width), 320, Math.max(320, Math.min(560, window.innerWidth - 480))) })
+  }
+
+  function resizeHandle() {
+    const width = rightWidth
+    return <div className="sidebar-resizer" role="separator" tabIndex={0} aria-label="Resize tool area" aria-orientation="vertical" aria-valuemin={320} aria-valuemax={560} aria-valuenow={width}
       onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.dataset.startX = String(event.clientX); event.currentTarget.dataset.startWidth = String(width) }}
-      onPointerMove={event => { if (!event.currentTarget.hasPointerCapture(event.pointerId)) return; const delta = event.clientX - Number(event.currentTarget.dataset.startX); resizeSidebar(side, Number(event.currentTarget.dataset.startWidth) + (side === 'left' ? delta : -delta)) }}
+      onPointerMove={event => { if (!event.currentTarget.hasPointerCapture(event.pointerId)) return; const delta = event.clientX - Number(event.currentTarget.dataset.startX); resizeSidebar(Number(event.currentTarget.dataset.startWidth) - delta) }}
       onPointerUp={event => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }}
-      onKeyDown={event => { const direction = event.key === 'ArrowLeft' ? -1 : event.key === 'ArrowRight' ? 1 : 0; if (!direction && event.key !== 'Home' && event.key !== 'End') return; event.preventDefault(); resizeSidebar(side, event.key === 'Home' ? 0 : event.key === 'End' ? 1000 : width + direction * (event.shiftKey ? 25 : 10) * (side === 'left' ? 1 : -1)) }} />
+      onKeyDown={event => { const direction = event.key === 'ArrowLeft' ? 1 : event.key === 'ArrowRight' ? -1 : 0; if (!direction && event.key !== 'Home' && event.key !== 'End') return; event.preventDefault(); resizeSidebar(event.key === 'Home' ? 320 : event.key === 'End' ? 560 : width + direction * (event.shiftKey ? 25 : 10)) }} />
   }
 
   useEffect(() => {
@@ -157,7 +157,7 @@ export default function App() {
     const observer = new ResizeObserver(() => setAlignmentViewport({ width: preview.clientWidth, height: preview.clientHeight }))
     observer.observe(preview)
     return () => observer.disconnect()
-  }, [alignmentExpanded])
+  }, [alignmentExpanded, activeTab])
 
   useEffect(() => () => { sourceRef.current?.bitmap.close() }, [])
   useEffect(() => {
@@ -375,38 +375,37 @@ export default function App() {
   return <div className="workshop">
     <header className="topbar">
       <div className="brand"><span className="brand-icon" aria-hidden="true">▦</span><span><strong>SPRITE WORKSHOP</strong><small>AiiDE / developer utility</small></span></div>
-      <div className="header-actions"><span className="local-badge"><i /> LOCAL ONLY</span><div className="layout-actions"><button className="small" onClick={() => setWorkshopLayout(previous => ({ ...previous, panels: { ...DEFAULT_LAYOUT.panels } }))}>Expand all</button><button className="small" onClick={() => { setAlignmentExpanded(false); setWorkshopLayout(previous => ({ ...previous, panels: Object.fromEntries(PANEL_KEYS.map(key => [key, false])) as PanelVisibility })) }}>Collapse all</button><button className="small" onClick={() => { setAlignmentExpanded(false); setWorkshopLayout({ panels: { ...DEFAULT_LAYOUT.panels }, leftWidth: DEFAULT_LAYOUT.leftWidth, rightWidth: DEFAULT_LAYOUT.rightWidth }) }}>Reset layout</button></div><input ref={fileRef} type="file" accept="image/png,.png" className="visually-hidden" aria-label="Import PNG" onChange={event => { void importFile(event.target.files?.[0]); event.target.value = '' }} /><button className="primary" onClick={() => fileRef.current?.click()}>Import PNG</button></div>
+      <div className="header-actions"><span className="local-badge"><i /> LOCAL ONLY</span><input ref={fileRef} type="file" accept="image/png,.png" className="visually-hidden" aria-label="Import PNG" onChange={event => { void importFile(event.target.files?.[0]); event.target.value = '' }} /><button className="primary" onClick={() => fileRef.current?.click()}>Import PNG</button></div>
     </header>
-    <div className="intro"><div><span className="eyebrow">FRAME EXTRACTION / MILESTONE 03</span><h1>Shape each frame by hand.</h1><p>Map regions, align an eight-frame loop, and export a transparent sprite sheet with metadata.</p></div><div className="source-meta"><span>SOURCE</span><strong>{source?.name ?? 'No image loaded'}</strong><small>{source ? `${source.width} × ${source.height} px · PNG` : 'Drop a PNG onto the canvas to begin'}</small></div></div>
+    <div className="intro"><div><span className="eyebrow">FRAME EXTRACTION WORKSPACE</span><h1>Shape each frame by hand.</h1><p>Map regions, align an eight-frame loop, and export a transparent sprite sheet with metadata.</p></div><div className="source-meta"><span>SOURCE</span><strong>{source?.name ?? 'No image loaded'}</strong><small>{source ? `${source.width} × ${source.height} px · PNG` : 'Drop a PNG onto the canvas to begin'}</small></div></div>
     {(error || notice || deleted) && <div className={error ? 'message error' : 'message'} role={error ? 'alert' : 'status'}>{error ?? notice}{deleted && <button className="undo-button" onClick={undoDelete}>Undo deletion of {deleted.region.name}</button>}<button aria-label="Dismiss message" onClick={() => { setError(null); setNotice(null); setDeleted(null) }}>×</button></div>}
+    <nav className="workflow-tabs" role="tablist" aria-label="Sprite workflow">{WORKFLOW_TABS.map((tab, index) => <button key={tab.id} ref={element => { tabRefs.current[index] = element }} id={`workflow-tab-${tab.id}`} role="tab" aria-selected={activeTab === tab.id} aria-controls={`workflow-panel-${tab.id}`} tabIndex={activeTab === tab.id ? 0 : -1} onClick={() => selectTab(tab.id)} onKeyDown={event => handleTabKeyDown(event, index)}>{tab.label}</button>)}</nav>
     <main className="workspace" style={workspaceStyle}>
-      <aside className="panel frames-panel" aria-label="Frames and suggestions"><PanelHeader id="frames" eyebrow="01 / REGIONS" title={`Frame list · ${regions.length}`} expanded={workshopLayout.panels.frames} onToggle={() => togglePanel('frames')} extra={<button className="small" disabled={!source} onClick={addFrame}>+ Add</button>} />
-        <div id="panel-frames" className="frames-list" hidden={!workshopLayout.panels.frames}>{regions.length === 0 ? <div className="panel-empty"><span>▧</span><strong>No frames yet</strong><p>Drag across the image, add a centered region, or preview suggestions.</p></div> : regions.map((region, index) => <div key={region.id} className={`frame-row ${selectedId === region.id ? 'active' : ''}`}><button className="frame-select" onClick={() => setSelectedId(region.id)}><Thumbnail image={source!.bitmap} region={region} /><span className="frame-text"><strong>{region.name}</strong><small>{region.width} × {region.height} px · {region.x}, {region.y}</small></span><span className="frame-index">{String(index + 1).padStart(2, '0')}</span></button><button className="row-delete" aria-label={`Delete ${region.name}`} title={`Delete ${region.name}`} onClick={() => deleteFrame(region.id)}>×</button></div>)}</div>
+      <aside id="workflow-panel-extract" className="panel frames-panel" role="tabpanel" aria-labelledby="workflow-tab-extract" hidden={activeTab !== 'extract'}><div className="section-heading"><div><span className="eyebrow">REGIONS</span><h2>Frame library <em>{regions.length}</em></h2></div><button className="small" disabled={!source} onClick={addFrame}>+ Add</button></div>
+        <div className="frames-list">{regions.length === 0 ? <div className="panel-empty"><span>▧</span><strong>No frames yet</strong><p>Drag across the image, add a centered region, or preview suggestions.</p></div> : regions.map((region, index) => <div key={region.id} className={`frame-row ${selectedId === region.id ? 'active' : ''}`}><button className="frame-select" onClick={() => setSelectedId(region.id)}><Thumbnail image={source!.bitmap} region={region} /><span className="frame-text"><strong>{region.name}</strong><small>{region.width} × {region.height} px · {region.x}, {region.y}</small></span><span className="frame-index">{String(index + 1).padStart(2, '0')}</span></button><button className="row-delete" aria-label={`Delete ${region.name}`} title={`Delete ${region.name}`} onClick={() => deleteFrame(region.id)}>×</button></div>)}</div>
         <DetectionPanel enabled={Boolean(source)} mode={detectionMode} onMode={setDetectionMode} grid={grid} onGrid={setGrid} joinGap={joinGap} onJoinGap={setJoinGap} minPixels={minPixels} onMinPixels={setMinPixels} suggestions={suggestions} selected={suggestion} onSelected={setSelectedSuggestion} onGenerate={generateSuggestions} onEdit={editSuggestion} onAccept={accept} onReject={reject} onClear={() => { setSuggestions([]); setSelectedSuggestion(null) }} />
         <div className="panel-foot">Coordinates always use source-image pixels.</div>
       </aside>
-      {resizeHandle('left')}
       <section className="canvas-panel" aria-label="Sprite sheet editor"><div className="canvas-toolbar"><div className="tool-group"><button className={mode === 'select' ? 'tool active' : 'tool'} onClick={() => setMode('select')} aria-pressed={mode === 'select'} title="Draw or edit regions">▣ <span>Select</span></button><button className={mode === 'pan' ? 'tool active' : 'tool'} onClick={() => setMode('pan')} aria-pressed={mode === 'pan'} title="Pan canvas">✥ <span>Pan</span></button></div><span className="toolbar-hint">{source ? 'Drag to draw · drag frame to move · handles to resize · Space or middle drag to pan' : 'Import a PNG to start'}</span><div className="zoom-controls"><button aria-label="Zoom out" disabled={!source} onClick={() => setMagnification(zoom / 1.25)}>−</button><output>{Math.round(zoom * 100)}%</output><button aria-label="Zoom in" disabled={!source} onClick={() => setMagnification(zoom * 1.25)}>+</button><button disabled={!source} onClick={() => fit()} title="Fit image in view">Fit</button></div></div>
         <div ref={stageRef} className={`stage ${dragOver ? 'drag-over' : ''} ${mode === 'pan' || spaceHeld ? 'panning' : ''}`} onPointerDown={event => startDrag(event)} onPointerMove={moveDrag} onPointerUp={endDrag} onPointerCancel={cancelDrag} onWheel={event => { if (!source) return; event.preventDefault(); const rect = stageRef.current!.getBoundingClientRect(); setMagnification(zoom * (event.deltaY < 0 ? 1.1 : 1 / 1.1), { x: event.clientX - rect.left, y: event.clientY - rect.top }) }} onDragOver={event => { event.preventDefault(); setDragOver(true) }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragOver(false) }} onDrop={event => { event.preventDefault(); setDragOver(false); void importFile(event.dataTransfer.files[0]) }}>
           {source ? <div className="image-surface checker" style={{ left: pan.x, top: pan.y, width: source.width * zoom, height: source.height * zoom }}><canvas ref={sourceCanvasRef} width={source.width} height={source.height} className="source-canvas" />{suggestions.map(item => <div key={item.id} className={`region suggestion-region ${selectedSuggestion === item.id ? 'focused' : ''}`} style={{ left: item.x * zoom, top: item.y * zoom, width: item.width * zoom, height: item.height * zoom }} onPointerDown={event => { event.stopPropagation(); setSelectedSuggestion(item.id) }}><span className="region-tag">{item.name}</span></div>)}{regions.map(region => <div key={region.id} className={`region ${selectedId === region.id ? 'selected' : ''}`} style={{ left: region.x * zoom, top: region.y * zoom, width: region.width * zoom, height: region.height * zoom }} onPointerDown={event => { setSelectedId(region.id); startDrag(event, 'move', region) }}><span className="region-tag">{region.name}</span>{selectedId === region.id && HANDLES.map(handle => <span key={handle} className={`handle handle-${handle}`} onPointerDown={event => startDrag(event, handle, region)} />)}</div>)}{draft && <div className="region drafting" style={{ left: draft.x * zoom, top: draft.y * zoom, width: draft.width * zoom, height: draft.height * zoom }} />}</div> : <div className="drop-prompt"><div className="drop-mark">▦</div><strong>Drop a PNG to begin</strong><p>Your image stays in this browser. No upload, no server processing.</p><button className="secondary" onClick={() => fileRef.current?.click()}>Choose a file</button></div>}
           {dragOver && <div className="drop-cover">Release to import PNG</div>}
         </div><div className="stage-footer"><span>{source ? `${source.width} × ${source.height} PX` : 'WAITING FOR SOURCE'}</span><span>NEAREST NEIGHBOUR · ORIGINAL PIXELS</span></div>
       </section>
-      {resizeHandle('right')}
-      <aside className="panel detail-panel" aria-label="Frame and animation controls"><PanelHeader id="inspection" eyebrow="02 / INSPECTOR" title="Frame inspection" expanded={workshopLayout.panels.inspection} onToggle={() => togglePanel('inspection')} />
-        <div id="panel-inspection" hidden={!workshopLayout.panels.inspection}>{selected && source ? <div className="details">
+      {resizeHandle()}
+      <aside className="panel detail-panel" aria-label="Workflow tools">
+        <div id="workflow-panel-inspect" className="workflow-panel" role="tabpanel" aria-labelledby="workflow-tab-inspect" hidden={activeTab !== 'inspect'}>{selected && source ? <div className="details">
+          <div className="section-heading"><div><span className="eyebrow">SELECTED FRAME</span><h2>Crop inspection</h2></div></div>
           <label className="field"><span>Name</span><input value={selected.name} maxLength={48} onChange={event => updateRegion({ ...selected, name: event.target.value })} /></label>
           <div className="field-grid">{(['x', 'y', 'width', 'height'] as const).map(key => <label className="field" key={key}><span>{key === 'width' ? 'Width' : key === 'height' ? 'Height' : key.toUpperCase()}</span><input type="number" min={key === 'width' || key === 'height' ? 1 : 0} max={key === 'x' ? source.width - 1 : key === 'y' ? source.height - 1 : key === 'width' ? source.width - selected.x : source.height - selected.y} value={selected[key]} onChange={event => editNumber(key, event.target.value)} /></label>)}</div>
           <div className="preview-label">SOURCE CROP <span>{selected.width} × {selected.height} PX</span></div>
           <div className="selected-preview checker"><SpriteCanvas image={source.bitmap} region={selected} width={selected.width} height={selected.height} /></div>
-          <div className="detail-actions"><button className="primary" onClick={() => void exportOne(selected)}>Export PNG</button><button className="danger" onClick={() => deleteFrame(selected.id)}>Delete frame</button></div>
-          <p className="help">This PNG exports the source crop only. Animation offsets are set and exported separately below.</p>
-        </div> : <div className="panel-empty details-empty"><span>◇</span><strong>Select a frame</strong><p>Draw on the canvas or choose a frame from the list to edit its exact coordinates.</p></div>}</div>
-        <PanelHeader id="alignment" eyebrow="03 / ANIMATION" title="Animation alignment" expanded={workshopLayout.panels.alignment} onToggle={() => togglePanel('alignment')} />
-        <div id="panel-alignment" className="panel-section" hidden={!workshopLayout.panels.alignment}><p className="section-help">Assign crops, then place each slot on one pixel canvas. Drag the preview or use exact offsets.</p>
-          <div className="alignment-controls"><label className="field"><span>Initial anchor</span><select value={alignmentMode} onChange={event => setAlignmentMode(event.target.value as AlignmentMode)}><option value="bottom">Bottom centre</option><option value="center">Centre</option></select></label><button className="small" disabled={!assigned.some(Boolean)} onClick={() => setOffsets(emptyOffsets())}>Align all to anchor</button><div className="field-grid"><label className="field"><span>Padding</span><input type="number" min="0" max="256" value={padding} onChange={event => setPadding(clamp(Number(event.target.value) || 0, 0, 256))} /></label><label className="field"><span>Min width</span><input type="number" min="0" max="4096" value={minWidth} onChange={event => setMinWidth(clamp(Number(event.target.value) || 0, 0, 4096))} /></label><label className="field"><span>Min height</span><input type="number" min="0" max="4096" value={minHeight} onChange={event => setMinHeight(clamp(Number(event.target.value) || 0, 0, 4096))} /></label></div><p className="layout-size">Shared canvas: {layout.width} × {layout.height} px</p></div></div>
-        <PanelHeader id="preview" title="Animation preview" expanded={workshopLayout.panels.preview} onToggle={() => togglePanel('preview')} />
-        <div id="panel-preview" className="panel-section" hidden={!workshopLayout.panels.preview}>
+          <div className="detail-actions"><button className="danger" onClick={() => deleteFrame(selected.id)}>Delete frame</button></div>
+          <p className="help">Crop coordinates use source-image pixels. Animation placement is edited in Animate.</p>
+        </div> : <div className="panel-empty details-empty"><span>◇</span><strong>Select a frame</strong><p>Draw on the canvas or choose a frame in Extract to edit its exact coordinates.</p></div>}</div>
+        <div id="workflow-panel-animate" className="workflow-panel" role="tabpanel" aria-labelledby="workflow-tab-animate" hidden={activeTab !== 'animate'}>
+        <section className="tool-section"><div className="section-heading"><div><span className="eyebrow">PREVIEW</span><h2>Animation alignment</h2></div></div><p className="section-help">Assign crops, then place each slot on one pixel canvas. Drag the preview or use exact offsets.</p>
+          <div className="alignment-controls"><label className="field"><span>Initial anchor</span><select value={alignmentMode} onChange={event => setAlignmentMode(event.target.value as AlignmentMode)}><option value="bottom">Bottom centre</option><option value="center">Centre</option></select></label><button className="small" disabled={!assigned.some(Boolean)} onClick={() => setOffsets(emptyOffsets())}>Align all to anchor</button><div className="field-grid"><label className="field"><span>Padding</span><input type="number" min="0" max="256" value={padding} onChange={event => setPadding(clamp(Number(event.target.value) || 0, 0, 256))} /></label><label className="field"><span>Min width</span><input type="number" min="0" max="4096" value={minWidth} onChange={event => setMinWidth(clamp(Number(event.target.value) || 0, 0, 4096))} /></label><label className="field"><span>Min height</span><input type="number" min="0" max="4096" value={minHeight} onChange={event => setMinHeight(clamp(Number(event.target.value) || 0, 0, 4096))} /></label></div><p className="layout-size">Shared canvas: {layout.width} × {layout.height} px</p></div>
           <div className={alignmentExpanded ? 'alignment-view expanded' : 'alignment-view'}>
             <div className="alignment-toolbar" aria-label="Alignment preview controls">
               {(['fit', 1, 2, 4, 8] as const).map(value => <button key={value} className={alignmentZoom === value ? 'active' : ''} aria-pressed={alignmentZoom === value} onClick={() => { setAlignmentZoom(value); setAlignmentPan({ x: 0, y: 0 }) }}>{value === 'fit' ? 'Fit' : `${value}×`}</button>)}
@@ -425,23 +424,22 @@ export default function App() {
             </div>
             <div className="alignment-guide-controls"><label className="check-field"><input type="checkbox" checked={centreGuide} onChange={event => setCentreGuide(event.target.checked)} /> Centre line</label><label className="check-field"><input type="checkbox" checked={baselineGuide} onChange={event => setBaselineGuide(event.target.checked)} /> Baseline</label><label className="check-field"><input type="checkbox" checked={pixelGrid} onChange={event => setPixelGrid(event.target.checked)} /> Pixel grid (2×+)</label><label className="field baseline-field"><span>Baseline Y (canvas px)</span><input type="number" min="0" max={layout.height - 1} value={baselineY} onChange={event => setBaselineOffset(clamp(Number(event.target.value) || 0, 0, layout.height - 1) - layout.anchorY)} /></label></div>
           </div>
-        </div>
-        <PanelHeader id="offsets" title="Slot offsets" expanded={workshopLayout.panels.offsets} onToggle={() => togglePanel('offsets')} />
-        <div id="panel-offsets" className="panel-section" hidden={!workshopLayout.panels.offsets}><div className="alignment-controls"><div className="field-grid offset-fields">{(['x', 'y'] as const).map(key => <label className="field" key={key}><span>Slot {activeSlot + 1} {key.toUpperCase()} offset (px)</span><input type="number" min="-4096" max="4096" disabled={!assigned[activeSlot]} value={offsets[activeSlot][key]} onChange={event => editOffset(key, event.target.value)} /></label>)}</div><div className="nudge-controls"><button disabled={!assigned[activeSlot]} onClick={() => nudge(-1, 0)} aria-label="Nudge left one pixel">←</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(0, -1)} aria-label="Nudge up one pixel">↑</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(0, 1)} aria-label="Nudge down one pixel">↓</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(1, 0)} aria-label="Nudge right one pixel">→</button><button disabled={!assigned[activeSlot]} onClick={() => setOffsets(previous => previous.map((offset, index) => index === activeSlot ? { x: 0, y: 0 } : offset))}>Reset slot</button></div><label className="check-field"><input type="checkbox" checked={onion} onChange={event => setOnion(event.target.checked)} /> Onion skin</label><label className="field"><span>Compare with</span><select value={onionReference} disabled={!onion} onChange={event => setOnionReference(event.target.value as 'previous' | 'fixed')}><option value="previous">Previous slot</option><option value="fixed">Fixed slot</option></select></label>{onionReference === 'fixed' && <label className="field"><span>Reference slot</span><select value={fixedReferenceSlot} disabled={!onion} onChange={event => setFixedReferenceSlot(Number(event.target.value))}>{slots.map((id, index) => <option key={index} value={index}>{`Slot ${index + 1}${id ? ` · ${assigned[index]?.name ?? 'Frame'}` : ' · Empty'}`}</option>)}</select></label>}<p className="motion-note">{onion && referenceSlot === activeSlot ? 'Choose another reference slot to see a comparison. ' : ''}Offsets can move pixels outside the canvas. Increase minimum size or padding if artwork is clipped.</p></div>
-          <button className="small aligned-export" disabled={!assigned[activeSlot] || !source} onClick={() => void exportAligned()}>Export aligned slot PNG</button></div>
-        <PanelHeader id="slots" title="Frame slot list" expanded={workshopLayout.panels.slots} onToggle={() => togglePanel('slots')} />
-        <div id="panel-slots" className="panel-section" hidden={!workshopLayout.panels.slots}>
+        </section>
+        <section className="tool-section"><div className="section-heading"><div><span className="eyebrow">ACTIVE SLOT {String(activeSlot + 1).padStart(2, '0')}</span><h2>Position and guides</h2></div></div><div className="alignment-controls"><div className="field-grid offset-fields">{(['x', 'y'] as const).map(key => <label className="field" key={key}><span>Slot {activeSlot + 1} {key.toUpperCase()} offset (px)</span><input type="number" min="-4096" max="4096" disabled={!assigned[activeSlot]} value={offsets[activeSlot][key]} onChange={event => editOffset(key, event.target.value)} /></label>)}</div><div className="nudge-controls"><button disabled={!assigned[activeSlot]} onClick={() => nudge(-1, 0)} aria-label="Nudge left one pixel">←</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(0, -1)} aria-label="Nudge up one pixel">↑</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(0, 1)} aria-label="Nudge down one pixel">↓</button><button disabled={!assigned[activeSlot]} onClick={() => nudge(1, 0)} aria-label="Nudge right one pixel">→</button><button disabled={!assigned[activeSlot]} onClick={() => setOffsets(previous => previous.map((offset, index) => index === activeSlot ? { x: 0, y: 0 } : offset))}>Reset slot</button></div><label className="check-field"><input type="checkbox" checked={onion} onChange={event => setOnion(event.target.checked)} /> Onion skin</label><label className="field"><span>Compare with</span><select value={onionReference} disabled={!onion} onChange={event => setOnionReference(event.target.value as 'previous' | 'fixed')}><option value="previous">Previous slot</option><option value="fixed">Fixed slot</option></select></label>{onionReference === 'fixed' && <label className="field"><span>Reference slot</span><select value={fixedReferenceSlot} disabled={!onion} onChange={event => setFixedReferenceSlot(Number(event.target.value))}>{slots.map((id, index) => <option key={index} value={index}>{`Slot ${index + 1}${id ? ` · ${assigned[index]?.name ?? 'Frame'}` : ' · Empty'}`}</option>)}</select></label>}<p className="motion-note">{onion && referenceSlot === activeSlot ? 'Choose another reference slot to see a comparison. ' : ''}Offsets can move pixels outside the canvas. Increase minimum size or padding if artwork is clipped.</p></div></section>
+        <section className="tool-section timeline"><div className="section-heading"><div><span className="eyebrow">8 FRAME LOOP</span><h2>Frame timeline</h2></div></div>
           <div className="play-controls"><button aria-label="Previous frame" disabled={!source} onClick={() => setActiveSlot(index => (index + 7) % 8)}>‹</button><button className="play-button" disabled={!assigned.some(Boolean) || reducedMotion} onClick={() => setPlaying(value => !value)}>{playing ? 'Pause' : 'Play'}</button><button aria-label="Next frame" disabled={!source} onClick={() => setActiveSlot(index => (index + 1) % 8)}>›</button><label>FPS <input type="number" min="1" max="24" value={fps} onChange={event => setFps(clamp(Number(event.target.value) || 1, 1, 24))} /></label></div>
           {reducedMotion && <p className="motion-note">Automatic playback is off because reduced motion is enabled. Step through frames manually.</p>}
           <div className="slot-grid">{slots.map((id, index) => <label key={index} className={activeSlot === index ? 'slot active' : 'slot'}><span>{String(index + 1).padStart(2, '0')}</span><select aria-label={`Animation frame ${index + 1}`} value={id ?? ''} onFocus={() => setActiveSlot(index)} onChange={event => { const value = event.target.value || null; setSlots(previous => previous.map((item, itemIndex) => itemIndex === index ? value : item)); setOffsets(previous => previous.map((offset, itemIndex) => itemIndex === index ? { x: 0, y: 0 } : offset)); setActiveSlot(index) }}><option value="">Empty</option>{regions.map(region => <option key={region.id} value={region.id}>{region.name}</option>)}</select></label>)}</div><button className="fill-button" disabled={!regions.length} onClick={() => { setSlots(Array.from({ length: 8 }, (_, index) => regions[index]?.id ?? null)); setOffsets(emptyOffsets()); setActiveSlot(0) }}>Fill slots from frame list</button>
+        </section>
         </div>
-        <PanelHeader id="export" eyebrow="04 / OUTPUT" title="Export Animation" expanded={workshopLayout.panels.export} onToggle={() => togglePanel('export')} />
-        <div id="panel-export" className="panel-section export-panel" hidden={!workshopLayout.panels.export}>
+        <div id="workflow-panel-export" className="workflow-panel export-panel" role="tabpanel" aria-labelledby="workflow-tab-export" hidden={activeTab !== 'export'}>
+          <section className="tool-section"><div className="section-heading"><div><span className="eyebrow">INDIVIDUAL ASSETS</span><h2>Frame export</h2></div></div><p className="section-help">Export the selected source crop, or the active animation slot on its aligned canvas.</p><div className="export-actions"><button className="secondary" disabled={!selected || !source} onClick={() => selected && void exportOne(selected)}>Export selected crop PNG</button><button className="secondary" disabled={!assigned[activeSlot] || !source} onClick={() => void exportAligned()}>Export slot {activeSlot + 1} aligned PNG</button></div></section>
+          <section className="tool-section"><div className="section-heading"><div><span className="eyebrow">COMPLETE ANIMATION</span><h2>Sprite sheet and metadata</h2></div></div>
           <label className="field"><span>Animation name</span><input value={animationName} maxLength={100} onChange={event => { setAnimationName(event.target.value); setExportError(null) }} /></label>
           <p className="export-summary">{slots.filter(Boolean).length}/8 frames · {fps} FPS · {layout.width * 8} × {layout.height} px sheet<br />Horizontal · {layout.width} × {layout.height} px per frame</p>
           <p className="section-help">Downloads a transparent PNG and matching JSON. Frames are ordered by slot, with zero-based sheet rectangles and a duration of 1000 / FPS milliseconds.</p>
           {(exportError || exportIssue) && <p className="export-error" role="alert">{exportError ?? exportIssue}</p>}
-          <button className="primary export-button" disabled={!source || exporting} onClick={() => void exportAnimation()}>{exporting ? 'Preparing export…' : 'Export Animation · PNG + JSON'}</button>
+          <button className="primary export-button" disabled={!source || exporting} onClick={() => void exportAnimation()}>{exporting ? 'Preparing export…' : 'Export Animation · PNG + JSON'}</button></section>
         </div>
       </aside>
     </main>
