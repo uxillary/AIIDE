@@ -5,8 +5,9 @@ use std::sync::Mutex;
 use tauri::State;
 
 use crate::project::{OpenProject, IGNORED};
+use candidates::CandidateRegistry;
 
-#[allow(dead_code)] // Discovery is request-local infrastructure; no UI or model caller exists yet.
+#[allow(dead_code)] // Some candidate metadata accessors are exercised only by focused validation tests.
 pub mod candidates;
 
 pub const MAX_TOOL_CALLS: usize = 8;
@@ -136,6 +137,44 @@ pub fn validate_proposal(root: &Path, summary: String, edits: Vec<ProposedReplac
     Ok(PendingProposal { summary: summary.trim().to_owned(), changes: vec![PendingChange { path: first_path, before, after, replacements: edits.len() }] })
 }
 
+fn escape_html_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+pub fn validate_candidate_proposal(root: &Path, registry: &CandidateRegistry, candidate_id: &str, summary: String, replacement: String) -> Result<PendingProposal, String> {
+    if summary.trim().is_empty() || summary.chars().count() > 240 { return Err("Proposal summary is missing or too long.".into()); }
+    if replacement.trim().is_empty() { return Err("Candidate replacement must not be empty.".into()); }
+    let candidate = registry.verify_current(root, candidate_id)?;
+    let path = candidate.path().to_owned();
+    let range = candidate.range();
+    let original = candidate.original().to_owned();
+    let before = registry.snapshot_for(candidate_id).ok_or("Unknown candidate ID.")?.to_owned();
+    if before.get(range.clone()) != Some(original.as_str()) {
+        return Err("Candidate source range is invalid.".into());
+    }
+    let replacement = escape_html_text(&replacement);
+    if path.len() + original.len() + replacement.len() > MAX_PROPOSAL_BYTES {
+        return Err("Proposal exceeds the size limit.".into());
+    }
+    if replacement == original { return Err("Proposal contains a no-op replacement.".into()); }
+    let mut after = String::with_capacity(before.len() - range.len() + replacement.len());
+    after.push_str(&before[..range.start]);
+    after.push_str(&replacement);
+    after.push_str(&before[range.end..]);
+    Ok(PendingProposal { summary: summary.trim().to_owned(), changes: vec![PendingChange { path, before, after, replacements: 1 }] })
+}
+
 pub fn apply_proposal(root: &Path, proposal: &PendingProposal) -> Result<(), String> {
     if proposal.changes.len() != 1 { return Err("Invalid pending proposal.".into()); }
     let change = &proposal.changes[0];
@@ -172,6 +211,19 @@ fn walk(root: &Path, folder: &Path, files: &mut Vec<PathBuf>, max: usize) -> Res
         } else if kind.is_file() && path.starts_with(root) { files.push(path); }
     }
     Ok(false)
+}
+
+pub fn discover_html_candidates(root: &Path, registry: &mut CandidateRegistry) -> Result<usize, String> {
+    let mut files = Vec::new();
+    if walk(root, root, &mut files, MAX_SCAN_FILES)? {
+        return Err("Candidate discovery reached the repository scan limit. Narrow the request before editing.".into());
+    }
+    let html = files.into_iter().filter(|path| path.extension().is_some_and(|extension|
+        extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+    )).collect::<Vec<_>>();
+    if html.is_empty() { return Err("No HTML file is available for candidate editing.".into()); }
+    if html.len() != 1 { return Err("Candidate editing currently requires exactly one HTML file.".into()); }
+    registry.discover_html(root, &relative(root, &html[0]))
 }
 
 pub fn execute(root: &Path, request: &ToolRequest) -> (String, Activity) {
@@ -324,6 +376,42 @@ mod tests {
         assert_eq!(fs::read_to_string(root.join("hello.txt")).unwrap(), "hello\nworld");
         apply_proposal(&root, &proposal).unwrap();
         assert_eq!(fs::read_to_string(root.join("hello.txt")).unwrap(), "Hello\nworld");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn candidate_proposal_replaces_only_the_verified_heading_range() {
+        let root = fixture();
+        let path = root.join("page.html");
+        let before = "<head><title>OrbitNote</title><meta name=\"description\" content=\"Keep me\"></head>\n<body><h1 class=\"hero\">\n  Old <span>heading</span>\n</h1><p>Keep this too.</p></body>";
+        fs::write(&path, before).unwrap();
+        let mut registry = CandidateRegistry::new();
+        assert_eq!(discover_html_candidates(&root, &mut registry).unwrap(), 3);
+        let heading = registry.model_view().into_iter().find(|candidate| candidate.role == candidates::CandidateRole::HeadingOne).unwrap();
+        let proposal = validate_candidate_proposal(&root, &registry, &heading.id, "Update the visible h1 heading.".into(), "Welcome to OrbitNote 2.0".into()).unwrap();
+        assert_eq!(proposal.changes[0].before, before);
+        assert_eq!(proposal.changes[0].after, "<head><title>OrbitNote</title><meta name=\"description\" content=\"Keep me\"></head>\n<body><h1 class=\"hero\">Welcome to OrbitNote 2.0</h1><p>Keep this too.</p></body>");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "proposal construction must not write");
+
+        let rejected = Some(proposal.clone());
+        drop(rejected);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "rejecting a proposal must not write");
+        apply_proposal(&root, &proposal).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), proposal.changes[0].after);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn candidate_proposals_escape_text_and_fail_closed() {
+        let root = fixture();
+        fs::write(root.join("page.html"), "<h1>Original</h1>").unwrap();
+        let mut registry = CandidateRegistry::new();
+        discover_html_candidates(&root, &mut registry).unwrap();
+        let id = registry.model_view()[0].id.clone();
+        let escaped = validate_candidate_proposal(&root, &registry, &id, "Heading".into(), "Tea & <code> \"today\"".into()).unwrap();
+        assert_eq!(escaped.changes[0].after, "<h1>Tea &amp; &lt;code&gt; &quot;today&quot;</h1>");
+        assert_eq!(validate_candidate_proposal(&root, &registry, "unknown", "Heading".into(), "Changed".into()).unwrap_err(), "Unknown candidate ID.");
+        assert!(validate_candidate_proposal(&root, &registry, &id, "Heading".into(), "   ".into()).unwrap_err().contains("empty"));
+        assert!(validate_candidate_proposal(&root, &registry, &id, "Heading".into(), "Original".into()).unwrap_err().contains("no-op"));
+        assert!(validate_candidate_proposal(&root, &registry, &id, "Heading".into(), "x".repeat(MAX_PROPOSAL_BYTES)).unwrap_err().contains("size limit"));
+        fs::write(root.join("page.html"), "<h1>Externally changed</h1>").unwrap();
+        assert!(validate_candidate_proposal(&root, &registry, &id, "Heading".into(), "Changed".into()).unwrap_err().contains("changed since discovery"));
         fs::remove_dir_all(root).unwrap();
     }
     #[test] fn rejects_unsafe_missing_ambiguous_and_noop_proposals() {
