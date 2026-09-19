@@ -3,6 +3,43 @@ import type { Region, Size } from './geometry'
 
 export type GridOptions = { rows: number; columns: number; gapX: number; gapY: number; left: number; right: number; top: number; bottom: number }
 export type AlphaOptions = { joinGap: number; minPixels: number }
+export const MAX_FRAME_COUNT = 256
+
+export type SuggestionAcceptance = { regions: Region[]; suggestions: Region[]; added: number; skipped: number; rejected: number }
+
+function sameRegion(a: Region, b: Region): boolean {
+  return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height
+}
+
+export function validSuggestion(region: Region, size: Size): boolean {
+  return [region.x, region.y, region.width, region.height].every(Number.isInteger)
+    && region.x >= 0 && region.y >= 0 && region.width > 0 && region.height > 0
+    && region.x + region.width <= size.width && region.y + region.height <= size.height
+}
+
+export function eligibleSuggestionCount(regions: Region[], suggestions: Region[], size: Size, maxFrames = MAX_FRAME_COUNT): number {
+  const accepted = [...regions]
+  let count = 0
+  for (const suggestion of suggestions) {
+    if (!validSuggestion(suggestion, size) || accepted.some(region => sameRegion(region, suggestion)) || accepted.length >= maxFrames) continue
+    accepted.push(suggestion)
+    count++
+  }
+  return count
+}
+
+export function acceptAllSuggestions(regions: Region[], suggestions: Region[], size: Size, createId: () => string, maxFrames = MAX_FRAME_COUNT): SuggestionAcceptance {
+  const accepted = [...regions]
+  let added = 0, skipped = 0, rejected = 0
+  for (const suggestion of suggestions) {
+    if (!validSuggestion(suggestion, size)) { rejected++; continue }
+    if (accepted.some(region => sameRegion(region, suggestion))) { skipped++; continue }
+    if (accepted.length >= maxFrames) { rejected++; continue }
+    accepted.push({ ...suggestion, id: createId() })
+    added++
+  }
+  return { regions: accepted, suggestions: [], added, skipped, rejected }
+}
 
 export function gridSuggestions(size: Size, options: GridOptions): Region[] {
   const rows = Math.max(1, Math.min(64, Math.round(options.rows)))
@@ -69,9 +106,10 @@ export function alphaSuggestions(source: Pixels, options: AlphaOptions): Region[
   return [...groups.values()].filter(island => island.pixels >= Math.max(1, options.minPixels)).sort((a, b) => a.y - b.y || a.x - b.x).slice(0, 128).map((island, index) => ({ id: `suggestion-alpha-${index}`, name: `Island ${index + 1}`, x: island.x, y: island.y, width: island.right - island.x, height: island.bottom - island.y }))
 }
 
-export function acceptSuggestion(regions: Region[], suggestions: Region[], id: string, newId: string): { regions: Region[]; suggestions: Region[] } {
+export function acceptSuggestion(regions: Region[], suggestions: Region[], id: string, newId: string, size?: Size, maxFrames = MAX_FRAME_COUNT): { regions: Region[]; suggestions: Region[] } {
   const suggestion = suggestions.find(region => region.id === id)
-  return suggestion ? { regions: [...regions, { ...suggestion, id: newId }], suggestions: suggestions.filter(region => region.id !== id) } : { regions, suggestions }
+  if (!suggestion || (size && !validSuggestion(suggestion, size)) || regions.length >= maxFrames || regions.some(region => sameRegion(region, suggestion))) return { regions, suggestions }
+  return { regions: [...regions, { ...suggestion, id: newId }], suggestions: suggestions.filter(region => region.id !== id) }
 }
 
 export function rejectSuggestion(suggestions: Region[], id: string): Region[] { return suggestions.filter(region => region.id !== id) }

@@ -5,7 +5,7 @@ import ts from 'typescript'
 
 const source = await readFile(new URL('../src/detection.ts', import.meta.url), 'utf8')
 const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText
-const { gridSuggestions, alphaSuggestions, acceptSuggestion, rejectSuggestion } = await import(`data:text/javascript,${encodeURIComponent(code)}`)
+const { gridSuggestions, alphaSuggestions, acceptSuggestion, acceptAllSuggestions, eligibleSuggestionCount, rejectSuggestion } = await import(`data:text/javascript,${encodeURIComponent(code)}`)
 
 test('grid suggestions respect rows, columns, spacing and asymmetric margins', () => {
   const suggestions = gridSuggestions({ width: 50, height: 30 }, { rows: 2, columns: 3, gapX: 2, gapY: 4, left: 3, right: 5, top: 2, bottom: 4 })
@@ -34,4 +34,31 @@ test('suggestions are preview-only until accepted; rejection preserves manual fr
   assert.equal(accepted.suggestions.length, 1)
   assert.deepEqual(rejectSuggestion(accepted.suggestions, accepted.suggestions[0].id), [])
   assert.equal(manual.length, 1)
+})
+
+test('bulk acceptance adds only valid unique source regions and reports every outcome', () => {
+  const manual = [{ id: 'manual', name: 'Handmade', x: 0, y: 0, width: 4, height: 4 }]
+  const suggestions = [
+    { id: 'duplicate', name: 'Duplicate', x: 0, y: 0, width: 4, height: 4 },
+    { id: 'valid', name: 'Valid', x: 4, y: 0, width: 4, height: 4 },
+    { id: 'repeated', name: 'Repeated', x: 4, y: 0, width: 4, height: 4 },
+    { id: 'outside', name: 'Outside', x: 7, y: 0, width: 2, height: 4 },
+  ]
+  let id = 0
+  assert.equal(eligibleSuggestionCount(manual, suggestions, { width: 8, height: 4 }), 1)
+  const result = acceptAllSuggestions(manual, suggestions, { width: 8, height: 4 }, () => `new-${++id}`)
+  assert.deepEqual(result.regions, [manual[0], { ...suggestions[1], id: 'new-1' }])
+  assert.deepEqual([result.added, result.skipped, result.rejected], [1, 2, 1])
+  assert.deepEqual(result.suggestions, [])
+  assert.deepEqual(manual, [{ id: 'manual', name: 'Handmade', x: 0, y: 0, width: 4, height: 4 }])
+})
+
+test('bulk acceptance respects the frame limit and repeated acceptance adds nothing', () => {
+  const existing = [{ id: 'a', name: 'A', x: 0, y: 0, width: 1, height: 1 }]
+  const suggestions = [{ id: 'b', name: 'B', x: 1, y: 0, width: 1, height: 1 }, { id: 'c', name: 'C', x: 2, y: 0, width: 1, height: 1 }]
+  const first = acceptAllSuggestions(existing, suggestions, { width: 3, height: 1 }, () => 'new', 2)
+  assert.deepEqual([first.added, first.skipped, first.rejected], [1, 0, 1])
+  const repeated = acceptAllSuggestions(first.regions, suggestions, { width: 3, height: 1 }, () => 'unused', 2)
+  assert.deepEqual([repeated.added, repeated.skipped, repeated.rejected], [0, 1, 1])
+  assert.equal(repeated.regions.length, 2)
 })
