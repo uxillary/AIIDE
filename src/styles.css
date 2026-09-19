@@ -78,6 +78,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .connection-state { color: #8a837b; font-family: ui-monospace, monospace; font-size: 10px; font-weight: 600; }
 .workspace-controls { display: flex; align-items: center; gap: 8px; color: #827d76; font-family: ui-monospace, monospace; font-size: 10px; }
 .workspace-controls label { color: #7b9487; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.image-model-label { max-width: 330px; overflow: hidden; color: #9caaa2; text-overflow: ellipsis; white-space: nowrap; }
 .model-select { max-width: 230px; min-width: 148px; height: 30px; border: 1px solid #35403a; border-radius: 4px; background: #1b201d; padding: 5px 24px 5px 8px; color: #eeeae4; font-family: ui-monospace, monospace; font-size: 11px; }
 .model-select:disabled { color: #78716c; }
 .small-button, .icon-button, .reject-button { border: 1px solid #35403a; border-radius: 4px; background: #1b201d; color: #b3ada5; font-size: 11px; }
@@ -128,6 +129,9 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .activity-message { color: #a8a29e; font-size: 11px; }
 .activity-step { margin-top: 5px; color: #78716c; font-family: ui-monospace, monospace; font-size: 10px; }
 .chat-composer { flex: none; padding: 14px 18px 12px; border-top: 1px solid #272c29; background: #151816; box-shadow: 0 -1px 0 rgb(110 231 183 / 4%); }
+.composer-mode { display: inline-flex; margin-bottom: 9px; border: 1px solid #303a34; border-radius: 5px; background: #111512; padding: 2px; }
+.composer-mode button { min-width: 58px; border: 0; border-radius: 3px; background: transparent; padding: 5px 9px; color: #78716c; font-family: ui-monospace, monospace; font-size: 10px; font-weight: 700; letter-spacing: .06em; }
+.composer-mode button[aria-pressed="true"] { background: #26362f; color: #a8efbd; }
 .composer-row { display: flex; align-items: flex-end; gap: 11px; }
 .composer-error { margin-bottom: 8px; color: #f87171; font-size: 12px; }
 .prompt-input { min-height: 70px; max-height: 180px; flex: 1; resize: vertical; border: 1px solid #38443d; border-radius: 6px; background: #1a1f1c; padding: 11px 12px; color: #eeeae4; font-size: 13px; line-height: 1.5; outline: none; }
@@ -138,6 +142,22 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .composer-hint { margin-top: 8px; color: #6f6963; font-size: 11px; }
 .composer-hint kbd { border: 1px solid #303a34; border-bottom-color: #222923; background: #111512; padding: 1px 5px; color: #a9b8ae; font-family: ui-monospace, monospace; font-size: 10px; }
 .composer-hint span { color: #434943; }
+
+.image-result-card { max-width: 680px; overflow: hidden; border: 1px solid #324139; border-radius: 6px; background: #0d110e; }
+.image-result-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid #29352e; padding: 9px 11px; font-size: 11px; }
+.image-result-heading span { color: #86efac; font-family: ui-monospace, monospace; font-size: 9px; font-weight: 800; letter-spacing: .12em; }
+.image-result-heading strong { color: #b9b3ab; font-weight: 650; }
+.image-result-failed, .image-result-cancelled { border-color: #513837; }
+.image-preview { display: block; width: 100%; max-height: 560px; background: #090b09; object-fit: contain; }
+.image-preview-placeholder { display: grid; min-height: 240px; place-items: center; color: #78716c; font-size: 12px; }
+.image-progress { display: flex; align-items: center; gap: 9px; padding: 15px 12px; color: #aaa39b; font-size: 12px; }
+.image-error { margin: 11px 12px 0; color: #fca5a5; font-size: 11px; line-height: 1.5; }
+.image-save-row { display: flex; align-items: stretch; gap: 8px; padding: 12px 12px 0; }
+.image-save-row input { min-width: 0; flex: 1; border: 1px solid #38443d; border-radius: 5px; background: #171c18; padding: 8px 9px; color: #eeeae4; font-family: ui-monospace, monospace; font-size: 11px; }
+.image-saved-path { padding: 11px 12px 0; color: #8ed4a6; font-size: 11px; }
+.image-saved-path code { color: #c5e8d1; font-family: ui-monospace, monospace; }
+.image-actions { display: flex; align-items: center; gap: 8px; padding: 10px 12px 0; }
+.image-result-meta { padding: 10px 12px 11px; color: #625e59; font-family: ui-monospace, monospace; font-size: 9px; }
 
 .changes-panel { width: 322px; flex: none; overflow-y: auto; border-left: 1px solid #272c29; background: #151816; }
 .changes-review { padding: 15px; }

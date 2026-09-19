@@ -4,6 +4,7 @@ mod repository;
 mod model_profiles;
 mod model_provider;
 mod benchmark;
+mod image_generation;
 
 pub fn run_benchmark_cli() -> Result<(), String> { benchmark::run_cli() }
 
@@ -13,8 +14,9 @@ pub fn run() {
         .manage(project::OpenProject::default())
         .manage(repository::PendingChanges::default())
         .manage(ollama::AgentDebug::default())
+        .manage(image_generation::ImageGenerationState::default())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![project::inspect_project, ollama::ollama_status, ollama::ollama_chat, ollama::set_agent_debug, ollama::agent_debug_status, ollama::latest_agent_trace, repository::apply_pending_change, repository::reject_pending_change])
+        .invoke_handler(tauri::generate_handler![project::inspect_project, ollama::ollama_status, ollama::ollama_chat, ollama::set_agent_debug, ollama::agent_debug_status, ollama::latest_agent_trace, repository::apply_pending_change, repository::reject_pending_change, image_generation::image_generation_status, image_generation::start_image_generation, image_generation::get_image_generation, image_generation::get_image_preview, image_generation::cancel_image_generation, image_generation::reject_generated_image, image_generation::save_generated_image])
         .run(tauri::generate_context!())
         .expect("failed to start AIIDE");
 }
