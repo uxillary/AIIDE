@@ -277,8 +277,11 @@ impl EvidenceRequirement {
             EvidenceKind::Listing => listings > 0,
             EvidenceKind::Inspection => searches > 0 || !read_paths.is_empty(),
             EvidenceKind::Read => self.filename.as_ref().map_or(!read_paths.is_empty(), |filename| {
-                read_paths.iter().any(|path| std::path::Path::new(path).file_name()
-                    .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(filename)))
+                read_paths.iter().any(|path| {
+                    let path = std::path::Path::new(path);
+                    path.file_name().is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(filename))
+                        || (!filename.contains('.') && path.file_stem().is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case(filename)))
+                })
             }),
         }
     }
@@ -301,11 +304,17 @@ fn classify_current_request(prompt: &str) -> RequestPlan {
     let text = prompt.trim().to_ascii_lowercase();
     let edit = text.split(['.', '!', '?', ';', '\n']).any(is_edit_clause);
     let selection = requests_candidate_selection(prompt, if edit { RequestIntent::Edit } else { RequestIntent::Answer });
-    let repository = edit || selection || file_reference(prompt).is_some() || has_path_reference(prompt)
-        || ["this project", "the project", "look at the css", "look at the code", "source code", "codebase", "project structure", "repository structure", "repository", "what files", "which files", "list files", "files in ", "files are in ", "directory", "folder", "page heading", "mobile menu", "main heading", "signup form"].iter().any(|phrase| text.contains(phrase));
+    let repository = edit || selection || file_reference(prompt).is_some() || incomplete_file_reference(prompt).is_some() || has_path_reference(prompt)
+        || ["this project", "the project", "this site", "the site", "this page", "the page", "look at the css", "look at the code", "source code", "codebase", "project structure", "repository structure", "repository", "what files", "which files", "list files", "files in ", "files are in ", "directory", "folder", "page heading", "mobile menu", "main heading", "signup form"].iter().any(|phrase| text.contains(phrase));
     let general = matches!(text.as_str(), "hey" | "hello" | "hi" | "how are you" | "how are you?")
-        || text.starts_with("what is ") || text.starts_with("what's ") || text.starts_with("explain ");
+        || text.starts_with("what is ") || text.starts_with("what's ") || text.starts_with("explain ")
+        || is_drafting_request(&text);
     RequestPlan { scope: if repository { RequestScope::Repository } else if general { RequestScope::General } else { RequestScope::Unknown }, intent: if edit { RequestIntent::Edit } else { RequestIntent::Answer } }
+}
+
+fn is_drafting_request(text: &str) -> bool {
+    ["write ", "write me ", "draft ", "draft me ", "create a paragraph", "create a new paragraph"]
+        .iter().any(|phrase| text.starts_with(phrase) || text.starts_with(&format!("please {phrase}")))
 }
 
 fn has_path_reference(prompt: &str) -> bool {
@@ -328,19 +337,37 @@ fn file_reference(prompt: &str) -> Option<String> {
     }).next()
 }
 
+fn incomplete_file_reference(prompt: &str) -> Option<String> {
+    let text = prompt.to_ascii_lowercase();
+    let asks_about_contents = ["heading", "contain", "content", "button", "colour", "color", "text", "title"]
+        .iter().any(|term| text.contains(term));
+    if !asks_about_contents { return None; }
+    prompt.split_whitespace().find_map(|word| {
+        let token = word.trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_' && character != '-');
+        ["index", "main", "app", "styles", "style"].iter().any(|stem| token.eq_ignore_ascii_case(stem)).then(|| token.to_owned())
+    })
+}
+
 fn evidence_requirement(prompt: &str, scope: RequestScope) -> EvidenceRequirement {
     if scope != RequestScope::Repository { return EvidenceRequirement::none(); }
     let text = prompt.trim().to_ascii_lowercase();
     if ["what files", "which files", "list files", "files are in ", "files in ", "directory contents", "folder contents"]
         .iter().any(|phrase| text.contains(phrase)) {
         EvidenceRequirement { kind: EvidenceKind::Listing, filename: None }
-    } else if let Some(filename) = file_reference(prompt) {
+    } else if let Some(filename) = file_reference(prompt).or_else(|| incomplete_file_reference(prompt)) {
         EvidenceRequirement { kind: EvidenceKind::Read, filename: Some(filename) }
     } else if ["find ", "locate ", "search ", "where is ", "where's "].iter().any(|phrase| text.starts_with(phrase)) {
         EvidenceRequirement { kind: EvidenceKind::Inspection, filename: None }
     } else {
         EvidenceRequirement { kind: EvidenceKind::Read, filename: None }
     }
+}
+
+fn unsupported_insertion_request(prompt: &str, intent: RequestIntent) -> bool {
+    if intent != RequestIntent::Edit { return false; }
+    let text = prompt.trim().to_ascii_lowercase();
+    text.contains("paragraph") && ["add ", "insert ", "append ", "create "]
+        .iter().any(|verb| text.starts_with(verb) || text.starts_with(&format!("please {verb}")))
 }
 
 fn agent_schema(project_open: bool, edit_intent: bool, has_read_evidence: bool, answer_allowed: bool) -> Value {
@@ -394,6 +421,16 @@ fn parse_action(raw: &str) -> Result<AgentAction, &'static str> {
         "propose_change" if reply.path.is_none() && reply.query.is_none() && reply.answer.is_none() && reply.summary.as_ref().is_some_and(|value| !value.trim().is_empty() && value.chars().count() <= 160) && reply.changes.as_ref().is_some_and(|value| !value.is_empty()) => Ok(AgentAction::Propose(reply.summary.unwrap(), reply.changes.unwrap())),
         "propose_change" => Err("For action='propose_change', include changes; each change needs path, old_text, and new_text. Copy old_text exactly from inspected content and keep summary to one short sentence."),
         _ => Err("invalid or ambiguous action fields"),
+    }
+}
+
+fn validate_action_for_state(action: &AgentAction, project_open: bool, edit_intent: bool, has_read_evidence: bool, answer_allowed: bool) -> Result<(), &'static str> {
+    match action {
+        AgentAction::Answer(_) if project_open && edit_intent => Err("an edit request cannot finish with an answer"),
+        AgentAction::Answer(_) if project_open && !answer_allowed => Err("repository evidence is required before answering"),
+        AgentAction::Propose(_, _) if !project_open || !edit_intent || !has_read_evidence => Err("propose_change requires an open project, edit intent, and a successful read_file"),
+        AgentAction::List(_) | AgentAction::Search(_) | AgentAction::Read(_) if !project_open => Err("repository tools require an open project"),
+        _ => Ok(()),
     }
 }
 
@@ -465,7 +502,7 @@ async fn agent_turn(provider: &impl ModelProvider, model: &str, exchange: &mut V
         let result = chat_turn(provider, model, exchange, agent_schema(project_open, edit_intent, has_read_evidence, answer_allowed), temperature, &stage, trace).await?;
         let parsed = if result.done_reason.as_deref() == Some("length") { Err("response exceeded the model output limit") }
             else { parse_action(&result.message.content) };
-        match parsed {
+        match parsed.and_then(|action| validate_action_for_state(&action, project_open, edit_intent, has_read_evidence, answer_allowed).map(|()| action)) {
             Ok(action) => { debug_log(trace, "protocol", format!("JSON parsing: PASSED\nSchema validation: PASSED\nSemantic validation: PASSED\nSelected action: {}", action_name(&action))); return Ok((result, action)); }
             Err(reason) => {
                 last_failure = Some((reason, response_shape(&result.message.content)));
@@ -644,6 +681,14 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
         return Ok(ChatResponse { model, content: if root.is_some() { "I can inspect this project and prepare focused changes for your review. Only the Apply button can write them." } else { "No project is open, so I cannot inspect or propose changes to files." }.into(), activity: vec![], proposal: None });
     }
     let plan = classify_current_request(&last_prompt);
+    if unsupported_insertion_request(&last_prompt, plan.intent) {
+        return Ok(ChatResponse {
+            model,
+            content: "I can draft the paragraph, but the current editing workflow cannot insert new content into a file. Ask me to write a paragraph you could add, then add it manually. Existing supported heading replacements can still be prepared for review.".into(),
+            activity: vec![],
+            proposal: None,
+        });
+    }
     match candidate_heading_edit_route(&last_prompt, plan.intent) {
         CandidateEditRoute::Heading if root.is_some() => {
             return run_candidate_heading_edit(provider, model, &last_prompt, root.as_deref().unwrap(), pending, app, debug_trace).await;
@@ -1077,13 +1122,18 @@ mod tests {
 
     #[test]
     fn natural_repository_requests_and_general_chat_are_classified_conservatively() {
-        for prompt in ["summarize index.html", "what does styles.css do?", "find the page heading", "what files are in src?"] {
+        for prompt in ["summarize index.html", "what does styles.css do?", "find the page heading", "what files are in src?", "what is the heading on index?", "please create a new paragraph relevant to the site", "what could i add to this site?"] {
             assert_eq!(classify_current_request(prompt).scope, RequestScope::Repository, "{prompt}");
         }
-        for prompt in ["hey", "how are you?", "explain what HTML is", "what is CSS?"] {
+        for prompt in ["hey", "how are you?", "explain what HTML is", "what is CSS?", "Write a paragraph about a fictional productivity app.", "Write me a paragraph I could add."] {
             assert_ne!(classify_current_request(prompt).scope, RequestScope::Repository, "{prompt}");
         }
+        assert_eq!(classify_current_request("Add a paragraph to src/index.html."), RequestPlan { scope: RequestScope::Repository, intent: RequestIntent::Edit });
         assert_eq!(evidence_requirement("summarize index.html", RequestScope::Repository), EvidenceRequirement { kind: EvidenceKind::Read, filename: Some("index.html".into()) });
+        let incomplete = evidence_requirement("what is the heading on index?", RequestScope::Repository);
+        assert_eq!(incomplete, EvidenceRequirement { kind: EvidenceKind::Read, filename: Some("index".into()) });
+        assert!(!incomplete.satisfied(1, 0, &["src/main.html".into()]));
+        assert!(incomplete.satisfied(1, 0, &["src/index.html".into()]));
         let named = evidence_requirement("what does styles.css do?", RequestScope::Repository);
         assert!(!named.satisfied(1, 1, &["src/index.html".into()]));
         assert!(named.satisfied(0, 0, &["src/styles.css".into()]));
@@ -1092,6 +1142,15 @@ mod tests {
         assert!(evidence_requirement("find the page heading", RequestScope::Repository).satisfied(0, 1, &[]));
         assert_eq!(evidence_requirement("what files are in src?", RequestScope::Repository).kind, EvidenceKind::Listing);
         assert_eq!(classify_current_request("inspect src/components").scope, RequestScope::Repository);
+    }
+
+    #[test]
+    fn action_semantics_reject_answers_without_required_repository_evidence() {
+        let answer = AgentAction::Answer("unsupported claim".into());
+        assert_eq!(validate_action_for_state(&answer, true, false, false, false), Err("repository evidence is required before answering"));
+        assert!(validate_action_for_state(&answer, true, false, true, true).is_ok());
+        let proposal = AgentAction::Propose("x".into(), vec![]);
+        assert!(validate_action_for_state(&proposal, true, true, false, false).is_err());
     }
 
     fn grounding_fixture(label: &str) -> std::path::PathBuf {
@@ -1380,6 +1439,51 @@ mod tests {
     }
 
     #[test]
+    fn filename_stem_question_discovers_and_reads_the_matching_file_before_answering() {
+        let root = grounding_fixture("filename-stem");
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"answer","answer":"The heading is invented."}"#,
+            r#"{"action":"list_files","path":""}"#,
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            r#"{"action":"answer","answer":"The heading is Welcome."}"#,
+            r#"{"action":"answer","answer":"The heading is Welcome."}"#,
+        ]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![
+                ChatMessage { role: "user".into(), content: "Write me a paragraph I could add.".into() },
+                ChatMessage { role: "assistant".into(), content: "Here is a draft paragraph.".into() },
+                ChatMessage { role: "user".into(), content: "what is the heading on index?".into() },
+            ],
+            Some(root.clone()), None, None, None,
+        )).unwrap();
+        assert!(response.activity.iter().any(|item| item.label == "Project structure"));
+        assert!(response.activity.iter().any(|item| item.label == "Read: src/index.html"));
+        assert!(response.content.contains("Welcome"));
+        assert!(!response.content.contains("invented"));
+        assert!(response.content.contains("Files actually inspected: src/index.html"));
+        let first_actions = provider.formats.lock().unwrap()[0]["properties"]["action"]["enum"].as_array().unwrap().clone();
+        assert!(!first_actions.iter().any(|action| action == "answer"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_repository_path_is_read_before_its_contents_are_described() {
+        let root = grounding_fixture("exact-path");
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            r#"{"action":"answer","answer":"It contains a Welcome heading."}"#,
+            r#"{"action":"answer","answer":"It contains a Welcome heading."}"#,
+        ]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "What does src/index.html contain?".into() }],
+            Some(root.clone()), None, None, None,
+        )).unwrap();
+        assert_eq!(response.activity.iter().filter(|item| item.label == "Read: src/index.html").count(), 1);
+        assert!(response.content.contains("Welcome"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn directory_listing_is_sufficient_without_unnecessary_reads() {
         let root = grounding_fixture("directory-listing");
         let provider = StubProvider::new(&["test-model"], &[
@@ -1410,6 +1514,56 @@ mod tests {
         )).unwrap();
         assert!(response.activity.is_empty());
         assert_eq!(response.content, "Hey!");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn general_drafting_answers_without_repository_tools() {
+        let root = grounding_fixture("general-drafting");
+        let paragraph = "OrbitNote turns scattered tasks into a calm daily plan.";
+        let response_json = format!(r#"{{"action":"answer","answer":"{paragraph}"}}"#);
+        let provider = StubProvider::new(&["test-model"], &[&response_json, &response_json]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Write a paragraph about a fictional productivity app.".into() }],
+            Some(root.clone()), None, None, None,
+        )).unwrap();
+        assert!(response.activity.is_empty());
+        assert_eq!(response.content, paragraph);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_specific_drafting_reads_project_content_and_returns_copy_without_a_proposal() {
+        let root = grounding_fixture("project-drafting");
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            r#"{"action":"answer","answer":"Welcome visitors with a short note about the product."}"#,
+            r#"{"action":"answer","answer":"Welcome visitors with a short note about the product."}"#,
+        ]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "please create a new paragraph relevant to the site".into() }],
+            Some(root.clone()), None, None, None,
+        )).unwrap();
+        assert!(response.proposal.is_none());
+        assert!(response.activity.iter().any(|item| item.label == "Read: src/index.html"));
+        assert!(response.content.contains("Welcome visitors"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsupported_paragraph_insertion_explains_the_actual_limit_without_model_or_file_mutation() {
+        let root = grounding_fixture("unsupported-insertion");
+        let original = std::fs::read_to_string(root.join("src/index.html")).unwrap();
+        let provider = StubProvider::new(&["test-model"], &[]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Add a paragraph to src/index.html.".into() }],
+            Some(root.clone()), None, None, None,
+        )).unwrap();
+        assert!(response.proposal.is_none());
+        assert!(response.content.contains("can draft the paragraph"));
+        assert!(response.content.contains("cannot insert new content"));
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), original);
         std::fs::remove_dir_all(root).unwrap();
     }
 

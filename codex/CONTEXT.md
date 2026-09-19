@@ -6,6 +6,8 @@ AIIDE is the current repository/application name. **Elma** is its local AI codin
 
 The frontend uses React, TypeScript, Vite, and Tailwind CSS; the desktop backend uses Tauri 2 and Rust. Local inference runs through Ollama, primarily tested with `qwen2.5-coder:7b`. The design should allow interchangeable local models. Users can open a project, inspect its file tree and Git summary, and ask Elma questions. Elma can request bounded `list_files`, `search_files`, and `read_file` operations. The current experimental editing path lets Elma propose up to four exact replacements in one existing UTF-8 text file. Rust validates the path and unique source text, captures the original snapshot, and generates a reviewable pending change. Only the user's Apply action writes, after a stale-snapshot check. File creation, multi-file edits, command execution, and Git mutations are not implemented. [REPO-MAP.md](REPO-MAP.md) identifies current owners; `src-tauri/src/repository.rs` defines current limits.
 
+Selecting a file in the sidebar currently opens a separate read-only viewer. The selected path and viewer contents are not supplied to Elma; repository questions still require the agent's bounded discovery and read tools.
+
 ## Application-led direction
 
 Experiments on `fix/reliable-editing` improved source validation but did not achieve reliable real-world editing acceptance: the small model still selected incorrect source targets. That branch is historical/experimental and is not approved for merging. Do not treat its implementation as the active design.

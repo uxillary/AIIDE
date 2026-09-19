@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "name": "changes-applied",
+  "frameCount": 8,
+  "fps": 8,
+  "frameDurationMs": 125,
+  "spriteSheet": "changes-applied.png",
+  "sheet": {
+    "width": 1176,
+    "height": 174
+  },
+  "cell": {
+    "width": 147,
+    "height": 174
+  },
+  "layout": "horizontal",
+  "frames": [
+    {
+      "slot": 1,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 147,
+        "height": 174
+      }
+    },
+    {
+      "slot": 2,
+      "rect": {
+        "x": 147,
+        "y": 0,
+        "width": 147,
+        "height": 174
+      }
+    },
+    {
+      "slot": 3,
+      "rect": {
+        "x": 294,
+        "y": 0,
+        "width": 147,
+        "height": 174
+      }
+    },
+    {
+      "slot": 4,
+      "rect": {
+        "x": 441,
+        "y": 0,
+        "width": 147,
+        "height": 174
+      }
+    },
+    {
+      "slot": 5,
+      "rect": {
+        "x": 588,
+        "y": 0,
+        "width": 147,
+        "height": 174
+      }
+    },
+    {
+      "slot": 6,
+      "rect": {
+        "x": 735,
+        "y": 0,
+        "width": 147,
+        "height": 174
+      }
+    },
+    {
+      "slot": 7,
+      "rect": {
+        "x": 882,
+        "y": 0,
+        "width": 147,
+        "height": 174
+      }
+    },
+    {
+      "slot": 8,
+      "rect": {
+        "x": 1029,
+        "y": 0,
+        "width": 147,
+        "height": 174
+      }
+    }
+  ]
+}
