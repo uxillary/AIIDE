@@ -1,83 +1,77 @@
-# ── RUN ELMA / AIIDE ─────────────────────────────
+# AIIDE developer command cheatsheet
 
+Run commands from the repository root unless noted.
+
+## Run AIIDE
+
+```powershell
 npm run tauri dev
+```
 
-# ── FRONTEND CHECKS ──────────────────────────────
+## Frontend checks
 
-npm run dev
-npm run build
-npm run typecheck
+```powershell
 npm run lint
+npm run typecheck
+npm run build
+```
 
-# ── RUST / TAURI CHECKS ──────────────────────────
+## Rust checks
 
-cd src-tauri
+```powershell
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
+```
 
-cargo check
-cargo test
+Six live Ollama acceptance tests are opt-in/ignored by the ordinary Rust suite.
 
-cd ..
+## Ollama
 
-# ── OLLAMA ───────────────────────────────────────
-
-# Check Ollama version
-
+```powershell
 ollama --version
-
-# Installed models
-
 ollama list
-
-# Models currently loaded/running
-
 ollama ps
-
-# Test Qwen directly
-
-ollama run qwen2.5-coder:7b
-
-# Download model
-
 ollama pull qwen2.5-coder:7b
-
-# Stop loaded model
-
+ollama run qwen2.5-coder:7b
 ollama stop qwen2.5-coder:7b
+```
 
-# ── GPU ──────────────────────────────────────────
+## Agent benchmark
 
-# Check GPU + VRAM usage
+```powershell
+npm run benchmark -- --model qwen2.5-coder:7b
+npm run benchmark -- --model qwen2.5-coder:7b --case edit
+```
 
+OpenRouter is available to the benchmark backend, not the desktop provider selector. When intentionally testing it, supply `OPENROUTER_API_KEY` through the process environment and never save or share the key:
+
+```powershell
+npm run benchmark -- --provider openrouter --model vendor/model-id
+```
+
+## GPU diagnostics
+
+```powershell
 nvidia-smi
-
-# Continuously refresh GPU stats
-
 nvidia-smi -l 1
+```
 
-# ── GIT ──────────────────────────────────────────
+## Git inspection
 
-git status
+```powershell
+git status --short --branch
 git diff
 git diff --check
 git log --oneline -10
+```
 
-# ── GOOD FULL CHECK BEFORE COMMIT ────────────────
+## Full local check
 
-npm run typecheck
+```powershell
 npm run lint
+npm run typecheck
 npm run build
-cd src-tauri
-cargo test
-cargo check
-cd ..
+cargo test --manifest-path src-tauri/Cargo.toml
 git diff --check
-git status
-
-# ── RUN ELMA / AIIDE ─────────────────────────────
-
-npm run tauri dev
-change the main heading to "Welcome to the AIIDE Sandbox". make only that change and prepare it for review
-
-benchmark
-
-npm run benchmark -- --model qwen2.5-coder:7b --case edit
+git status --short
+```
