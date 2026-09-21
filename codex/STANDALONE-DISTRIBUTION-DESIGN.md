@@ -8,7 +8,7 @@ A normal supported user should be able to install AIIDE, understand optional cap
 
 The preferred shape is a relatively small signed AIIDE installer plus optional, separately acquired runtimes and models. Multi-gigabyte model files should not all be bundled into the primary installer. Existing compatible Ollama and ComfyUI installations remain valid choices, and provider boundaries must allow alternatives later.
 
-This document defines release architecture, not a promise that every runtime can or will be installed by AIIDE.
+For image generation, the target experience is: install AIIDE, optionally enable image generation, approve the required downloads, let AIIDE configure the engine and model, and generate entirely through Elma. This document defines the **PLANNED** release architecture; that experience is not implemented yet.
 
 ## Confirmed direction
 
@@ -18,7 +18,11 @@ This document defines release architecture, not a promise that every runtime can
 - Cloud/GitHub capabilities do not inherently require a local model.
 - Downloads or installations require explicit consent after size, storage, licence, source, and hardware implications are shown.
 - AIIDE should detect and reuse compatible existing engines before offering managed installation.
+- Application-managed ComfyUI is the selected initial image-engine direction. It remains an optional component separate from the primary installer.
+- External user-managed ComfyUI remains supported, and AIIDE must never terminate, update, overwrite, repair, or uninstall an externally owned runtime.
 - Text, image, editing, and vision providers remain replaceable.
+- ComfyUI is an initial engine behind the image-provider boundary, not a permanent architectural dependency; fully embedded inference is **DEFERRED** for investigation.
+- SDXL 1.0 remains the implemented prototype and acceptance baseline, not the selected production default model.
 - Runtime/model failures must degrade the affected capability rather than prevent the application from opening.
 - Packaging technology, supported version matrices, and redistribution rights remain open until investigated and tested.
 
@@ -31,7 +35,7 @@ This document defines release architecture, not a promise that every runtime can
 | C. Application-managed runtimes | AIIDE downloads/installs approved optional runtimes/models, owns compatible configuration, and can start/stop managed processes. | Cohesive setup and diagnostics; reproducible versions. | Large security, update, process, licence, support, recovery, and storage responsibilities. |
 | D. Fully embedded inference | Inference libraries run inside or beside the application without a separately visible service. | Potentially simpler surface and tighter lifecycle control. | Largest packaging footprint and engineering commitment; hardware backends, updates, model formats, licensing, and crash isolation become AIIDE responsibilities. |
 
-The near-term target is Stage B. For image generation, a pinned official Windows portable ComfyUI archive is the recommended future Stage C substrate, while official Comfy Desktop remains an external user-managed option. Stage C still requires a supported matrix, licence approval, verified artifact manifest, and process-ownership implementation. Stage D is an investigation option, not the default destination.
+The near-term distribution target is Stage B. For image generation, a pinned official Windows portable ComfyUI archive is the selected future Stage C substrate, while official Comfy Desktop remains an external user-managed option. Stage C still requires a supported matrix, licence approval, verified artifact manifest, and process-ownership implementation. Stage D is a **DEFERRED** investigation, not the default destination.
 
 ## Proposed first-run flow
 
@@ -56,14 +60,14 @@ Current engine: Ollama. Guided setup should detect its loopback service and inst
 
 ### Image generation
 
-Current feature-branch engine: ComfyUI with an SDXL 1.0 checkpoint. Guided setup should verify the endpoint, compatible core nodes/API, exact checkpoint, disk space, and practical GPU limits. Eight gigabytes of VRAM is the current lower-bound target rather than a guarantee of performance. A mocked lifecycle test or reachable engine does not prove generation quality or stable memory behaviour.
+Current feature-branch engine: ComfyUI with an SDXL 1.0 checkpoint. SDXL is the implemented prototype and real-GPU acceptance baseline; the production default remains undecided pending model comparison and testing on the RTX 3070 Ti's 8 GB VRAM. Guided setup should verify the endpoint, compatible core nodes/API, selected model workflow and files, disk space, and practical GPU limits. A mocked lifecycle test or reachable engine does not prove generation quality or stable memory behaviour.
 
 The Phase 3 investigation selects a two-mode direction:
 
 - **External mode:** reuse a user-started loopback ComfyUI installation without taking lifecycle ownership. Comfy Desktop may be recommended as an official setup route, but AIIDE does not silently embed or automate it.
-- **Managed mode:** later install an exact, approved official Windows portable NVIDIA release and SDXL checkpoint as separate optional components in AIIDE's per-user application-data area. AIIDE owns only components recorded in its installation manifest and only processes launched in the current managed session.
+- **Managed mode:** later install an exact, approved official Windows portable NVIDIA release and a compatible registry-selected model as separate optional components in AIIDE's per-user application-data area. AIIDE owns only components recorded in its installation manifest and only processes launched in the current managed session.
 
-The first implementation slice remains guided detection, not acquisition. It should expose structured readiness for runtime version/API, required core nodes, checkpoint choice, GPU/device information, and busy state; show a compact setup card only in Image mode; and retain a skip path. Managed download and process control are a separate approval gate.
+The first implementation slice remains guided detection, not acquisition. M08A Stage B should expose separate engine and model readiness, persist external-engine configuration, introduce a small typed model registry, show a compact setup card only in Image mode, and add focused deterministic failure tests. It must retain a skip path. Runtime/model downloads, process management, installer changes, and a broad model-management UI are outside Stage B.
 
 ComfyUI core is GPL-3.0. Comfy Desktop is AGPL-3.0-or-later or commercially licensed. SDXL 1.0 uses CreativeML Open RAIL++-M. Distribution, automated acquisition, notices, source obligations, model restrictions, and any commercial-licence requirement need release/legal approval before Stage C. Technical separation through a loopback API does not replace that review.
 
@@ -76,6 +80,8 @@ OpenRouter is the current backend experiment. It needs a desktop provider select
 GitHub integration needs no local inference model. It should begin with authentication and read-only repository metadata, then add narrowly confirmed remote actions. The user must be able to use local Git without signing in. Credential storage, scopes, account/repository identity, push behaviour, pull-request content, and every remote mutation need explicit boundaries.
 
 ## Runtime and model management requirements
+
+Runtime management and model configuration are separate boundaries. A small internal image-model registry should eventually record a stable identifier and display name, architecture and capabilities, compatible engine versions, model-specific workflow and required nodes, required files and validated sources, sizes and expected SHA-256 hashes, licence/redistribution conditions, GPU/VRAM and storage guidance, and installed/unavailable/incompatible states. Different architectures may require different workflows and dependencies; a checkpoint is not assumed to fit the fixed SDXL workflow merely because ComfyUI can list it.
 
 ### Detection and compatibility
 
@@ -96,7 +102,7 @@ GitHub integration needs no local inference model. It should begin with authenti
 - never execute a downloaded binary before verification;
 - record component source, version, hash, licence, install location, and ownership.
 
-For GitHub-hosted runtime archives, pin a tag and asset name and ship the expected SHA-256 in signed AIIDE release metadata. Never ship a moving `latest` URL. GitHub's release API digest is useful release evidence but must not be the only network-time trust input. For SDXL 1.0, the currently selected checkpoint is 6.94 GB with SHA-256 `31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b` from Stability AI's official Hugging Face repository.
+For GitHub-hosted runtime archives, pin a tag and asset name and ship the expected SHA-256 in signed AIIDE release metadata. Never ship a moving `latest` URL. GitHub's release API digest is useful release evidence but must not be the only network-time trust input. For the SDXL 1.0 acceptance baseline, the current checkpoint is 6.94 GB with SHA-256 `31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b` from Stability AI's official Hugging Face repository. This does not preselect the production model.
 
 Archive extraction must reject absolute paths, traversal, links/reparse points, duplicate destinations, and unexpected layouts. Extract into a fresh staging directory, verify the expected runtime layout, then atomically promote it. Never update a working runtime in place.
 
@@ -188,7 +194,7 @@ Add explicit-consent download guidance or launch approved upstream installers. T
 
 Manage only components whose redistribution, unattended installation, update, process, and recovery stories are approved. Introduce them one capability at a time with clean install/update/uninstall tests.
 
-The candidate image package is a pinned official Windows portable NVIDIA ComfyUI release plus the separately pinned SDXL 1.0 checkpoint. Before implementation, record the exact runtime archive size/digest, extracted size, Python/PyTorch/CUDA and driver matrix, full notices, and licence approval. Install versions side by side, keep models separately retainable, and never remove external installations or user-owned models.
+The selected image-engine package direction is a pinned official Windows portable NVIDIA ComfyUI release plus a separately pinned compatible model selected after comparison and GPU acceptance. Before implementation, record the exact runtime archive size/digest, extracted size, Python/PyTorch/CUDA and driver matrix, model registry record, full notices, and licence approval. Install versions side by side, keep models separately retainable, and never remove external installations or user-owned models.
 
 ### Phase 4 — embedded-engine evaluation
 
@@ -211,7 +217,7 @@ A standalone release is not ready until clean supported Windows machines can:
 
 - exact Windows versions and CPU architectures;
 - installer, updater, signing, and release-channel technology;
-- per-capability external versus managed ownership;
+- external versus managed ownership for capabilities other than the approved image-engine direction;
 - supported Ollama, ComfyUI, model, Python, driver, and GPU matrix;
 - model storage layout, sharing, migration, and retention defaults;
 - artifact hashing/signature and mirror policy;
@@ -222,13 +228,15 @@ A standalone release is not ready until clean supported Windows machines can:
 - whether any embedded engine beats the replaceable external-provider approach;
 - macOS/Linux scope after Windows acceptance.
 
-## Image strategy approval gate
+## Approved image strategy and remaining gates
 
-Approval is required before Stage B application changes. The proposed approval is:
+The approved direction is:
 
-1. accept official Windows portable ComfyUI as the future optional managed image runtime, while retaining external loopback ComfyUI support;
-2. implement readiness detection, app-owned configuration, and the compact Image-mode setup card first, with no downloads or process management;
+1. use official Windows portable ComfyUI as the future optional managed image runtime, while retaining external loopback ComfyUI support and strict ownership boundaries;
+2. implement separate engine/model readiness, app-owned external configuration, a small model registry, and the compact Image-mode setup card first, with no downloads, process management, or installer changes;
 3. run real GPU acceptance against a manually installed compatible engine/checkpoint;
 4. defer managed acquisition until an exact portable release, artifact digest, supported driver matrix, notices/licences, safe extraction design, and Windows process-ownership mechanism have separate approval.
+
+The production model also remains a separate approval: compare candidates for verified compatibility, licensing, generation performance, memory behaviour, workflow requirements, and image quality on the RTX 3070 Ti before selecting a default.
 
 See [M08A-IMAGE-GENERATION-DESIGN.md](M08A-IMAGE-GENERATION-DESIGN.md) for the current implementation audit, source comparison, storage/process contract, and bounded Stage B file plan.

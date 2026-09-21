@@ -55,7 +55,7 @@ Statuses may be combined. Branch-specific functionality must not be presented as
 | Agent benchmark and model profiles | `main` — **IMPLEMENTED**, **VERIFIED** as a harness | Three controlled answer/lookup/edit cases protect grounding and no-write proposal behaviour. Live results are model- and runtime-specific and were not rerun during this documentation audit. |
 | Elma animation states | `main` — **IMPLEMENTED**, **VERIFIED** by frontend build | Sprite-sheet states: idle, thinking, working, inspecting, success, and error. CSS disables sprite animation for reduced-motion preference. |
 | General settings and onboarding | `main` — **PLANNED** | The chosen Ollama model is stored locally, but there is no settings page, capability manager, first-run flow, or secure credential UI. |
-| M08A image generation | `image-generation` only — **IMPLEMENTED**, **EXPERIMENTAL** | ComfyUI/SDXL provider, single job, state tracking, PNG preview, Save/Reject, safe save, temporary cleanup, and Chat/Image toggle are committed. The feature commit reports 81 Rust tests, lint, typecheck, build, and diff check passing; no live GPU generation succeeded because ComfyUI was unavailable. |
+| M08A image generation | `image-generation` only — **IMPLEMENTED**, **EXPERIMENTAL** | ComfyUI/SDXL prototype provider, single job, state tracking, PNG preview, Save/Reject, safe save, temporary cleanup, and Chat/Image toggle are committed. SDXL is the acceptance baseline, not the production default. The feature commit reports 81 Rust tests, lint, typecheck, build, and diff check passing; no live GPU generation succeeded because ComfyUI was unavailable. |
 | M08B image editing | **PLANNED** | Requires original preservation, edit-capable provider/model selection, preview, comparison, and approval. SDXL text-to-image alone does not provide this workflow. |
 | M08C image analysis | **PLANNED** | Requires a vision-capable provider/model and bounded project-image access. The current coding model must not be assumed to understand images. |
 | Sprite sheets, background removal, upscaling, variants, metadata, animation workflows | **PROPOSED** | Evaluate only after the core image workflow is reliable; AIIDE should not become a general graphics editor. |
@@ -100,6 +100,8 @@ Image generation is separate from text inference because it is asynchronous, GPU
 
 M08A uses a fixed, core-node SDXL 1.0 ComfyUI workflow at 1024 × 1024, batch size 1, 30 steps, DPM++ 2M/Karras, CFG 7, and a random seed. It permits one active or reviewable job. AIIDE polls real states without invented percentages, downloads and validates a bounded PNG into AIIDE-owned temporary storage, and saves only after approval to a protected project-relative `.png` path. Collision naming is exclusive and non-destructive. Older ComfyUI versions may not safely cancel a running job; AIIDE does not use the global interrupt endpoint.
 
+SDXL 1.0 remains the implemented prototype and acceptance baseline until a replacement is demonstrated; it is not permanently selected as the production default. Production-model selection requires focused comparison and real testing on the RTX 3070 Ti's 8 GB VRAM, covering compatibility, licensing, performance, memory behaviour, workflow requirements, and image quality. A small typed model registry should separate model configuration and model-specific workflows from runtime management. ComfyUI remains behind the replaceable image-provider boundary so another engine can be introduced without replacing the composer, result cards, or Save/Reject approval flow.
+
 The branch design is `codex/M08A-IMAGE-GENERATION-DESIGN.md` on `image-generation`. It is intentionally not copied to `main` before the feature merges.
 
 M08B should preserve the original image, show a before/after comparison, and require approval before replacement or saving. M08C should use a vision-capable provider to describe and reason about project images. Neither capability is supplied by the current SDXL text-to-image path.
@@ -124,7 +126,7 @@ Future image work may add a distinct working/painting state for Elma, but it rem
 
 The current supported environment is a developer checkout. Normal end users should not need to prepare Python environments, model folders, inference servers, environment variables, or command-line arguments.
 
-The preferred direction is a relatively small signed application installer plus optional capability setup. Existing compatible Ollama and ComfyUI installations should remain usable. AIIDE may later offer managed runtime/model installation with explicit consent, integrity checks, version compatibility, storage and hardware checks, lifecycle ownership, recovery, and clear uninstall/data-retention choices. Bundling every multi-gigabyte model in the primary installer is not the plan. Fully embedded inference remains an option to investigate, not a commitment.
+The approved image direction is a relatively small signed application installer plus optional, consent-based runtime and model acquisition. A normal user should be able to enable image generation and generate through Elma without manually installing Python, configuring ComfyUI, starting a server, or using terminal commands. Application-managed ComfyUI is the selected initial engine strategy, but it is **PLANNED**, not implemented; version pinning, artifact verification, compatibility testing, licensing review, and safe process ownership remain gates. Existing compatible external ComfyUI installations remain usable and must never be modified or terminated as though AIIDE owns them. No paid cloud API is required for local generation. Fully embedded inference is **DEFERRED** for investigation.
 
 See [codex/STANDALONE-DISTRIBUTION-DESIGN.md](codex/STANDALONE-DISTRIBUTION-DESIGN.md) for the onboarding sequence, runtime responsibilities, security and licensing requirements, phases, and open questions.
 
@@ -141,6 +143,10 @@ Milestone identifiers before M08A are historical repository context; do not renu
 
 This is the recommended next implementation milestone because M08B, M08C, managed image-runtime setup, and public image claims all depend on a trustworthy M08A baseline.
 
+### Approved M08A Stage B architecture
+
+After preserving the SDXL acceptance baseline, Stage B should add richer runtime readiness, persisted external-engine configuration, a compact Image-mode setup card, separate engine and model readiness, a small typed model registry, and focused deterministic failure tests. It must not download runtimes/models, manage processes, change the installer, or add a model marketplace. The production model and managed acquisition mechanism remain separate approval decisions after comparison and real GPU evidence.
+
 ### Next approved capability areas
 
 - **M08B image editing** depends on M08A approval semantics and a researched edit-capable model/provider.
@@ -155,7 +161,7 @@ Controlled commands, multi-file edits, durable session recovery, and project-con
 ## Open decisions
 
 - supported Windows versions, installer/update technology, code signing, and release channels;
-- whether AIIDE only detects existing engines or may install and manage selected versions;
+- managed-installation details for image generation and whether other capabilities remain detection-only;
 - supported Ollama, ComfyUI, model, driver, and GPU compatibility matrices;
 - model download source, integrity/signature policy, licence presentation, and redistribution eligibility;
 - secure OpenRouter and future GitHub credential storage and revocation;

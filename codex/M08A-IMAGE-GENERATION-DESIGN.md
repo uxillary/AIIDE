@@ -1,10 +1,10 @@
 # M08A local image generation and managed-engine direction
 
-Status: Phase 2 baseline implemented on `image-generation`; Phase 3 Stage A investigation complete. Real GPU acceptance and any managed-runtime implementation remain pending.
+Status: Phase 2 baseline **IMPLEMENTED** on `image-generation`; managed ComfyUI direction **PLANNED** and approved. Real GPU acceptance, production-model selection, and managed-runtime implementation remain pending.
 
-## Approved baseline
+## Implemented prototype baseline
 
-This milestone introduces two material external choices: a multi-gigabyte model/runtime and a ComfyUI API compatibility floor. The recommended baseline is:
+This milestone introduced two material external choices: a multi-gigabyte model/runtime and a ComfyUI API compatibility floor. The implemented prototype baseline is:
 
 - ComfyUI as an independently installed, user-managed local service.
 - SDXL 1.0 base (`sd_xl_base_1.0.safetensors`) as the first supported checkpoint.
@@ -12,7 +12,15 @@ This milestone introduces two material external choices: a multi-gigabyte model/
 - `1024 × 1024`, batch size 1, 30 steps, `dpmpp_2m`/`karras`, CFG 7, and a random seed as quality-focused defaults.
 - One image job at a time. No refiner, upscaler, LoRA, prompt rewriting, image editing, or image analysis in M08A.
 
-This baseline was approved for Phase 2. The alternatives below remain useful context for later milestones because they materially change installation size, compatibility, licensing, workflow shape, and memory behaviour.
+This baseline was approved for Phase 2 and remains the acceptance-test baseline until a replacement is demonstrated. It does not select SDXL 1.0 as AIIDE's production default. The alternatives below remain useful context because they materially change installation size, compatibility, licensing, workflow shape, and memory behaviour.
+
+## Approved product direction
+
+AIIDE's target is a cohesive Windows desktop experience: install AIIDE, optionally enable image generation, approve the required downloads, let AIIDE configure the engine and selected model, and generate through Elma without manually installing Python, configuring ComfyUI, starting an inference server, or using terminal commands. Runtime and model acquisition will remain optional, consent-based, and separate from the primary installer. Local generation will not require a paid cloud API.
+
+Application-managed ComfyUI is the selected initial engine strategy. AIIDE will eventually install, configure, start, and stop an approved pinned ComfyUI runtime through a separately approved management mechanism. External user-managed ComfyUI remains supported for compatibility; AIIDE must never terminate, update, overwrite, repair, or uninstall a runtime it does not own.
+
+This is a **PLANNED** product direction, not current functionality. Managed installation remains gated on version pinning, archive verification, compatibility testing, legal/licensing review, safe extraction, and reliable process ownership. Fully embedded inference is **DEFERRED** for investigation. ComfyUI remains behind the existing image-provider abstraction so another engine can replace it without replacing the composer, result cards, or Save/Reject approval flow.
 
 ## What exists today
 
@@ -128,9 +136,9 @@ Errors remain actionable and do not expose arbitrary response bodies:
 
 ## Model evaluation
 
-### Recommended: SDXL 1.0 base
+### Implemented prototype baseline: SDXL 1.0 base
 
-SDXL base is a 3B-parameter model with an official 6.94 GB single checkpoint and can run without its refiner. ComfyUI's maintained model guidance places SDXL base at an 8 GB VRAM minimum and 12 GB recommended. It is the most conservative quality/reliability choice for an RTX 3070 Ti: mature native support, a compact core-node workflow, no gated text-encoder bundle, and no quantization/custom-node dependency.
+SDXL base is a 3B-parameter model with an official 6.94 GB single checkpoint and can run without its refiner. ComfyUI's maintained model guidance places SDXL base at an 8 GB VRAM minimum and 12 GB recommended. It was the conservative prototype choice for the RTX 3070 Ti: mature native support, a compact core-node workflow, no gated text-encoder bundle, and no quantization/custom-node dependency.
 
 Trade-offs: 8 GB is the floor, so model offloading and slower generation are expected; the refiner is excluded because the documented class is 16 GB+; generated text, anatomy, compositional precision, and photorealism remain imperfect. A 1024-square generation is the baseline. Wider/taller presets and batches wait for a later milestone.
 
@@ -143,6 +151,23 @@ SD3.5 Medium is newer, 2.5B parameters, and generally offers stronger prompt adh
 - FLUX.1 schnell: the official model file is about 23.8 GB; reference precision is commonly a 24 GB-class workload and 8 GB use depends on quantization/offloading.
 - Z-Image Turbo: the official model is 6B parameters and advertises comfortable operation at 16 GB VRAM. An 8 GB setup again depends on lower precision/offloading and newer workflow support.
 - SDXL base plus refiner, high-resolution fix, upscaling, or multi-stage workflows: materially higher memory, runtime, and failure surface than this first vertical slice.
+
+### Production model selection and registry
+
+The production default model is undecided. A focused comparison and real RTX 3070 Ti acceptance are required before selection, covering verified engine compatibility, licence and redistribution terms, generation time, memory behaviour, workflow and dependency requirements, and representative image quality. Eight gigabytes of VRAM is a test constraint, not evidence that a model is accepted.
+
+Stage B should introduce a small internal model registry, or equivalent typed configuration boundary, separate from runtime management. It should be capable of representing:
+
+- a stable model identifier and display name;
+- architecture and supported capabilities;
+- compatible engine/runtime versions;
+- the model-specific workflow and required nodes;
+- required files, validated download sources, sizes, and expected SHA-256 hashes;
+- licence and redistribution conditions;
+- GPU/VRAM and storage guidance; and
+- installed, unavailable, and incompatible states.
+
+Different architectures may require different workflows and dependencies. A checkpoint must never be treated as a drop-in substitution for the fixed SDXL workflow unless its registry entry and verified workflow explicitly support that. M08A does not include a model marketplace or broad model-management interface.
 
 ## Phase 3 managed-runtime investigation
 
@@ -163,7 +188,7 @@ Managed ComfyUI is technically appropriate only as a separately installed option
 Use two supported ownership modes behind the existing provider:
 
 1. **External** — detect and verify a user-started loopback ComfyUI service. AIIDE stores only the approved endpoint/checkpoint configuration and never starts, updates, stops, repairs, or removes that runtime.
-2. **Managed** — after a later explicit install approval, acquire one pinned official Windows portable NVIDIA release into AIIDE's local application-data area, acquire the approved SDXL checkpoint separately, and launch the engine as an AIIDE-owned child process with an argument array.
+2. **Managed** — after a later explicit install approval, acquire one pinned official Windows portable NVIDIA release into AIIDE's local application-data area, acquire the selected compatible model separately, and launch the engine as an AIIDE-owned child process with an argument array.
 
 The managed layout should be resolved through Tauri's per-user application-data APIs rather than hard-coded absolute paths:
 
@@ -180,7 +205,7 @@ No component belongs in the opened project. Updates install side by side and bec
 - Pin an exact ComfyUI stable release and exact portable asset name. Never use a moving `/latest/` URL in a shipped manifest.
 - Download only from the official `Comfy-Org/ComfyUI` GitHub release. Verify the asset against an expected SHA-256 stored in signed AIIDE release metadata before extraction or execution. GitHub exposes release-asset SHA-256 digests, but AIIDE must ship its expected value rather than trust mutable network metadata at install time.
 - Reject archives with absolute paths, traversal, links/reparse points, duplicate destinations, or an unexpected top-level layout. Extract to a new staging directory and atomically promote it.
-- Pin `sd_xl_base_1.0.safetensors` from Stability AI's official Hugging Face repository: 6.94 GB, SHA-256 `31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b`, CreativeML Open RAIL++-M. Show the licence and use restrictions before download.
+- For the existing SDXL acceptance baseline, pin `sd_xl_base_1.0.safetensors` from Stability AI's official Hugging Face repository: 6.94 GB, SHA-256 `31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b`, CreativeML Open RAIL++-M. Show the licence and use restrictions before any future download. A production model requires its own approved registry record.
 - ComfyUI core is GPL-3.0. Comfy Desktop is AGPL-3.0-or-later or commercial. Release/legal review must confirm AIIDE's notices, source-offer obligations, separation model, and model-licence presentation before AIIDE distributes or automates either component. This document is not a legal determination.
 - The runtime archive's compressed/installed size, bundled Python/PyTorch/CUDA versions, minimum NVIDIA driver, and complete third-party notices must be recorded for the chosen pin before implementation. Do not quote a moving estimate as a supported requirement.
 
@@ -206,7 +231,7 @@ Windows Job Object ownership is the preferred crash-cleanup mechanism, but it sh
 4. If necessary, set `AIIDE_COMFYUI_ENDPOINT` to another loopback URL and `AIIDE_COMFYUI_CHECKPOINT` to the exact installed filename before launching AIIDE.
 5. Start with ComfyUI's current default dynamic VRAM behavior. Use a pinned-version-specific low-memory recovery option only if live testing shows it is needed; current ComfyUI documents `--lowvram` as having no effect when dynamic VRAM is active.
 
-AIIDE will not install ComfyUI, download weights, alter the service, or start/stop it.
+The current implementation will not install ComfyUI, download weights, alter the service, or start/stop it. Those capabilities belong to the later approved managed-runtime direction and are not part of current GPU acceptance.
 
 ## Phase 2 implementation files
 
@@ -237,20 +262,21 @@ The mockable Rust provider tests currently cover:
 - cleanup after reject, save, project change, and state drop
 - the single-job concurrency guard
 
-Stage B should be a detection-and-guidance slice, not an installer:
+Stage B should establish the smallest architecture that supports future model changes. It is a detection-and-guidance slice, not an installer:
 
 1. Replace the binary connected/offline probe with structured readiness states: checking, external-ready, managed-ready, unavailable, incompatible version/API, missing core nodes, missing checkpoint, and actionable hardware warning.
-2. Probe `/system_stats` for version/device data and `/object_info/<node>` for every fixed-workflow node. Read the `CheckpointLoaderSimple` choices and require the configured checkpoint. Treat unknown schemas as incompatible, not ready.
-3. Add a compact setup card shown only in Image mode. Explain SDXL's 6.94 GB model, additional runtime/staging space, 8 GB minimum/12 GB recommended VRAM guidance, local/offline behavior, source, ownership, and licence. Provide `Set up`, `Use existing ComfyUI`, `Retry`, and `Skip` states without invented progress.
-4. Keep external `127.0.0.1:8188` compatibility and add app-owned persisted configuration rather than requiring environment variables for normal use. Continue rejecting non-loopback endpoints.
-5. Provide official upstream setup/model-page links after explicit user action. Do not download, install, launch, update, or uninstall anything in this slice.
-6. Add focused backend tests for each readiness failure, schema variation, checkpoint absence, unsafe endpoint, and ownership label; verify the existing chat route remains unchanged.
-7. Use the resulting readiness report to run the documented real GPU acceptance on the RTX 3070 Ti once ComfyUI and SDXL are manually available. Record engine/core/model versions, driver, generation time, and observed failure/recovery behavior. Do not mark managed setup or GPU acceptance complete from mocks.
+2. Separate engine readiness from model readiness. Probe `/system_stats` for version/device data and `/object_info/<node>` for the selected model workflow. Read available model choices and require the configured registry model and files. Treat unknown schemas as incompatible, not ready.
+3. Add the small typed model registry described above, initially containing the SDXL acceptance baseline without making it the permanent production default.
+4. Add a compact setup card shown only in Image mode. For the selected model, explain download and storage size, practical GPU/VRAM guidance, local/offline behavior, source, ownership, and licence. Provide `Set up`, `Use existing ComfyUI`, `Retry`, and `Skip` states without invented progress.
+5. Keep external `127.0.0.1:8188` compatibility and add app-owned persisted external-engine configuration rather than requiring environment variables for normal use. Continue rejecting non-loopback endpoints.
+6. Provide official upstream setup/model-page links after explicit user action. Do not download, install, launch, update, or uninstall anything in this slice.
+7. Add focused deterministic tests for engine-readiness failures, model-readiness failures, schema variation, missing files or nodes, unsafe endpoints, registry incompatibility, and ownership labels; verify the existing chat route remains unchanged.
+8. Use the resulting readiness report to run the documented real GPU acceptance on the RTX 3070 Ti once ComfyUI and SDXL are manually available. Record engine/core/model versions, driver, generation time, memory behaviour, output quality, and observed failure/recovery behavior. Do not mark managed setup, a production model, or GPU acceptance complete from mocks.
 
 The bounded detection-and-guidance slice is expected to change:
 
-- `src-tauri/src/image_generation.rs` for typed readiness probes and focused tests;
-- `src/types/image.ts` and `src/services/image/provider.ts` for the richer status contract;
+- `src-tauri/src/image_generation.rs` for typed engine/model readiness probes, the small model registry boundary, and focused tests;
+- `src/types/image.ts` and `src/services/image/provider.ts` for the separated readiness contract;
 - `src/components/LocalChat.tsx` for Image-mode setup-state routing;
 - a small `src/components/ImageSetupCard.tsx` component, if extracting the setup state keeps `LocalChat` readable;
 - `src/styles.css` for scoped setup-card states;
@@ -260,7 +286,7 @@ No runtime dependency or Tauri process/filesystem capability should be added in 
 
 Only after that slice and release/legal approval should a separate managed-acquisition slice implement the pinned portable manifest, resumable verified downloads, safe extraction, managed-process ownership, repair, update, and uninstall behavior.
 
-Approval is required for this strategy and Stage B boundary before application code changes.
+The managed ComfyUI strategy and this Stage B boundary are approved. Production-model selection and managed acquisition remain separate approval gates.
 
 ## Sources
 
