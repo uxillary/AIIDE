@@ -1,6 +1,6 @@
-# M08A local image generation — Phase 1 design
+# M08A local image generation and managed-engine direction
 
-Status: approved baseline implemented on `image-generation`.
+Status: Phase 2 baseline implemented on `image-generation`; Phase 3 Stage A investigation complete. Real GPU acceptance and any managed-runtime implementation remain pending.
 
 ## Approved baseline
 
@@ -23,7 +23,7 @@ This baseline was approved for Phase 2. The alternatives below remain useful con
 - `src-tauri/src/ollama.rs` validates requests, routes repository-aware turns, emits activity events, retries malformed structured output, and creates text-only pending proposals.
 - `src-tauri/src/model_provider.rs` abstracts text inference across Ollama and OpenRouter. Its request/response contract is not suitable for long-running binary image jobs.
 
-Image generation should therefore use a separate frontend `ImageProvider` and Rust `ImageGenerationProvider` contract. It must not add image fields or lifecycle states to `ModelProvider`.
+Image generation therefore uses a separate frontend `ImageProvider` and Rust `ImageGenerationProvider` contract. It does not add image fields or lifecycle states to `ModelProvider`.
 
 ### Approval and repository boundary
 
@@ -31,20 +31,38 @@ Image generation should therefore use a separate frontend `ImageProvider` and Ru
 - `src/components/ChangesPanel.tsx` renders text diffs and Apply/Reject controls.
 - Opening another project clears the pending text proposal.
 
-Generated images must use independent pending-image state and commands. Binary bytes must never become `PendingChange`, pass through text decoding, or appear in the Changes diff. Saving remains a Rust-owned, project-relative operation after an explicit Save action.
+Generated images use independent pending-image state and commands. Binary bytes never become `PendingChange`, pass through text decoding, or appear in the Changes diff. Saving remains a Rust-owned, project-relative operation after an explicit Save action.
 
 ### Errors, cancellation, tracing, and tests
 
 - Chat networking has bounded request timeouts and provider-neutral user errors, but no request cancellation.
-- Agent debug tracing is in-memory and chat-specific. Image tracing should be a small separate in-memory event log with prompt text omitted by default.
+- Agent debug tracing is in-memory and chat-specific. Image activity currently uses bounded console events rather than a persistent diagnostic log.
 - Tauri events currently carry activity labels to the chat UI.
-- Rust unit tests cover providers, routing, repository path safety, proposal validation, rejection, approval, and stale writes. There is no frontend unit-test harness; frontend regression protection is lint, typecheck, and build.
+- Rust unit tests cover the provider boundary, fixed workflow, lifecycle, cancellation behavior, temporary previews, rejection, safe saves, collision handling, and path protection. There is no frontend unit-test harness; frontend regression protection is lint, typecheck, and build.
+
+### Phase 3 baseline audit
+
+The implementation has the intended architecture and should be extended rather than rewritten:
+
+- `src-tauri/src/image_generation.rs` owns the provider trait, loopback-only ComfyUI adapter, fixed core-node SDXL workflow, single-job state, polling, prompt-specific cancellation, bounded PNG retrieval, temporary storage, Reject, and protected collision-safe Save.
+- `src/services/image/` and `src/types/image.ts` keep the frontend provider contract separate from chat inference.
+- `LocalChat.tsx` retains the Chat/Image composer boundary, filters image turns out of coding chat history, and polls only the current image job.
+- `ImageResultCard.tsx` renders actual lifecycle states and requires an explicit project-relative Save.
+- Tauri command registration is narrow and image bytes remain outside the text proposal path.
+
+The following gaps remain:
+
+- `image_generation_status()` currently proves only that `GET /system_stats` succeeds. It does not verify a supported ComfyUI version, required core nodes, the checkpoint list, GPU/device suitability, or the prompt-specific cancellation endpoint.
+- Configuration still relies on developer environment variables for non-default endpoints and checkpoint names.
+- There is no capability/setup state model, compact guided setup UI, managed installation record, runtime acquisition, process ownership, update, repair, or uninstall path.
+- There is no live ComfyUI/SDXL evidence. Mock-provider tests prove the application lifecycle, not GPU execution, output quality, performance, or VRAM behavior.
+- A transient provider polling error is reported to the UI but does not by itself establish a terminal ComfyUI job state; live acceptance must exercise disconnect and recovery behavior.
 
 ## ComfyUI integration
 
 ComfyUI has a local workflow API, asynchronous queueing, history, image retrieval, and progress events. Its official websocket example submits `POST /prompt`, follows `/ws`, reads `/history/{prompt_id}`, and retrieves outputs from `/view`. A second official example can stream final images over a websocket, but it relies on the bundled example `SaveImageWebsocket` custom node rather than a core node.
 
-M08A should favour core nodes and broad install reliability:
+M08A favours core nodes and broad install reliability:
 
 1. Build an embedded, fixed SDXL API workflow in Rust.
 2. Substitute only validated prompt, checkpoint filename, dimensions, seed, steps, CFG, sampler, and scheduler values.
@@ -126,17 +144,71 @@ SD3.5 Medium is newer, 2.5B parameters, and generally offers stronger prompt adh
 - Z-Image Turbo: the official model is 6B parameters and advertises comfortable operation at 16 GB VRAM. An 8 GB setup again depends on lower precision/offloading and newer workflow support.
 - SDXL base plus refiner, high-resolution fix, upscaling, or multi-stage workflows: materially higher memory, runtime, and failure surface than this first vertical slice.
 
-## Windows setup if the recommendation is approved
+## Phase 3 managed-runtime investigation
+
+### Evaluated Windows options
+
+| Option | Suitability | Decision |
+| --- | --- | --- |
+| Existing user-managed ComfyUI | Preserves current installations and is the fastest route to real GPU acceptance. Compatibility and lifecycle vary by installation. | Continue supporting loopback endpoints. Never stop or modify a process AIIDE did not launch. |
+| Official Comfy Desktop | Officially recommended for normal ComfyUI users and manages isolated environments and updates. It is a separate Electron application, currently AGPL-3.0-or-later/commercial dual-licensed, and controls its own installs and release cadence. | Offer only as an external user-managed setup path. Do not silently embed, redistribute, automate, or take ownership without separate licensing and integration approval. |
+| Official Windows portable NVIDIA archive | Self-contained embedded Python/PyTorch environment, no system Python requirement, official GitHub release assets, and explicit command-line control. Upstream describes portable as unsuitable for ordinary manual users, but that concern is the manual archive workflow that AIIDE could hide. | Recommended technical substrate for a future optional AIIDE-managed engine, subject to an immutable version pin, verified digest, licence review, extraction testing, and explicit user consent. |
+| `comfy-cli` or a manual Python environment | Useful for developers but adds Python/package resolution and mutable dependency state. | Do not use for the normal supported AIIDE flow. |
+| Fully embedded inference library | Removes the local HTTP service but makes AIIDE own model formats, CUDA/PyTorch packaging, scheduling, crash isolation, and hardware backends. | Deferred; the replaceable provider remains the architectural boundary. |
+
+Managed ComfyUI is technically appropriate only as a separately installed optional capability. It must not be folded into the main AIIDE installer, the project repository, or the text-provider abstraction.
+
+### Recommended distribution strategy
+
+Use two supported ownership modes behind the existing provider:
+
+1. **External** — detect and verify a user-started loopback ComfyUI service. AIIDE stores only the approved endpoint/checkpoint configuration and never starts, updates, stops, repairs, or removes that runtime.
+2. **Managed** — after a later explicit install approval, acquire one pinned official Windows portable NVIDIA release into AIIDE's local application-data area, acquire the approved SDXL checkpoint separately, and launch the engine as an AIIDE-owned child process with an argument array.
+
+The managed layout should be resolved through Tauri's per-user application-data APIs rather than hard-coded absolute paths:
+
+- `capabilities/image/comfyui/<pinned-version>/` — immutable runtime payload;
+- `models/image/sdxl/` — separately retained model data;
+- `downloads/staging/` — resumable partial artifacts;
+- `runtime/image/<session>/` — temporary input/output/user directories and logs;
+- a small installation record containing version, source URL, size, SHA-256, licence identifier, install path, ownership, and verification result.
+
+No component belongs in the opened project. Updates install side by side and become active only after verification; they do not mutate a working runtime in place. Uninstall removes only records and files marked AIIDE-owned and asks separately whether to retain the model.
+
+### Artifact and licence gates
+
+- Pin an exact ComfyUI stable release and exact portable asset name. Never use a moving `/latest/` URL in a shipped manifest.
+- Download only from the official `Comfy-Org/ComfyUI` GitHub release. Verify the asset against an expected SHA-256 stored in signed AIIDE release metadata before extraction or execution. GitHub exposes release-asset SHA-256 digests, but AIIDE must ship its expected value rather than trust mutable network metadata at install time.
+- Reject archives with absolute paths, traversal, links/reparse points, duplicate destinations, or an unexpected top-level layout. Extract to a new staging directory and atomically promote it.
+- Pin `sd_xl_base_1.0.safetensors` from Stability AI's official Hugging Face repository: 6.94 GB, SHA-256 `31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b`, CreativeML Open RAIL++-M. Show the licence and use restrictions before download.
+- ComfyUI core is GPL-3.0. Comfy Desktop is AGPL-3.0-or-later or commercial. Release/legal review must confirm AIIDE's notices, source-offer obligations, separation model, and model-licence presentation before AIIDE distributes or automates either component. This document is not a legal determination.
+- The runtime archive's compressed/installed size, bundled Python/PyTorch/CUDA versions, minimum NVIDIA driver, and complete third-party notices must be recorded for the chosen pin before implementation. Do not quote a moving estimate as a supported requirement.
+
+### Managed process contract
+
+For an approved managed runtime, AIIDE should:
+
+- select an unused loopback port, detect startup races/conflicts, and retry only with a new managed port;
+- launch embedded Python directly with an argument array, never a batch file or shell, and never include prompt text in process arguments;
+- pass explicit `--listen 127.0.0.1`, `--port`, `--disable-auto-launch`, `--disable-all-custom-nodes`, `--disable-api-nodes`, `--base-directory`, and managed temp/model directory arguments supported by the pinned version;
+- keep the child handle for the current AIIDE session and stop only that child; a surviving process discovered after restart is external/unowned until the user resolves it;
+- use bounded startup/shutdown timeouts, capture bounded redacted diagnostics, and never terminate a process merely because it owns the expected port;
+- keep ComfyUI's targeted job cancellation and never fall back to the global interrupt route;
+- work offline after the verified runtime and model are installed, without background update requirements.
+
+Windows Job Object ownership is the preferred crash-cleanup mechanism, but it should be approved with the managed-process implementation because it may require a small Windows-specific dependency. Without reliable ownership, automatic shutdown must be deferred rather than approximated with stored process IDs.
+
+## Current manual GPU-acceptance setup
 
 1. Install the official ComfyUI Desktop app, or the official Windows portable NVIDIA build for RTX 20-series and newer cards.
-2. Download `sd_xl_base_1.0.safetensors` manually from Stability AI and place it in `ComfyUI\models\checkpoints`. The file is approximately 6.94 GB and uses the CreativeML Open RAIL++-M license.
+2. Download `sd_xl_base_1.0.safetensors` manually from Stability AI and place it in `ComfyUI\models\checkpoints`. The file is 6.94 GB, has SHA-256 `31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b`, and uses the CreativeML Open RAIL++-M licence.
 3. Start ComfyUI yourself and keep it bound to loopback. The normal endpoint is `http://127.0.0.1:8188`.
 4. If necessary, set `AIIDE_COMFYUI_ENDPOINT` to another loopback URL and `AIIDE_COMFYUI_CHECKPOINT` to the exact installed filename before launching AIIDE.
-5. If normal mode exhausts 8 GB VRAM, start the portable server with ComfyUI's `--lowvram` option. Expect slower generation and additional system-memory use.
+5. Start with ComfyUI's current default dynamic VRAM behavior. Use a pinned-version-specific low-memory recovery option only if live testing shows it is needed; current ComfyUI documents `--lowvram` as having no effect when dynamic VRAM is active.
 
 AIIDE will not install ComfyUI, download weights, alter the service, or start/stop it.
 
-## Planned files
+## Phase 2 implementation files
 
 - `src-tauri/src/image_generation.rs`: provider trait, ComfyUI adapter, fixed workflow, job state, commands, safe save/cleanup, and deterministic tests.
 - `src-tauri/src/lib.rs`: state and command registration only.
@@ -147,14 +219,13 @@ AIIDE will not install ComfyUI, download weights, alter the service, or start/st
 - `src/styles.css`: scoped card and mode-control styles using current tokens.
 - `README.md`: opt-in Windows/ComfyUI/model setup and limitations.
 
-No new frontend dependency is required. The initial Rust implementation can use the existing `reqwest`, `serde`, and `serde_json` stack with HTTP polling. If websocket progress or direct websocket image transport becomes mandatory, that should be a later, separately reviewed dependency change.
+No new frontend dependency was required. The Rust implementation uses the existing `reqwest`, `serde`, and `serde_json` stack with HTTP polling. Websocket progress remains a later, separately reviewed dependency change.
 
-## Test plan
+## Verification and bounded Stage B plan
 
-Provider behavior will be behind a mockable Rust trait. Deterministic tests will cover:
+The mockable Rust provider tests currently cover:
 
-- explicit image routing and unchanged chat routing
-- unavailable engine and missing checkpoint
+- unavailable engine and workflow/checkpoint submission errors
 - submission and execution failure, including OOM mapping
 - queued cancellation and supported prompt-specific cancellation
 - cancellation-not-supported behavior without global interrupt
@@ -163,19 +234,46 @@ Provider behavior will be behind a mockable Rust trait. Deterministic tests will
 - approved save
 - traversal, absolute, protected, symlink, and non-PNG paths
 - exclusive collision naming
-- cleanup after reject, save, supersede, project change, and state drop
+- cleanup after reject, save, project change, and state drop
 - the single-job concurrency guard
 
-Verification after implementation: focused Rust tests, full Rust tests, `npm run lint`, `npm run typecheck`, and `npm run build`. A real GPU run is performed only when ComfyUI and the selected checkpoint are already installed; mocked tests are not evidence of image quality.
+Stage B should be a detection-and-guidance slice, not an installer:
+
+1. Replace the binary connected/offline probe with structured readiness states: checking, external-ready, managed-ready, unavailable, incompatible version/API, missing core nodes, missing checkpoint, and actionable hardware warning.
+2. Probe `/system_stats` for version/device data and `/object_info/<node>` for every fixed-workflow node. Read the `CheckpointLoaderSimple` choices and require the configured checkpoint. Treat unknown schemas as incompatible, not ready.
+3. Add a compact setup card shown only in Image mode. Explain SDXL's 6.94 GB model, additional runtime/staging space, 8 GB minimum/12 GB recommended VRAM guidance, local/offline behavior, source, ownership, and licence. Provide `Set up`, `Use existing ComfyUI`, `Retry`, and `Skip` states without invented progress.
+4. Keep external `127.0.0.1:8188` compatibility and add app-owned persisted configuration rather than requiring environment variables for normal use. Continue rejecting non-loopback endpoints.
+5. Provide official upstream setup/model-page links after explicit user action. Do not download, install, launch, update, or uninstall anything in this slice.
+6. Add focused backend tests for each readiness failure, schema variation, checkpoint absence, unsafe endpoint, and ownership label; verify the existing chat route remains unchanged.
+7. Use the resulting readiness report to run the documented real GPU acceptance on the RTX 3070 Ti once ComfyUI and SDXL are manually available. Record engine/core/model versions, driver, generation time, and observed failure/recovery behavior. Do not mark managed setup or GPU acceptance complete from mocks.
+
+The bounded detection-and-guidance slice is expected to change:
+
+- `src-tauri/src/image_generation.rs` for typed readiness probes and focused tests;
+- `src/types/image.ts` and `src/services/image/provider.ts` for the richer status contract;
+- `src/components/LocalChat.tsx` for Image-mode setup-state routing;
+- a small `src/components/ImageSetupCard.tsx` component, if extracting the setup state keeps `LocalChat` readable;
+- `src/styles.css` for scoped setup-card states;
+- existing image setup documentation if the user-visible instructions change.
+
+No runtime dependency or Tauri process/filesystem capability should be added in this slice. Persisted external endpoint/checkpoint configuration should use the smallest existing Tauri-safe application-data pattern available when implementation begins; if no suitable persistence boundary exists, that item requires a narrow design decision rather than writing configuration into the project.
+
+Only after that slice and release/legal approval should a separate managed-acquisition slice implement the pinned portable manifest, resumable verified downloads, safe extraction, managed-process ownership, repair, update, and uninstall behavior.
+
+Approval is required for this strategy and Stage B boundary before application code changes.
 
 ## Sources
 
 - ComfyUI repository and Windows installation: <https://github.com/Comfy-Org/ComfyUI>
+- Comfy Desktop architecture and dual licence: <https://github.com/Comfy-Org/Comfy-Desktop>
+- ComfyUI command-line contract: <https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/cli_args.py>
 - ComfyUI official websocket API example: <https://github.com/Comfy-Org/ComfyUI/blob/master/script_examples/websockets_api_example.py>
 - ComfyUI direct websocket image example: <https://github.com/Comfy-Org/ComfyUI/blob/master/script_examples/websockets_api_example_ws_images.py>
 - ComfyUI server routes and job cancellation: <https://github.com/Comfy-Org/ComfyUI/blob/master/server.py>
 - SDXL 1.0 model card and weights: <https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0>
+- SDXL 1.0 licence: <https://github.com/Stability-AI/generative-models/blob/main/model_licenses/LICENSE-SDXL1.0>
 - ComfyUI maintained model guidance: <https://github.com/Comfy-Org/workflow_templates/blob/main/site/knowledge/models/sdxl.md>
+- GitHub release-asset digests: <https://docs.github.com/en/rest/releases/releases>
 - SD3.5 ComfyUI example and dependencies: <https://github.com/comfyanonymous/ComfyUI_examples/tree/master/sd3>
 - Stability AI SD3.5 hardware statement: <https://stability.ai/news/introducing-stable-diffusion-3-5>
 - FLUX.1 schnell official weights: <https://huggingface.co/black-forest-labs/FLUX.1-schnell>
