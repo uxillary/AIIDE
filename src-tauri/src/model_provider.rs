@@ -35,6 +35,13 @@ pub(crate) struct InferenceResponse {
     pub message: ModelMessage,
     pub done: bool,
     pub done_reason: Option<String>,
+    pub usage: Option<TokenUsage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -141,6 +148,10 @@ struct ChatPayloadResponse {
     message: ModelMessage,
     done: bool,
     done_reason: Option<String>,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 
 fn ollama_request_error(error: reqwest::Error) -> ProviderFailure {
@@ -182,7 +193,11 @@ impl ModelProvider for OllamaProvider {
         if !result.done || result.message.role != "assistant" || result.model.is_empty() {
             return Err(ProviderFailure::new(ProviderErrorKind::MalformedResponse, "Ollama returned an incomplete chat response."));
         }
-        Ok(InferenceResponse { model: result.model, message: result.message, done: result.done, done_reason: result.done_reason })
+        let usage = result.prompt_eval_count.zip(result.eval_count).map(|(input_tokens, output_tokens)| TokenUsage {
+            input_tokens,
+            output_tokens,
+        });
+        Ok(InferenceResponse { model: result.model, message: result.message, done: result.done, done_reason: result.done_reason, usage })
     }
 }
 
@@ -227,6 +242,13 @@ struct OpenRouterResponse {
     model: Option<String>,
     choices: Option<Vec<OpenRouterChoice>>,
     error: Option<OpenRouterError>,
+    usage: Option<OpenRouterUsage>,
+}
+
+#[derive(Deserialize)]
+struct OpenRouterUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -345,11 +367,16 @@ fn normalize_openrouter_response(status: u16, body: Value) -> Result<InferenceRe
     let choice = choices.remove(0);
     let content = normalize_openrouter_content(choice.message.content).ok_or_else(&structure_error)?;
     if choice.message.role != "assistant" { return Err(structure_error()); }
+    let usage = result.usage.map(|usage| TokenUsage {
+        input_tokens: usage.prompt_tokens,
+        output_tokens: usage.completion_tokens,
+    });
     Ok(InferenceResponse {
         model,
         message: ModelMessage { role: choice.message.role, content },
         done: true,
         done_reason: choice.finish_reason,
+        usage,
     })
 }
 
@@ -440,11 +467,13 @@ mod tests {
             "choices": [{
                 "message": { "role": "assistant", "content": "{\"action\":\"answer\",\"answer\":\"ok\"}" },
                 "finish_reason": "stop"
-            }]
+            }],
+            "usage": { "prompt_tokens": 123, "completion_tokens": 17, "total_tokens": 140 }
         })).unwrap();
         assert_eq!(response.model, "vendor/model:free");
         assert_eq!(response.message.content, r#"{"action":"answer","answer":"ok"}"#);
         assert_eq!(response.done_reason.as_deref(), Some("stop"));
+        assert_eq!(response.usage, Some(TokenUsage { input_tokens: 123, output_tokens: 17 }));
 
         let schema = serde_json::json!({"type":"object","required":["action"]});
         let format = openrouter_response_format(schema.clone());
@@ -471,6 +500,27 @@ mod tests {
             }]
         })).unwrap();
         assert_eq!(response.message.content, r#"{"action":"answer","answer":"ok"}"#);
+        assert_eq!(response.usage, None);
+    }
+
+    #[test]
+    fn ollama_usage_fields_are_optional_for_older_or_partial_responses() {
+        let with_usage: ChatPayloadResponse = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "message": { "role": "assistant", "content": "ok" },
+            "done": true,
+            "done_reason": "stop",
+            "prompt_eval_count": 91,
+            "eval_count": 12
+        })).unwrap();
+        assert_eq!(with_usage.prompt_eval_count.zip(with_usage.eval_count), Some((91, 12)));
+
+        let without_usage: ChatPayloadResponse = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "message": { "role": "assistant", "content": "ok" },
+            "done": true
+        })).unwrap();
+        assert_eq!(without_usage.prompt_eval_count.zip(without_usage.eval_count), None);
     }
 
     #[test]
