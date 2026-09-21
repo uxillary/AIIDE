@@ -5,6 +5,7 @@ import type { ImageEngineStatus, ImageJob } from '../../types/image'
 export const comfyUiProvider: ImageProvider = {
   name: 'ComfyUI',
   getStatus: () => invoke<ImageEngineStatus>('image_generation_status'),
+  configure: (endpoint: string, modelId: string) => invoke<ImageEngineStatus>('configure_image_generation', { endpoint, modelId }),
   start: (prompt: string) => invoke<ImageJob>('start_image_generation', { prompt }),
   getJob: (jobId: string) => invoke<ImageJob>('get_image_generation', { jobId }),
   getPreview: (jobId: string) => invoke<ArrayBuffer>('get_image_preview', { jobId }),

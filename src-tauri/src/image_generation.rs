@@ -1,5 +1,5 @@
 use reqwest::{Client, StatusCode, Url};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -7,16 +7,83 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{ipc::Response, State};
+use tauri::{ipc::Response, Manager, State};
 
 use crate::project::{OpenProject, IGNORED};
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8188";
 const DEFAULT_CHECKPOINT: &str = "sd_xl_base_1.0.safetensors";
+const SDXL_BASELINE_MODEL_ID: &str = "sdxl-1.0-base";
+const CONFIG_FILE: &str = "image-generation.json";
+const MINIMUM_GUIDANCE_VRAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_PROMPT_CHARS: usize = 4_000;
 const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug)]
+struct ImageModelDefinition {
+    id: &'static str,
+    display_name: &'static str,
+    architecture: &'static str,
+    capabilities: &'static [&'static str],
+    engine: &'static str,
+    workflow_id: &'static str,
+    checkpoint: &'static str,
+    supporting_files: &'static [&'static str],
+    required_nodes: &'static [&'static str],
+    hardware_guidance: &'static str,
+    license: &'static str,
+    acquisition: &'static str,
+}
+
+const SDXL_REQUIRED_NODES: &[&str] = &[
+    "KSampler",
+    "CheckpointLoaderSimple",
+    "EmptyLatentImage",
+    "CLIPTextEncode",
+    "VAEDecode",
+    "PreviewImage",
+];
+
+const IMAGE_MODELS: &[ImageModelDefinition] = &[ImageModelDefinition {
+    id: SDXL_BASELINE_MODEL_ID,
+    display_name: "SDXL 1.0 Base",
+    architecture: "SDXL",
+    capabilities: &["text-to-image"],
+    engine: "ComfyUI core workflow API",
+    workflow_id: "comfyui-sdxl-base-v1",
+    checkpoint: DEFAULT_CHECKPOINT,
+    supporting_files: &[],
+    required_nodes: SDXL_REQUIRED_NODES,
+    hardware_guidance:
+        "8 GB VRAM is the supported acceptance-test floor; hardware detection is advisory.",
+    license: "CreativeML Open RAIL++-M",
+    acquisition:
+        "User-provided external ComfyUI checkpoint; AIIDE does not download it in Stage B.",
+}];
+
+fn model_definition(id: &str) -> Option<&'static ImageModelDefinition> {
+    IMAGE_MODELS.iter().find(|model| model.id == id)
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageGenerationConfiguration {
+    endpoint: String,
+    model_id: String,
+    checkpoint: String,
+}
+
+impl ImageGenerationConfiguration {
+    fn defaults() -> Self {
+        Self {
+            endpoint: DEFAULT_ENDPOINT.into(),
+            model_id: SDXL_BASELINE_MODEL_ID.into(),
+            checkpoint: DEFAULT_CHECKPOINT.into(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 enum JobPhase {
@@ -129,14 +196,70 @@ impl From<&PendingImage> for ImageJob {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageModelSummary {
+    id: &'static str,
+    display_name: &'static str,
+    architecture: &'static str,
+    capabilities: &'static [&'static str],
+    engine_requirement: &'static str,
+    workflow_id: &'static str,
+    checkpoint: &'static str,
+    supporting_files: &'static [&'static str],
+    required_nodes: &'static [&'static str],
+    hardware_guidance: &'static str,
+    license: &'static str,
+    acquisition: &'static str,
+}
+
+impl From<&'static ImageModelDefinition> for ImageModelSummary {
+    fn from(model: &'static ImageModelDefinition) -> Self {
+        Self {
+            id: model.id,
+            display_name: model.display_name,
+            architecture: model.architecture,
+            capabilities: model.capabilities,
+            engine_requirement: model.engine,
+            workflow_id: model.workflow_id,
+            checkpoint: model.checkpoint,
+            supporting_files: model.supporting_files,
+            required_nodes: model.required_nodes,
+            hardware_guidance: model.hardware_guidance,
+            license: model.license,
+            acquisition: model.acquisition,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageEngineStatus {
     state: &'static str,
+    ready: bool,
     endpoint: String,
+    model: ImageModelSummary,
     checkpoint: String,
     busy: bool,
+    engine_status: &'static str,
+    model_status: &'static str,
+    hardware_status: &'static str,
+    missing_nodes: Vec<String>,
+    missing_files: Vec<String>,
+    hardware_message: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ReadinessProbeError {
+    Unavailable(String),
+    Incompatible(String),
+}
+
+trait ImageReadinessProvider {
+    async fn system_stats(&self) -> Result<Value, ReadinessProbeError>;
+    async fn object_info(&self) -> Result<Value, ReadinessProbeError>;
+    async fn queue_info(&self) -> Result<Value, ReadinessProbeError>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -176,12 +299,6 @@ struct ComfyUiProvider {
 }
 
 impl ComfyUiProvider {
-    fn from_env(timeout: Duration) -> Result<Self, String> {
-        let configured =
-            std::env::var("AIIDE_COMFYUI_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.into());
-        Self::new(&configured, timeout)
-    }
-
     fn new(endpoint: &str, timeout: Duration) -> Result<Self, String> {
         let mut endpoint = Url::parse(endpoint)
             .map_err(|_| "The configured ComfyUI endpoint is invalid.".to_owned())?;
@@ -239,6 +356,40 @@ impl ComfyUiProvider {
             return Ok(Some(ProviderJobState::Queued));
         }
         Ok(None)
+    }
+
+    async fn readiness_json(&self, path: &str) -> Result<Value, ReadinessProbeError> {
+        let url = self.url(path).map_err(ReadinessProbeError::Incompatible)?;
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| ReadinessProbeError::Unavailable(comfy_transport_error(error)))?;
+        if !response.status().is_success() {
+            return Err(ReadinessProbeError::Incompatible(format!(
+                "ComfyUI does not provide the required /{path} API."
+            )));
+        }
+        response.json().await.map_err(|_| {
+            ReadinessProbeError::Incompatible(format!(
+                "ComfyUI returned a malformed /{path} response."
+            ))
+        })
+    }
+}
+
+impl ImageReadinessProvider for ComfyUiProvider {
+    async fn system_stats(&self) -> Result<Value, ReadinessProbeError> {
+        self.readiness_json("system_stats").await
+    }
+
+    async fn object_info(&self) -> Result<Value, ReadinessProbeError> {
+        self.readiness_json("object_info").await
+    }
+
+    async fn queue_info(&self) -> Result<Value, ReadinessProbeError> {
+        self.readiness_json("queue").await
     }
 }
 
@@ -301,7 +452,7 @@ fn workflow_submission_error(body: &Value) -> String {
         || detail.contains("checkpoint")
         || detail.contains("not in list")
     {
-        "The configured SDXL checkpoint is not installed in ComfyUI. Check AIIDE_COMFYUI_CHECKPOINT and the ComfyUI models\\checkpoints folder.".into()
+        "The configured SDXL checkpoint is not installed in ComfyUI. Add the required file to the ComfyUI models\\checkpoints folder, then retry.".into()
     } else {
         "This ComfyUI installation rejected the required core SDXL workflow. Update ComfyUI and verify its core nodes.".into()
     }
@@ -495,19 +646,295 @@ impl ImageGenerationProvider for ComfyUiProvider {
     }
 }
 
-fn configured_checkpoint() -> Result<String, String> {
-    let checkpoint =
-        std::env::var("AIIDE_COMFYUI_CHECKPOINT").unwrap_or_else(|_| DEFAULT_CHECKPOINT.into());
+fn validate_checkpoint(checkpoint: &str) -> Result<(), String> {
     if checkpoint.trim().is_empty()
         || checkpoint.contains("..")
         || checkpoint.contains(':')
         || checkpoint.starts_with(['/', '\\'])
     {
-        return Err(
-            "AIIDE_COMFYUI_CHECKPOINT must be a ComfyUI-relative checkpoint filename.".into(),
-        );
+        return Err("The configured checkpoint must be a ComfyUI-relative filename.".into());
     }
-    Ok(checkpoint)
+    Ok(())
+}
+
+fn validate_configuration(
+    configuration: ImageGenerationConfiguration,
+) -> Result<ImageGenerationConfiguration, String> {
+    ComfyUiProvider::new(&configuration.endpoint, Duration::from_secs(1))?;
+    if model_definition(&configuration.model_id).is_none() {
+        return Err("The selected image model is not supported by this AIIDE build.".into());
+    }
+    validate_checkpoint(&configuration.checkpoint)?;
+    Ok(configuration)
+}
+
+fn environment_configuration() -> Result<ImageGenerationConfiguration, String> {
+    let mut configuration = ImageGenerationConfiguration::defaults();
+    if let Ok(endpoint) = std::env::var("AIIDE_COMFYUI_ENDPOINT") {
+        configuration.endpoint = endpoint;
+    }
+    if let Ok(checkpoint) = std::env::var("AIIDE_COMFYUI_CHECKPOINT") {
+        configuration.checkpoint = checkpoint;
+    }
+    validate_configuration(configuration)
+}
+
+fn load_configuration(path: &Path) -> Result<ImageGenerationConfiguration, String> {
+    if !path.exists() {
+        return environment_configuration();
+    }
+    let text = fs::read_to_string(path)
+        .map_err(|_| "Could not read the saved image-generation configuration.".to_owned())?;
+    let configuration: ImageGenerationConfiguration = serde_json::from_str(&text)
+        .map_err(|_| "The saved image-generation configuration is malformed.".to_owned())?;
+    validate_configuration(configuration)
+}
+
+fn persist_configuration(
+    path: &Path,
+    endpoint: String,
+    model_id: String,
+) -> Result<ImageGenerationConfiguration, String> {
+    let model = model_definition(&model_id)
+        .ok_or("The selected image model is not supported by this AIIDE build.")?;
+    let provider = ComfyUiProvider::new(endpoint.trim(), Duration::from_secs(1))?;
+    let configuration = validate_configuration(ImageGenerationConfiguration {
+        endpoint: provider.endpoint.as_str().trim_end_matches('/').to_owned(),
+        model_id,
+        checkpoint: model.checkpoint.into(),
+    })?;
+    let parent = path
+        .parent()
+        .ok_or("Could not locate the application configuration directory.")?;
+    fs::create_dir_all(parent)
+        .map_err(|_| "Could not prepare the application configuration directory.".to_owned())?;
+    let contents = serde_json::to_vec_pretty(&configuration)
+        .map_err(|_| "Could not encode the image-generation configuration.".to_owned())?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|_| "Could not save the image-generation configuration.".to_owned())?;
+    file.write_all(&contents)
+        .map_err(|_| "Could not save the image-generation configuration.".to_owned())?;
+    Ok(configuration)
+}
+
+fn configuration_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join(CONFIG_FILE))
+        .map_err(|_| "Could not locate the application configuration directory.".to_owned())
+}
+
+fn selected_configuration(app: &tauri::AppHandle) -> Result<ImageGenerationConfiguration, String> {
+    load_configuration(&configuration_path(app)?)
+}
+
+fn hardware_diagnostics(system_stats: &Value) -> (&'static str, Option<String>) {
+    let Some(devices) = system_stats.get("devices").and_then(Value::as_array) else {
+        return (
+            "unavailable",
+            Some("ComfyUI did not report usable GPU memory information. Hardware checks are advisory; a real generation is still required.".into()),
+        );
+    };
+    let maximum = devices
+        .iter()
+        .filter(|device| {
+            device
+                .get("type")
+                .and_then(Value::as_str)
+                .is_none_or(|kind| !kind.eq_ignore_ascii_case("cpu"))
+        })
+        .filter_map(|device| device.get("vram_total").and_then(Value::as_u64))
+        .max();
+    match maximum {
+        Some(bytes) if bytes < MINIMUM_GUIDANCE_VRAM_BYTES => (
+            "potentially_insufficient",
+            Some(format!(
+                "ComfyUI reports {:.1} GB VRAM; the SDXL acceptance baseline is 8 GB. Detection is advisory.",
+                bytes as f64 / 1024_f64.powi(3)
+            )),
+        ),
+        Some(_) => (
+            "sufficient",
+            Some("Reported GPU memory meets the 8 GB SDXL acceptance-test floor; this does not prove generation will succeed.".into()),
+        ),
+        None => (
+            "unavailable",
+            Some("ComfyUI did not report usable GPU memory information. Hardware checks are advisory; a real generation is still required.".into()),
+        ),
+    }
+}
+
+fn probe_failure_status(
+    configuration: &ImageGenerationConfiguration,
+    model: &'static ImageModelDefinition,
+    local_busy: bool,
+    failure: ReadinessProbeError,
+) -> ImageEngineStatus {
+    let (state, engine_status, error) = match failure {
+        ReadinessProbeError::Unavailable(error) => ("unavailable", "unavailable", error),
+        ReadinessProbeError::Incompatible(error) => ("incompatible", "incompatible", error),
+    };
+    ImageEngineStatus {
+        state,
+        ready: false,
+        endpoint: configuration.endpoint.clone(),
+        model: model.into(),
+        checkpoint: configuration.checkpoint.clone(),
+        busy: local_busy,
+        engine_status,
+        model_status: "unknown",
+        hardware_status: "unavailable",
+        missing_nodes: vec![],
+        missing_files: vec![],
+        hardware_message: None,
+        error: Some(error),
+    }
+}
+
+fn malformed_probe(message: &str) -> ReadinessProbeError {
+    ReadinessProbeError::Incompatible(message.into())
+}
+
+async fn readiness_with_provider(
+    provider: &impl ImageReadinessProvider,
+    configuration: &ImageGenerationConfiguration,
+    local_busy: bool,
+) -> ImageEngineStatus {
+    let model = model_definition(&configuration.model_id)
+        .expect("validated image model configuration must reference the registry");
+    let system_stats = match provider.system_stats().await {
+        Ok(value)
+            if value.as_object().is_some() && value.get("system").is_some_and(Value::is_object) =>
+        {
+            value
+        }
+        Ok(_) => {
+            return probe_failure_status(
+                configuration,
+                model,
+                local_busy,
+                malformed_probe("ComfyUI returned a malformed /system_stats response."),
+            )
+        }
+        Err(error) => return probe_failure_status(configuration, model, local_busy, error),
+    };
+    let (hardware_status, hardware_message) = hardware_diagnostics(&system_stats);
+    let object_info = match provider.object_info().await {
+        Ok(value) if value.as_object().is_some() => value,
+        Ok(_) => {
+            return probe_failure_status(
+                configuration,
+                model,
+                local_busy,
+                malformed_probe("ComfyUI returned a malformed /object_info response."),
+            )
+        }
+        Err(error) => return probe_failure_status(configuration, model, local_busy, error),
+    };
+    let queue = match provider.queue_info().await {
+        Ok(value) => value,
+        Err(error) => return probe_failure_status(configuration, model, local_busy, error),
+    };
+    let Some(running) = queue.get("queue_running").and_then(Value::as_array) else {
+        return probe_failure_status(
+            configuration,
+            model,
+            local_busy,
+            malformed_probe("ComfyUI returned a malformed /queue response."),
+        );
+    };
+    let Some(pending) = queue.get("queue_pending").and_then(Value::as_array) else {
+        return probe_failure_status(
+            configuration,
+            model,
+            local_busy,
+            malformed_probe("ComfyUI returned a malformed /queue response."),
+        );
+    };
+    let busy = local_busy || !running.is_empty() || !pending.is_empty();
+    let missing_nodes: Vec<String> = model
+        .required_nodes
+        .iter()
+        .filter(|node| object_info.get(**node).is_none())
+        .map(|node| (*node).to_owned())
+        .collect();
+    if !missing_nodes.is_empty() {
+        return ImageEngineStatus {
+            state: "missing_nodes",
+            ready: false,
+            endpoint: configuration.endpoint.clone(),
+            model: model.into(),
+            checkpoint: configuration.checkpoint.clone(),
+            busy,
+            engine_status: if busy { "busy" } else { "reachable" },
+            model_status: "missing_nodes",
+            hardware_status,
+            missing_nodes,
+            missing_files: vec![],
+            hardware_message,
+            error: Some("This ComfyUI installation is missing nodes required by the selected SDXL workflow.".into()),
+        };
+    }
+    let Some(checkpoints) = object_info
+        .get("CheckpointLoaderSimple")
+        .and_then(|node| node.get("input"))
+        .and_then(|input| input.get("required"))
+        .and_then(|required| required.get("ckpt_name"))
+        .and_then(Value::as_array)
+        .and_then(|definition| definition.first())
+        .and_then(Value::as_array)
+    else {
+        return probe_failure_status(
+            configuration,
+            model,
+            busy,
+            malformed_probe("ComfyUI's checkpoint API is incompatible with this AIIDE build."),
+        );
+    };
+    let checkpoint_installed = checkpoints
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|checkpoint| checkpoint == configuration.checkpoint);
+    if !checkpoint_installed {
+        return ImageEngineStatus {
+            state: "missing_checkpoint",
+            ready: false,
+            endpoint: configuration.endpoint.clone(),
+            model: model.into(),
+            checkpoint: configuration.checkpoint.clone(),
+            busy,
+            engine_status: if busy { "busy" } else { "reachable" },
+            model_status: "missing_checkpoint",
+            hardware_status,
+            missing_nodes: vec![],
+            missing_files: vec![configuration.checkpoint.clone()],
+            hardware_message,
+            error: Some("The selected SDXL checkpoint is not installed in ComfyUI.".into()),
+        };
+    }
+    ImageEngineStatus {
+        state: if busy { "busy" } else { "ready" },
+        ready: true,
+        endpoint: configuration.endpoint.clone(),
+        model: model.into(),
+        checkpoint: configuration.checkpoint.clone(),
+        busy,
+        engine_status: if busy { "busy" } else { "reachable" },
+        model_status: "ready",
+        hardware_status,
+        missing_nodes: vec![],
+        missing_files: vec![],
+        hardware_message,
+        error: if busy {
+            Some("ComfyUI is busy with another generation. Retry when its queue is clear.".into())
+        } else {
+            None
+        },
+    }
 }
 
 fn sdxl_workflow(prompt: &str, checkpoint: &str, seed: u64) -> Value {
@@ -523,6 +950,18 @@ fn sdxl_workflow(prompt: &str, checkpoint: &str, seed: u64) -> Value {
         "8": { "class_type": "VAEDecode", "inputs": { "samples": ["3", 0], "vae": ["4", 2] }},
         "9": { "class_type": "PreviewImage", "inputs": { "images": ["8", 0] }}
     })
+}
+
+fn workflow_for_model(
+    model: &ImageModelDefinition,
+    prompt: &str,
+    checkpoint: &str,
+    seed: u64,
+) -> Value {
+    match model.workflow_id {
+        "comfyui-sdxl-base-v1" => sdxl_workflow(prompt, checkpoint, seed),
+        _ => unreachable!("registered image models must have an implemented workflow"),
+    }
 }
 
 fn next_seed() -> u64 {
@@ -571,6 +1010,7 @@ async fn start_with_provider(
     provider: &impl ImageGenerationProvider,
     state: &ImageGenerationState,
     prompt: String,
+    model: &ImageModelDefinition,
     checkpoint: &str,
 ) -> Result<ImageJob, String> {
     let prompt = validate_prompt(&prompt)?;
@@ -614,7 +1054,10 @@ async fn start_with_provider(
         }
     }
     let prompt_id = match provider
-        .submit(sdxl_workflow(&prompt, checkpoint, seed), &job_id)
+        .submit(
+            workflow_for_model(model, &prompt, checkpoint, seed),
+            &job_id,
+        )
         .await
     {
         Ok(id) => id,
@@ -821,72 +1264,66 @@ async fn cancel_with_provider(
 #[tauri::command]
 pub async fn image_generation_status(
     state: State<'_, ImageGenerationState>,
+    app: tauri::AppHandle,
 ) -> Result<ImageEngineStatus, String> {
-    let checkpoint = match configured_checkpoint() {
-        Ok(checkpoint) => checkpoint,
-        Err(error) => {
-            return Ok(ImageEngineStatus {
-                state: "error",
-                endpoint: std::env::var("AIIDE_COMFYUI_ENDPOINT")
-                    .unwrap_or_else(|_| DEFAULT_ENDPOINT.into()),
-                checkpoint: std::env::var("AIIDE_COMFYUI_CHECKPOINT").unwrap_or_default(),
-                busy: false,
-                error: Some(error),
-            })
-        }
-    };
-    let busy = state
+    let configuration = selected_configuration(&app)?;
+    let local_busy = state
         .inner
         .lock()
         .ok()
         .and_then(|inner| inner.current.as_ref().map(|job| job.phase.active()))
         .unwrap_or(false);
-    let provider = match ComfyUiProvider::from_env(Duration::from_secs(4)) {
-        Ok(provider) => provider,
-        Err(error) => {
-            return Ok(ImageEngineStatus {
-                state: "error",
-                endpoint: std::env::var("AIIDE_COMFYUI_ENDPOINT")
-                    .unwrap_or_else(|_| DEFAULT_ENDPOINT.into()),
-                checkpoint,
-                busy,
-                error: Some(error),
-            })
-        }
-    };
-    let endpoint = provider.endpoint.as_str().trim_end_matches('/').to_owned();
-    match provider.available().await {
-        Ok(true) => Ok(ImageEngineStatus {
-            state: "connected",
-            endpoint,
-            checkpoint,
-            busy,
-            error: None,
-        }),
-        Ok(false) => Ok(ImageEngineStatus {
-            state: "offline",
-            endpoint,
-            checkpoint,
-            busy,
-            error: Some("ComfyUI is unavailable at the configured local endpoint.".into()),
-        }),
-        Err(error) => Ok(ImageEngineStatus {
-            state: "offline",
-            endpoint,
-            checkpoint,
-            busy,
-            error: Some(error),
-        }),
+    let provider = ComfyUiProvider::new(&configuration.endpoint, Duration::from_secs(4))?;
+    Ok(readiness_with_provider(&provider, &configuration, local_busy).await)
+}
+
+#[tauri::command]
+pub async fn configure_image_generation(
+    endpoint: String,
+    model_id: String,
+    state: State<'_, ImageGenerationState>,
+    app: tauri::AppHandle,
+) -> Result<ImageEngineStatus, String> {
+    let local_busy = state
+        .inner
+        .lock()
+        .map_err(|_| "Image generation state unavailable")?
+        .current
+        .as_ref()
+        .is_some_and(|job| job.phase.active());
+    if local_busy {
+        return Err(
+            "Cancel or finish the active image generation before changing its connection.".into(),
+        );
     }
+    let configuration = persist_configuration(&configuration_path(&app)?, endpoint, model_id)?;
+    let provider = ComfyUiProvider::new(&configuration.endpoint, Duration::from_secs(4))?;
+    Ok(readiness_with_provider(&provider, &configuration, false).await)
 }
 
 #[tauri::command]
 pub async fn start_image_generation(
     prompt: String,
     state: State<'_, ImageGenerationState>,
+    app: tauri::AppHandle,
 ) -> Result<ImageJob, String> {
-    let provider = ComfyUiProvider::from_env(Duration::from_secs(20))?;
-    let result = start_with_provider(&provider, &state, prompt, &configured_checkpoint()?).await;
+    let configuration = selected_configuration(&app)?;
+    let model = model_definition(&configuration.model_id)
+        .ok_or("The selected image model is not supported by this AIIDE build.")?;
+    let provider = ComfyUiProvider::new(&configuration.endpoint, Duration::from_secs(20))?;
+    let readiness = readiness_with_provider(&provider, &configuration, false).await;
+    if !readiness.ready {
+        return Err(readiness
+            .error
+            .unwrap_or_else(|| "Image generation is not ready.".into()));
+    }
+    if readiness.busy {
+        return Err(
+            "ComfyUI is busy with another generation. Retry when its queue is clear.".into(),
+        );
+    }
+    let result =
+        start_with_provider(&provider, &state, prompt, model, &configuration.checkpoint).await;
     if let Ok(job) = &result {
         eprintln!("[AIIDE][image] submitted {}", job.job_id);
     }
@@ -897,8 +1334,10 @@ pub async fn start_image_generation(
 pub async fn get_image_generation(
     job_id: String,
     state: State<'_, ImageGenerationState>,
+    app: tauri::AppHandle,
 ) -> Result<ImageJob, String> {
-    let provider = ComfyUiProvider::from_env(Duration::from_secs(30))?;
+    let configuration = selected_configuration(&app)?;
+    let provider = ComfyUiProvider::new(&configuration.endpoint, Duration::from_secs(30))?;
     refresh_with_provider(&provider, &state, &job_id).await
 }
 
@@ -906,8 +1345,10 @@ pub async fn get_image_generation(
 pub async fn cancel_image_generation(
     job_id: String,
     state: State<'_, ImageGenerationState>,
+    app: tauri::AppHandle,
 ) -> Result<ImageJob, String> {
-    let provider = ComfyUiProvider::from_env(Duration::from_secs(10))?;
+    let configuration = selected_configuration(&app)?;
+    let provider = ComfyUiProvider::new(&configuration.endpoint, Duration::from_secs(10))?;
     let result = cancel_with_provider(&provider, &state, &job_id).await;
     if let Ok(job) = &result {
         eprintln!(
@@ -1167,6 +1608,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    const DEFAULT_MODEL_ID: &str = SDXL_BASELINE_MODEL_ID;
+
     struct MockProvider {
         available: bool,
         submitted: Mutex<Vec<Value>>,
@@ -1209,6 +1652,70 @@ mod tests {
         }
     }
 
+    struct MockReadinessProvider {
+        system_stats: Result<Value, ReadinessProbeError>,
+        object_info: Result<Value, ReadinessProbeError>,
+        queue: Result<Value, ReadinessProbeError>,
+    }
+
+    impl ImageReadinessProvider for MockReadinessProvider {
+        async fn system_stats(&self) -> Result<Value, ReadinessProbeError> {
+            self.system_stats.clone()
+        }
+
+        async fn object_info(&self) -> Result<Value, ReadinessProbeError> {
+            self.object_info.clone()
+        }
+
+        async fn queue_info(&self) -> Result<Value, ReadinessProbeError> {
+            self.queue.clone()
+        }
+    }
+
+    fn configuration() -> ImageGenerationConfiguration {
+        ImageGenerationConfiguration::defaults()
+    }
+
+    fn system_stats() -> Value {
+        json!({
+            "system": { "os": "nt" },
+            "devices": [{ "name": "Test GPU", "type": "cuda", "vram_total": MINIMUM_GUIDANCE_VRAM_BYTES }]
+        })
+    }
+
+    fn object_info(checkpoint: Option<&str>, omitted_node: Option<&str>) -> Value {
+        let mut nodes = serde_json::Map::new();
+        for node in SDXL_REQUIRED_NODES {
+            if omitted_node == Some(*node) {
+                continue;
+            }
+            let value = if *node == "CheckpointLoaderSimple" {
+                json!({
+                    "input": {
+                        "required": {
+                            "ckpt_name": [checkpoint.into_iter().collect::<Vec<_>>(), {}]
+                        }
+                    }
+                })
+            } else {
+                json!({})
+            };
+            nodes.insert((*node).into(), value);
+        }
+        Value::Object(nodes)
+    }
+
+    fn readiness_provider(
+        checkpoint: Option<&str>,
+        omitted_node: Option<&str>,
+    ) -> MockReadinessProvider {
+        MockReadinessProvider {
+            system_stats: Ok(system_stats()),
+            object_info: Ok(object_info(checkpoint, omitted_node)),
+            queue: Ok(json!({ "queue_running": [], "queue_pending": [] })),
+        }
+    }
+
     fn png() -> Vec<u8> {
         [PNG_SIGNATURE.as_slice(), b"test-image"].concat()
     }
@@ -1238,9 +1745,133 @@ mod tests {
             "http://example.com:8188",
             "http://user@127.0.0.1:8188",
             "http://127.0.0.1:8188/api",
+            "http://127.0.0.1:8188/?token=secret",
+            "http://127.0.0.1:8188/#fragment",
         ] {
             assert!(ComfyUiProvider::new(endpoint, Duration::from_secs(1)).is_err());
         }
+    }
+
+    #[test]
+    fn model_registry_keeps_workflow_requirements_out_of_the_runtime() {
+        let model = model_definition(DEFAULT_MODEL_ID).unwrap();
+        assert_eq!(model.architecture, "SDXL");
+        assert_eq!(model.workflow_id, "comfyui-sdxl-base-v1");
+        assert!(model.required_nodes.contains(&"PreviewImage"));
+        assert_eq!(IMAGE_MODELS.len(), 1);
+    }
+
+    #[test]
+    fn successful_engine_and_model_readiness_is_structured() {
+        let status = tauri::async_runtime::block_on(readiness_with_provider(
+            &readiness_provider(Some(DEFAULT_CHECKPOINT), None),
+            &configuration(),
+            false,
+        ));
+        assert_eq!(status.state, "ready");
+        assert!(status.ready);
+        assert_eq!(status.engine_status, "reachable");
+        assert_eq!(status.model_status, "ready");
+        assert_eq!(status.hardware_status, "sufficient");
+        assert!(!status.busy);
+    }
+
+    #[test]
+    fn readiness_reports_missing_checkpoint_and_nodes() {
+        let missing_checkpoint = tauri::async_runtime::block_on(readiness_with_provider(
+            &readiness_provider(Some("another.safetensors"), None),
+            &configuration(),
+            false,
+        ));
+        assert_eq!(missing_checkpoint.state, "missing_checkpoint");
+        assert_eq!(missing_checkpoint.missing_files, vec![DEFAULT_CHECKPOINT]);
+
+        let missing_nodes = tauri::async_runtime::block_on(readiness_with_provider(
+            &readiness_provider(Some(DEFAULT_CHECKPOINT), Some("PreviewImage")),
+            &configuration(),
+            false,
+        ));
+        assert_eq!(missing_nodes.state, "missing_nodes");
+        assert_eq!(missing_nodes.missing_nodes, vec!["PreviewImage"]);
+    }
+
+    #[test]
+    fn readiness_reports_unsupported_unavailable_and_malformed_apis() {
+        let unavailable = MockReadinessProvider {
+            system_stats: Err(ReadinessProbeError::Unavailable(
+                "temporary disconnect".into(),
+            )),
+            object_info: Ok(Value::Null),
+            queue: Ok(Value::Null),
+        };
+        let status = tauri::async_runtime::block_on(readiness_with_provider(
+            &unavailable,
+            &configuration(),
+            false,
+        ));
+        assert_eq!(status.state, "unavailable");
+
+        let unsupported = MockReadinessProvider {
+            system_stats: Ok(system_stats()),
+            object_info: Err(ReadinessProbeError::Incompatible(
+                "missing object_info".into(),
+            )),
+            queue: Ok(Value::Null),
+        };
+        let status = tauri::async_runtime::block_on(readiness_with_provider(
+            &unsupported,
+            &configuration(),
+            false,
+        ));
+        assert_eq!(status.state, "incompatible");
+
+        let malformed = MockReadinessProvider {
+            system_stats: Ok(system_stats()),
+            object_info: Ok(Value::Null),
+            queue: Ok(json!({ "queue_running": [], "queue_pending": [] })),
+        };
+        let status = tauri::async_runtime::block_on(readiness_with_provider(
+            &malformed,
+            &configuration(),
+            false,
+        ));
+        assert_eq!(status.state, "incompatible");
+        assert!(status.error.unwrap().contains("malformed"));
+    }
+
+    #[test]
+    fn readiness_distinguishes_busy_and_advisory_hardware() {
+        let mut provider = readiness_provider(Some(DEFAULT_CHECKPOINT), None);
+        provider.queue = Ok(json!({ "queue_running": [[1, "other-prompt"]], "queue_pending": [] }));
+        provider.system_stats = Ok(json!({
+            "system": { "os": "nt" },
+            "devices": [{ "type": "cuda", "vram_total": 4_u64 * 1024 * 1024 * 1024 }]
+        }));
+        let status = tauri::async_runtime::block_on(readiness_with_provider(
+            &provider,
+            &configuration(),
+            false,
+        ));
+        assert_eq!(status.state, "busy");
+        assert_eq!(status.engine_status, "busy");
+        assert_eq!(status.hardware_status, "potentially_insufficient");
+        assert!(status.ready);
+    }
+
+    #[test]
+    fn explicit_configuration_is_persisted_and_wins_over_fallbacks() {
+        let root = fixture("configuration");
+        let path = root.join(CONFIG_FILE);
+        let saved = persist_configuration(
+            &path,
+            "http://localhost:9000".into(),
+            DEFAULT_MODEL_ID.into(),
+        )
+        .unwrap();
+        assert_eq!(saved.endpoint, "http://localhost:9000");
+        assert_eq!(load_configuration(&path).unwrap(), saved);
+        assert!(path.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1283,6 +1914,7 @@ mod tests {
             &provider,
             &state,
             "cat".into(),
+            model_definition(DEFAULT_MODEL_ID).unwrap(),
             DEFAULT_CHECKPOINT,
         ))
         .unwrap_err();
@@ -1301,6 +1933,7 @@ mod tests {
             &provider,
             &state,
             "A lighthouse".into(),
+            model_definition(DEFAULT_MODEL_ID).unwrap(),
             DEFAULT_CHECKPOINT,
         ))
         .unwrap();
@@ -1308,6 +1941,7 @@ mod tests {
             &provider,
             &state,
             "Another".into(),
+            model_definition(DEFAULT_MODEL_ID).unwrap(),
             DEFAULT_CHECKPOINT,
         ))
         .unwrap_err();
@@ -1345,6 +1979,7 @@ mod tests {
             &provider,
             &state,
             "cat".into(),
+            model_definition(DEFAULT_MODEL_ID).unwrap(),
             DEFAULT_CHECKPOINT,
         ))
         .unwrap();
@@ -1366,6 +2001,7 @@ mod tests {
             &failed_provider,
             &failed_state,
             "cat".into(),
+            model_definition(DEFAULT_MODEL_ID).unwrap(),
             DEFAULT_CHECKPOINT,
         ))
         .unwrap();
@@ -1385,6 +2021,7 @@ mod tests {
             &provider,
             &state,
             "cat".into(),
+            model_definition(DEFAULT_MODEL_ID).unwrap(),
             DEFAULT_CHECKPOINT,
         ))
         .unwrap();
@@ -1404,6 +2041,7 @@ mod tests {
             &provider,
             &state,
             "cat".into(),
+            model_definition(DEFAULT_MODEL_ID).unwrap(),
             DEFAULT_CHECKPOINT,
         ))
         .unwrap();
@@ -1424,6 +2062,7 @@ mod tests {
             &provider,
             &state,
             "cat".into(),
+            model_definition(DEFAULT_MODEL_ID).unwrap(),
             DEFAULT_CHECKPOINT,
         ))
         .unwrap();
@@ -1465,6 +2104,7 @@ mod tests {
             &provider,
             &state,
             "cat".into(),
+            model_definition(DEFAULT_MODEL_ID).unwrap(),
             DEFAULT_CHECKPOINT,
         ))
         .unwrap();

@@ -165,6 +165,25 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .composer-hint span { color: #434943; }
 
 /* Image generation */
+.image-setup-card { max-width: 620px; margin: 28px auto; border: 1px solid #3c4c43; border-radius: 7px; background: #121713; padding: 18px; color: #aaa39b; font-size: 12px; line-height: 1.55; }
+.image-setup-card .eyebrow { display: block; margin-bottom: 6px; color: #7fd99d; font-family: ui-monospace, monospace; font-size: 9px; font-weight: 750; letter-spacing: .12em; }
+.image-setup-card h2 { margin-bottom: 6px; color: #f2efe9; font-size: 17px; }
+.image-requirements { margin-top: 13px; border: 1px solid #4b4029; background: #201b12; padding: 10px; color: #cfc7bb; }
+.image-requirements strong, .image-requirements small { display: block; }
+.image-requirements ul { display: grid; gap: 3px; margin: 6px 0; }
+.image-requirements code { color: #f2c66d; font-family: ui-monospace, monospace; }
+.image-requirements small { color: #938979; }
+.image-hardware { margin-top: 12px; border-left: 2px solid #607268; padding-left: 9px; color: #98a69e; }
+.image-hardware-potentially_insufficient { border-color: #d6a54e; color: #e2bd78; }
+.image-connection-form { display: grid; gap: 6px; margin-top: 15px; }
+.image-connection-form label, .image-setup-model > span { color: #8ba394; font-family: ui-monospace, monospace; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.image-connection-form > div { display: flex; gap: 8px; }
+.image-connection-form input { min-width: 0; flex: 1; border: 1px solid #38443d; border-radius: 5px; background: #1a1f1c; padding: 8px 9px; color: #eeeae4; font-family: ui-monospace, monospace; font-size: 11px; }
+.image-connection-form small { color: #716b65; }
+.image-setup-model { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin-top: 14px; border-top: 1px solid #29322d; padding-top: 11px; }
+.image-setup-model strong { color: #ded9d2; }
+.image-setup-model small { grid-column: 2; color: #77716b; font-family: ui-monospace, monospace; font-size: 9px; }
+.image-setup-actions { display: flex; align-items: center; gap: 11px; margin-top: 15px; }
 .image-result-card { max-width: 680px; overflow: hidden; border: 1px solid #324139; border-radius: 6px; background: #0d110e; }
 .image-result-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid #29352e; padding: 9px 11px; font-size: 11px; }
 .image-result-heading span { color: #86efac; font-family: ui-monospace, monospace; font-size: 9px; font-weight: 800; letter-spacing: .12em; }

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { Elma, type ElmaState } from './Elma'
 import { ImageResultCard } from './ImageResultCard'
+import { ImageSetupCard } from './ImageSetupCard'
 import { getAgentDebugStatus, getLatestAgentTrace, ollamaProvider, setAgentDebug } from '../services/ai/ollama'
 import { comfyUiProvider } from '../services/image/comfyui'
 import type { ChatMessage, PendingProposal, ProviderStatus } from '../types/ai'
@@ -13,6 +14,20 @@ const SUCCESS_DISPLAY_MS = 1300
 const ERROR_DISPLAY_MS = 2000
 const IMAGE_POLL_MS = 1200
 const STARTER_PROMPTS = ['Tell me about this project', 'Find where this is implemented', 'Make a small change']
+const FALLBACK_IMAGE_MODEL = {
+  id: 'sdxl-1.0-base',
+  displayName: 'SDXL 1.0 Base',
+  architecture: 'SDXL',
+  capabilities: ['text-to-image'],
+  engineRequirement: 'ComfyUI core workflow API',
+  workflowId: 'comfyui-sdxl-base-v1',
+  checkpoint: 'sd_xl_base_1.0.safetensors',
+  supportingFiles: [],
+  requiredNodes: ['KSampler', 'CheckpointLoaderSimple', 'EmptyLatentImage', 'CLIPTextEncode', 'VAEDecode', 'PreviewImage'],
+  hardwareGuidance: '8 GB VRAM is the supported acceptance-test floor; hardware detection is advisory.',
+  license: 'CreativeML Open RAIL++-M',
+  acquisition: 'User-provided external ComfyUI checkpoint; AIIDE does not download it in Stage B.',
+}
 
 type ImageOutcome = { kind: 'saved'; path: string } | { kind: 'rejected' } | null
 interface ConversationMessage extends ChatMessage {
@@ -30,6 +45,14 @@ function imageActive(job: ImageJob) {
   return job.status === 'submitting' || job.status === 'queued' || job.status === 'generating'
 }
 
+function unavailableImageStatus(message: string): ImageEngineStatus {
+  return {
+    state: 'unavailable', ready: false, endpoint: 'http://127.0.0.1:8188', model: FALLBACK_IMAGE_MODEL,
+    checkpoint: FALLBACK_IMAGE_MODEL.checkpoint, busy: false, engineStatus: 'unavailable', modelStatus: 'unknown',
+    hardwareStatus: 'unavailable', missingNodes: [], missingFiles: [], hardwareMessage: null, error: message,
+  }
+}
+
 export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject, onProposal, changeState }: { projectOpen: boolean; projectPath?: string; projectBusy: boolean; onOpenProject: () => void; onProposal: (proposal: PendingProposal) => void; changeState: 'working' | 'success' | 'error' | null }) {
   const [mode, setMode] = useState<'chat' | 'image'>('chat')
   const [status, setStatus] = useState<ProviderStatus | null>(null)
@@ -42,6 +65,8 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
   const [imageActionJob, setImageActionJob] = useState<string | null>(null)
   const [checking, setChecking] = useState(false)
   const [checkingImage, setCheckingImage] = useState(false)
+  const [configuringImage, setConfiguringImage] = useState(false)
+  const [imageSetupDismissed, setImageSetupDismissed] = useState(false)
   const [activeSteps, setActiveSteps] = useState<string[]>([])
   const [retrying, setRetrying] = useState(false)
   const [inspecting, setInspecting] = useState(false)
@@ -90,8 +115,19 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
     checkingImageRef.current = true
     setCheckingImage(true)
     try { setImageEngine(await comfyUiProvider.getStatus()) }
-    catch (cause) { setImageEngine({ state: 'offline', endpoint: 'http://127.0.0.1:8188', checkpoint: 'sd_xl_base_1.0.safetensors', busy: false, error: messageOf(cause) }) }
+    catch (cause) { setImageEngine(unavailableImageStatus(messageOf(cause))) }
     finally { checkingImageRef.current = false; setCheckingImage(false) }
+  }
+
+  async function configureImage(endpoint: string, modelId: string) {
+    setConfiguringImage(true)
+    setError(null)
+    try {
+      setImageEngine(await comfyUiProvider.configure(endpoint, modelId))
+      setImageSetupDismissed(false)
+    } catch (cause) {
+      setError(messageOf(cause))
+    } finally { setConfiguringImage(false) }
   }
 
   function updateImageJob(next: ImageJob) {
@@ -204,7 +240,7 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
     try {
       const engine = await comfyUiProvider.getStatus()
       setImageEngine(engine)
-      if (engine.state !== 'connected') throw new Error(engine.error ?? 'ComfyUI is unavailable at the configured local endpoint.')
+      if (!engine.ready || engine.busy) throw new Error(engine.error ?? 'Image generation is not ready.')
       const job = await comfyUiProvider.start(content)
       setMessages(current => [...current, { role: 'assistant', content: '', channel: 'image', imageJob: job, imageOutcome: null }])
     } catch (cause) {
@@ -270,7 +306,8 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
   const connected = status?.state === 'connected'
   const chatReady = projectOpen && connected && status.models.length > 0 && !activeImage
   const openImage = [...messages].reverse().find(message => message.imageJob && !message.imageOutcome)?.imageJob
-  const imageReady = projectOpen && imageEngine?.state === 'connected' && !openImage && !loading
+  const imageReady = projectOpen && Boolean(imageEngine?.ready) && !imageEngine?.busy && !openImage && !loading
+  const imageNeedsAttention = Boolean(imageEngine && (!imageEngine.ready || imageEngine.busy || imageEngine.hardwareStatus !== 'sufficient'))
   const ready = mode === 'chat' ? chatReady : imageReady
   const working = loading || imageSubmitting || Boolean(activeImage)
   const elmaState: ElmaState = changeState ?? terminalState ?? (working ? inspecting ? 'inspecting' : retrying ? 'working' : imageSubmitting || activeImage ? 'working' : 'thinking' : 'idle')
@@ -296,8 +333,8 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
         <div className="provider-state"><span className={`connection-dot ${connected ? 'connected' : ''}`} /><span>{ollamaProvider.name}</span><span className="connection-state">{checking ? 'Checking…' : connected ? 'Connected' : status?.state === 'error' ? 'Error' : 'Offline'}</span></div>
         <div className="workspace-controls"><label htmlFor="model">Model</label><select id="model" className="model-select" value={selectedModel} disabled={!chatReady || loading} onChange={event => { setSelectedModel(event.target.value); localStorage.setItem(MODEL_KEY, event.target.value) }}><option value="">{connected && status.models.length ? 'Select model' : 'No models'}</option>{status?.models.map(model => <option key={model.id} value={model.id}>{model.name} — {model.profile.label}</option>)}</select><button className="small-button" aria-pressed={debug} disabled={loading} onClick={() => void toggleDebug()}><span aria-hidden="true">›_</span> Debug {debug ? 'on' : 'off'}</button><button className="icon-button" aria-label="Retry Ollama connection" title="Retry connection" onClick={() => void refresh()} disabled={checking || loading}>↻</button></div>
       </> : <>
-        <div className="provider-state"><span className={`connection-dot ${imageEngine?.state === 'connected' ? 'connected' : ''}`} /><span>{comfyUiProvider.name}</span><span className="connection-state">{checkingImage ? 'Checking…' : imageEngine?.state === 'connected' ? 'Connected' : imageEngine?.state === 'error' ? 'Error' : 'Offline'}</span></div>
-        <div className="workspace-controls"><span className="image-model-label">SDXL 1.0 · {imageEngine?.checkpoint ?? 'sd_xl_base_1.0.safetensors'}</span><button className="icon-button" aria-label="Retry ComfyUI connection" title="Retry connection" onClick={() => void refreshImage()} disabled={checkingImage || imageSubmitting}>↻</button></div>
+        <div className="provider-state"><span className={`connection-dot ${imageEngine?.engineStatus === 'reachable' || imageEngine?.engineStatus === 'busy' ? 'connected' : ''}`} /><span>{comfyUiProvider.name}</span><span className="connection-state">{checkingImage ? 'Checking…' : imageEngine?.state === 'ready' ? 'Ready' : imageEngine?.state === 'busy' ? 'Busy' : imageEngine?.engineStatus === 'reachable' ? 'Reachable' : imageEngine?.state === 'incompatible' ? 'Incompatible' : 'Offline'}</span></div>
+        <div className="workspace-controls"><span className="image-model-label">{imageEngine?.model.displayName ?? 'SDXL 1.0 Base'} · {imageEngine?.checkpoint ?? 'sd_xl_base_1.0.safetensors'}</span>{imageNeedsAttention && imageSetupDismissed && <button className="small-button" onClick={() => setImageSetupDismissed(false)}>Configure</button>}<button className="icon-button" aria-label="Retry ComfyUI readiness" title="Retry readiness" onClick={() => void refreshImage()} disabled={checkingImage || imageSubmitting}>↻</button></div>
       </>}
     </div>
     {mode === 'chat' && debug && (
@@ -372,16 +409,17 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
       {projectOpen && mode === 'chat' && status?.state === 'offline' && <div className="chat-empty"><h2>Ollama not detected</h2><p>Start your local Ollama service, then try again.</p><button className="primary-button" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
       {projectOpen && mode === 'chat' && status?.state === 'error' && <div className="chat-empty"><h2>Ollama connection issue</h2><p>{status.error?.message}</p><button className="primary-button" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
       {projectOpen && mode === 'chat' && connected && !status.models.length && <div className="chat-empty"><h2>No local models installed</h2><p>Ollama is connected, but no local models are installed. Pull a model with the Ollama CLI, then retry.</p></div>}
-      {projectOpen && mode === 'image' && imageEngine?.state !== 'connected' && messages.length === 0 && <div className="chat-empty"><h2>ComfyUI not detected</h2><p>{imageEngine?.error ?? 'Start ComfyUI with the SDXL checkpoint installed, then try again.'}</p><button className="primary-button" onClick={() => void refreshImage()} disabled={checkingImage}>Retry</button></div>}
+      {projectOpen && mode === 'image' && !imageEngine && <div className="chat-empty">Checking the ComfyUI engine and selected model…</div>}
+      {projectOpen && mode === 'image' && imageEngine && imageNeedsAttention && !imageSetupDismissed && !openImage && <ImageSetupCard status={imageEngine} checking={checkingImage} saving={configuringImage} onRetry={() => void refreshImage()} onConnect={configureImage} onDismiss={() => setImageSetupDismissed(true)} />}
       {projectOpen && mode === 'chat' && chatReady && messages.length === 0 && <div className="chat-empty project-start"><Elma state="idle" size="hero" /><span className="eyebrow">READY TO HAVE A LOOK</span><h2>What are we working on?</h2><p>I can inspect this project, explain what I find, or prepare a focused edit for review.</p><div className="starter-prompts">{STARTER_PROMPTS.map(starter => <button key={starter} onClick={() => setPrompt(starter)}>{starter}<span aria-hidden="true">→</span></button>)}</div></div>}
-      {projectOpen && mode === 'image' && imageReady && messages.length === 0 && <div className="chat-empty project-start"><Elma state="idle" size="hero" /><span className="eyebrow">LOCAL SDXL · REVIEW BEFORE SAVE</span><h2>What should we make?</h2><p>Describe one image. ComfyUI will generate a temporary 1024 × 1024 preview.</p></div>}
+      {projectOpen && mode === 'image' && imageReady && (!imageNeedsAttention || imageSetupDismissed) && messages.length === 0 && <div className="chat-empty project-start"><Elma state="idle" size="hero" /><span className="eyebrow">LOCAL SDXL · REVIEW BEFORE SAVE</span><h2>What should we make?</h2><p>Describe one image. Readiness checks passed, but only a real GPU generation can confirm acceptance.</p></div>}
       {messages.map((message, index) => <div className={`chat-message chat-message-${message.role}`} key={message.imageJob?.jobId ?? index}><div className="chat-speaker"><span>{message.role === 'user' ? 'YOU' : 'ELMA'}</span>{message.role === 'assistant' && message.model && <small>{message.model}</small>}{message.channel === 'image' && <small>IMAGE</small>}</div>{Boolean(message.activity?.length) && <details className="message-activity"><summary>Inspected {message.activity?.length} items</summary><ul>{message.activity?.map((item, step) => <li key={step}>✓ {item.label}</li>)}</ul></details>}{message.content && <div className="message-body">{message.content}</div>}{message.imageJob && <ImageResultCard job={message.imageJob} previewUrl={previewUrls[message.imageJob.jobId]} outcome={message.imageOutcome ?? null} busy={imageActionJob === message.imageJob.jobId} onCancel={() => void cancelImage(message.imageJob!)} onReject={() => void rejectImage(message.imageJob!)} onRegenerate={() => void regenerateImage(message.imageJob!)} onSave={path => void saveImage(message.imageJob!, path)} />}</div>)}
       {loading && <div className="chat-message activity-message"><div>{retrying ? 'Working on it…' : inspecting ? 'Checking files…' : activeSteps.length ? 'Preparing an answer…' : 'Thinking…'}</div>{activeSteps.map((step, index) => <div className="activity-step" key={index}>✓ {step}</div>)}</div>}
       {imageSubmitting && <div className="chat-message activity-message">Submitting the fixed SDXL workflow to ComfyUI…</div>}
       <div ref={endRef} />
     </div>
     <div className="chat-composer">
-      <div className="composer-mode" role="group" aria-label="Request type"><button aria-pressed={mode === 'chat'} disabled={loading || imageSubmitting} onClick={() => { setMode('chat'); setError(null) }}>Chat</button><button aria-pressed={mode === 'image'} disabled={loading || imageSubmitting} onClick={() => { setMode('image'); setError(null) }}>Image</button></div>
+      <div className="composer-mode" role="group" aria-label="Request type"><button aria-pressed={mode === 'chat'} disabled={loading || imageSubmitting} onClick={() => { setMode('chat'); setError(null) }}>Chat</button><button aria-pressed={mode === 'image'} disabled={loading || imageSubmitting} onClick={() => { setMode('image'); setImageSetupDismissed(false); setError(null) }}>Image</button></div>
       {error && <div role="alert" className="composer-error">{error}</div>}
       <div className="composer-row"><textarea aria-label={mode === 'image' ? 'Image prompt' : 'Prompt'} className="prompt-input" value={prompt} disabled={!ready || loading || imageSubmitting} maxLength={mode === 'image' ? 4000 : 12000} placeholder={placeholder} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void (mode === 'image' ? sendImage() : sendChat()) } }} /><button className="primary-button send-button" onClick={() => void (mode === 'image' ? sendImage() : sendChat())} disabled={!ready || !prompt.trim() || loading || imageSubmitting}>{mode === 'image' ? 'Generate' : 'Send'}</button></div>
       <p className="composer-hint"><kbd>Enter</kbd> {mode === 'image' ? 'generate' : 'send'} <span>·</span> <kbd>Shift</kbd> + <kbd>Enter</kbd> new line <span>·</span> {mode === 'image' ? 'One local GPU job at a time' : 'Session-only chat'}</p>

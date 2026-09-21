@@ -39,6 +39,7 @@ pub fn run() {
             git::git_commit_detail,
             git::git_suggest_commit_message,
             image_generation::image_generation_status,
+            image_generation::configure_image_generation,
             image_generation::start_image_generation,
             image_generation::get_image_generation,
             image_generation::get_image_preview,
