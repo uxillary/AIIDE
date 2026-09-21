@@ -1,62 +1,37 @@
 # AIIDE repository map
 
-Use this map to choose a starting point, then inspect only necessary call boundaries. [CONTEXT.md](CONTEXT.md) is the concise current source of truth; [PROJECT.md](../PROJECT.md) owns product principles, capability status, and roadmap.
+Use this map to pick a starting point, then inspect only the necessary call boundaries. [CONTEXT.md](CONTEXT.md) records durable architecture; [PROJECT.md](../PROJECT.md) owns capability status and roadmap.
 
-| Task area | Start here | Cross boundary only if needed |
+| Feature | Start here | Cross boundary only if needed |
 | --- | --- | --- |
-| Chat, composer, activity, provider/model controls | `src/components/LocalChat.tsx`, `src/styles.css` | `src/services/ai/`, `src/types/ai.ts`, then `src-tauri/src/ollama.rs` for behaviour |
-| Elma personality or model-specific prompting | `codex/PERSONALITY.md`, `codex/MODEL-PROFILES.md` | `src-tauri/src/model_profiles.rs`, then `ollama.rs` for runtime prompts |
-| Elma animation states | `src/components/Elma.tsx`, `src/assets/elma/runtime/`, `src/styles.css` | `LocalChat.tsx` and `App.tsx` for state selection |
-| Text-provider abstraction, Ollama, OpenRouter | `src-tauri/src/model_provider.rs` | `ollama.rs`; `src/services/ai/ollama.ts` for the Ollama-only desktop route |
-| Agent protocol, grounding, retries, debug trace | `src-tauri/src/ollama.rs` | `repository.rs` for tool execution and proposal rules |
-| Repository listing, search, reads, path safety, pending changes | `src-tauri/src/repository.rs` | `ollama.rs` for orchestration; `src/services/project.ts` and `src/types/project.ts` for UI contracts |
-| Application-led HTML candidate discovery | `src-tauri/src/repository/candidates.rs` | `ollama.rs` for candidate selection/replacement and `repository.rs` for proposal assembly |
-| Open folder, project tree, Git summary | `src-tauri/src/project.rs` | `src/components/ProjectSidebar.tsx`, `FileTree.tsx`, and `FileViewer.tsx` |
-| Local Git status, diffs, staging, commits, history | `src-tauri/src/git.rs` | `src/components/GitPanel.tsx`, `src/services/git.ts`, `src/types/git.ts` |
-| Pending proposal UI and session history | `src/components/ChangesPanel.tsx`, `src/App.tsx` | `repository.rs` for Apply/Reject safety |
-| Agent benchmark and model compatibility | `src-tauri/src/benchmark.rs`, `src-tauri/src/model_profiles.rs` | `src-tauri/src/bin/agent-benchmark.rs`, `src-tauri/fixtures/agent-benchmark/` |
-| Tauri command wiring and permissions | `src-tauri/src/lib.rs` | relevant command module, `src-tauri/capabilities/default.json`, `src-tauri/tauri.conf.json` |
-| Build and dependencies | `package.json`, `src-tauri/Cargo.toml` | Vite, TypeScript, ESLint, Tauri config; lockfiles only for dependency work |
-| Product status and roadmap | `PROJECT.md` | `codex/CONTEXT.md` for a compact implementation snapshot |
-| Standalone distribution and onboarding | `codex/STANDALONE-DISTRIBUTION-DESIGN.md` | `PROJECT.md` for priorities; no implementation exists yet |
+| React UI, application state, chat and provider controls | `src/App.tsx`, `src/components/LocalChat.tsx` | `src/services/`, `src/types/`, then the owning Tauri command |
+| Shared UI styling and accessibility | `src/styles.css` | relevant component in `src/components/` |
+| Elma sprites, animation and state | `src/components/Elma.tsx`, `src/assets/elma/runtime/` | `LocalChat.tsx` and `App.tsx` for state selection; `codex/PERSONALITY.md` for voice |
+| Text providers and agent orchestration | `src-tauri/src/model_provider.rs`, `src-tauri/src/ollama.rs` | `src/services/ai/`, `src/types/ai.ts`, `model_profiles.rs` |
+| Repository inspection and reviewable editing | `src-tauri/src/repository.rs`, `src-tauri/src/repository/candidates.rs` | `ollama.rs`; `src/services/project.ts`, `src/types/project.ts`, `ChangesPanel.tsx` |
+| Project opening, tree and file viewer | `src-tauri/src/project.rs` | `ProjectSidebar.tsx`, `FileTree.tsx`, `FileViewer.tsx` |
+| Local Git status, diffs, staging and commits | `src-tauri/src/git.rs` | `GitPanel.tsx`, `src/services/git.ts`, `src/types/git.ts` |
+| Tauri command wiring and permissions | `src-tauri/src/lib.rs` | owning Rust module, `src-tauri/capabilities/default.json`, `src-tauri/tauri.conf.json` |
+| Tests and agent benchmark | inline Rust test modules, `src-tauri/src/benchmark.rs` | `src-tauri/src/bin/agent-benchmark.rs`, `src-tauri/fixtures/agent-benchmark/`, `codex/MODEL-PROFILES.md` |
+| Build and configuration | `package.json`, `src-tauri/Cargo.toml` | Vite, TypeScript, ESLint and Tauri configuration; lockfiles only for dependency work |
+| Product decisions and distribution | `PROJECT.md`, `codex/STANDALONE-DISTRIBUTION-DESIGN.md` | `README.md` for public setup and limitations |
 
-## Architecture at a glance
+## Directory boundaries
 
-`src/` is the React/TypeScript/Vite frontend. Components render the chat-first workspace; services wrap Tauri invocations; types define frontend contracts. There is no frontend unit-test harness, so frontend regression checks are lint, typecheck, and build.
+- `src/` is the React/TypeScript/Vite frontend. Components render state, services invoke Tauri commands, types define frontend contracts, and `App.tsx` coordinates the workspace.
+- `src-tauri/src/` is the trusted Rust backend. It owns project identity, bounded repository access, deterministic proposal assembly and application, provider orchestration, and approved local Git mutations.
+- Repository-aware model calls use bounded list/search/read tools. Application-led HTML candidate discovery lives in `repository/candidates.rs`; only validated pending proposals can reach Apply/Reject in the UI.
+- `src/assets/elma/` contains source frames, sheets, and runtime sprites. Start with the small `runtime/` set; inspect source art only for sprite work.
 
-`src-tauri/src/` is the trusted Rust/Tauri backend:
+## Branch-only tools and capabilities
 
-- `project.rs` owns the opened project and bounded tree metadata.
-- `repository.rs` owns bounded inspection, protected/project-relative paths, pending proposals, read-only viewing, Apply/Reject, and stale-write protection.
-- `repository/candidates.rs` extracts bounded verified HTML title, heading, and paragraph candidates.
-- `ollama.rs` owns request classification, the bounded agent loop, provider-neutral model calls, grounding, candidate-edit orchestration, retries, and debug traces. The command names remain Ollama-specific because the desktop UI currently exposes only Ollama.
-- `model_provider.rs` implements the internal Ollama/OpenRouter text-inference boundary. OpenRouter is available to the benchmark but not the desktop UI.
-- `git.rs` owns local Git inspection and explicit mutations. No GitHub or remote commands exist.
-- `benchmark.rs` owns the controlled three-case agent harness.
-- `lib.rs` registers state and Tauri commands; `main.rs` launches the application.
+- Image generation is on `image-generation`, not the current mainline implementation. There, `src-tauri/src/image_generation.rs` owns the image-provider boundary, ComfyUI adapter, lifecycle, temporary output and protected save. UI owners are `src/components/ImageResultCard.tsx`, `src/services/image/`, `src/types/image.ts`, and image mode in `LocalChat.tsx`. The branch design is `codex/M08A-IMAGE-GENERATION-DESIGN.md`.
+- Sprite Workshop is on `tools-workshop`. `tools/sprite-workshop/src/` owns its standalone React/Vite editor; `src/project.ts`, `detection.ts`, `alignment.ts`, `render.ts`, and `export.ts` own the main workflows. Its tests are in `tools/sprite-workshop/tests/`. It is a local browser utility, not part of the Tauri application.
 
-## Image-generation branch
+Use `git show <branch>:<path>` for narrow read-only inspection of branch-only work. Do not treat a local ignored build directory as merged source.
 
-M08A is committed on `image-generation`, not `main`. Inspect it read-only with Git unless that branch is the active work target:
+## Default-ignore areas
 
-```powershell
-git show image-generation:codex/M08A-IMAGE-GENERATION-DESIGN.md
-git show image-generation:src-tauri/src/image_generation.rs
-git diff --stat main...image-generation
-```
+Unless directly relevant, skip `node_modules/`, `.npm-cache/`, `dist/`, `build/`, `coverage/`, `src-tauri/target/`, generated Tauri schemas, `*.tsbuildinfo`, lockfiles, and local IDE files. Skip `files/` installer archives and other binaries. Treat `elma-images/` and non-runtime `src/assets/elma/` as large asset collections; inspect filenames or selected assets rather than dumping them. Never inspect `.env*`, `*.local`, credential stores, or diagnostic content merely for orientation. Treat any future `codex/archive/` as historical and opt-in.
 
-On that branch, `src-tauri/src/image_generation.rs` owns the image-provider abstraction, ComfyUI adapter, fixed SDXL workflow, lifecycle, temporary storage, cancellation, and protected save. Frontend owners are `src/components/ImageResultCard.tsx`, `src/services/image/`, `src/types/image.ts`, and the image mode in `LocalChat.tsx`. Image bytes remain outside the text proposal/diff path.
-
-## Documentation ownership
-
-- `AGENTS.md` — short repository working rules only.
-- `README.md` — public introduction, current developer setup, supported features, and release limitations.
-- `PROJECT.md` — canonical vision, principles, capability inventory, architecture, roadmap, and open decisions.
-- `codex/CONTEXT.md` — token-efficient current state and durable decisions.
-- `codex/REPO-MAP.md` — navigation only.
-- `codex/PERSONALITY.md` — canonical Elma personality.
-- `codex/MODEL-PROFILES.md` — model compatibility and benchmark usage.
-- `codex/STANDALONE-DISTRIBUTION-DESIGN.md` — planned distribution/onboarding/runtime architecture.
-- milestone design documents — detailed milestone-specific decisions; branch-specific documents stay branch-specific until their feature merges.
-
-Generated/local areas include `node_modules/`, `dist/`, `.npm-cache/`, `src-tauri/target/`, `src-tauri/gen/`, and TypeScript `*.tsbuildinfo`. Do not inspect them unless the task concerns generated output. Treat any future `codex/archive/` as cold history.
+These are behavioural defaults, not absolute bans: inspect an excluded area when the task specifically concerns it.
