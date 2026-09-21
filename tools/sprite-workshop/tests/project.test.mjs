@@ -17,7 +17,8 @@ const project = {
   schemaVersion: PROJECT_SCHEMA_VERSION, regions, selectedId: 'frame-a', slots: ['frame-a', 'frame-b', null, null, null, null, null, null], activeSlot: 1,
   fps: 12, animationName: 'walk', alignmentMode: 'center', offsets: [{ x: 4, y: -2 }, ...Array.from({ length: 7 }, () => ({ x: 0, y: 0 }))],
   padding: 9, minWidth: 32, minHeight: 48, onion: true, onionReference: 'fixed', fixedReferenceSlot: 1, centreGuide: false, baselineGuide: true,
-  pixelGrid: true, baselineOffset: 3, detectionMode: 'alpha', grid: { rows: 2, columns: 3, gapX: 1, gapY: 2, left: 3, right: 4, top: 5, bottom: 6 }, joinGap: 7, minPixels: 8,
+  pixelGrid: true, baselineOffset: 3, detectionMode: 'row', grid: { rows: 2, columns: 3, gapX: 1, gapY: 2, left: 3, right: 4, top: 5, bottom: 6 }, joinGap: 7, minPixels: 8,
+  rowSelection: { id: 'row-selection', name: 'Animation row', x: 10, y: 20, width: 80, height: 16 }, rowFrameCount: 8, rowBoundaryMode: 'content', rowPadding: 2,
 }
 const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3])
 const record = { id: 'latest', schemaVersion: PROJECT_SCHEMA_VERSION, savedAt: 1, project, source: { blob: new Blob([png], { type: 'image/png' }), name: 'elma.png', type: 'image/png', size: png.length, lastModified: 42 } }
@@ -30,6 +31,13 @@ test('portable project round trip preserves source bytes, frame order and stable
   assert.equal(restored.project.alignmentMode, 'center')
   assert.deepEqual(restored.project.offsets[0], { x: 4, y: -2 })
   assert.equal(restored.project.padding, 9)
+  assert.deepEqual(restored.project.rowSelection, project.rowSelection)
+  assert.equal(restored.project.rowBoundaryMode, 'content')
+})
+
+test('schema version 1 projects without animation-row settings remain valid', () => {
+  const { rowSelection, rowFrameCount, rowBoundaryMode, rowPadding, ...legacy } = project
+  assert.deepEqual(validateProject(legacy), legacy)
 })
 
 test('malformed and unsupported portable projects are rejected', () => {

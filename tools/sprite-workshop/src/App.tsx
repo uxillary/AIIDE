@@ -8,8 +8,8 @@ import type { SourceImage } from './image'
 import { SpriteCanvas, Thumbnail } from './Preview'
 import { alignmentDragOffset, alignmentScale, calculateLayout, emptyOffsets, referenceSlotFor } from './alignment'
 import type { AlignmentMode, AlignmentZoom, Pixels } from './alignment'
-import { acceptAllSuggestions, acceptSuggestion, alphaSuggestions, eligibleSuggestionCount, gridSuggestions, rejectSuggestion } from './detection'
-import type { GridOptions } from './detection'
+import { acceptAllSuggestions, acceptSuggestion, acceptSuggestionBatch, alphaSuggestions, animationRowSuggestions, eligibleSuggestionCount, gridSuggestions, rejectSuggestion } from './detection'
+import type { GridOptions, RowBoundaryMode, RowSuggestion } from './detection'
 import { removeFrame, restoreFrame, slotsFromFrameOrder } from './frameActions'
 import type { DeletedFrame } from './frameActions'
 import { DetectionPanel } from './DetectionPanel'
@@ -18,8 +18,9 @@ import type { ProjectData, SourceRecord, StoredProject } from './project'
 
 type Drag =
   | { kind: 'draw'; start: Point; id: string; name: string }
+  | { kind: 'row-draw'; start: Point }
   | { kind: 'pan'; start: Point; pan: Point }
-  | { kind: 'move' | 'resize'; start: Point; region: Region; handle?: Handle }
+  | { kind: 'move' | 'resize' | 'row-move' | 'row-resize'; start: Point; region: Region; handle?: Handle }
 
 const HANDLES: Handle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w']
 const EMPTY_SLOTS = Array<string | null>(8).fill(null)
@@ -55,12 +56,17 @@ export default function App() {
   const [pixels, setPixels] = useState<Pixels | null>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [deleted, setDeleted] = useState<DeletedFrame | null>(null)
-  const [suggestions, setSuggestions] = useState<Region[]>([])
+  const [suggestions, setSuggestions] = useState<RowSuggestion[]>([])
   const [selectedSuggestion, setSelectedSuggestion] = useState<string | null>(null)
-  const [detectionMode, setDetectionMode] = useState<'grid' | 'alpha'>('grid')
+  const [detectionMode, setDetectionMode] = useState<'grid' | 'alpha' | 'row'>('grid')
   const [grid, setGrid] = useState<GridOptions>({ rows: 5, columns: 8, gapX: 8, gapY: 8, left: 0, right: 0, top: 0, bottom: 0 })
   const [joinGap, setJoinGap] = useState(12)
   const [minPixels, setMinPixels] = useState(8)
+  const [rowSelection, setRowSelection] = useState<Region | null>(null)
+  const [rowFrameCount, setRowFrameCount] = useState(8)
+  const [rowBoundaryMode, setRowBoundaryMode] = useState<RowBoundaryMode>('equal')
+  const [rowPadding, setRowPadding] = useState(0)
+  const [assignBatch, setAssignBatch] = useState(false)
   const [slots, setSlots] = useState<(string | null)[]>(EMPTY_SLOTS)
   const [activeSlot, setActiveSlot] = useState(0)
   const [fps, setFps] = useState(8)
@@ -129,13 +135,15 @@ export default function App() {
   const projectData = useMemo<ProjectData>(() => ({
     schemaVersion: PROJECT_SCHEMA_VERSION, regions, selectedId, slots, activeSlot, fps, animationName, alignmentMode, offsets, padding, minWidth, minHeight,
     onion, onionReference, fixedReferenceSlot, centreGuide, baselineGuide, pixelGrid, baselineOffset, detectionMode, grid, joinGap, minPixels,
-  }), [regions, selectedId, slots, activeSlot, fps, animationName, alignmentMode, offsets, padding, minWidth, minHeight, onion, onionReference, fixedReferenceSlot, centreGuide, baselineGuide, pixelGrid, baselineOffset, detectionMode, grid, joinGap, minPixels])
+    rowSelection, rowFrameCount, rowBoundaryMode, rowPadding,
+  }), [regions, selectedId, slots, activeSlot, fps, animationName, alignmentMode, offsets, padding, minWidth, minHeight, onion, onionReference, fixedReferenceSlot, centreGuide, baselineGuide, pixelGrid, baselineOffset, detectionMode, grid, joinGap, minPixels, rowSelection, rowFrameCount, rowBoundaryMode, rowPadding])
 
   function applyProject(project: ProjectData) {
     setRegions(project.regions); setSelectedId(project.selectedId); setSlots(project.slots); setActiveSlot(project.activeSlot); setFps(project.fps); setAnimationName(project.animationName)
     setAlignmentMode(project.alignmentMode); setOffsets(project.offsets); setPadding(project.padding); setMinWidth(project.minWidth); setMinHeight(project.minHeight)
     setOnion(project.onion); setOnionReference(project.onionReference); setFixedReferenceSlot(project.fixedReferenceSlot); setCentreGuide(project.centreGuide); setBaselineGuide(project.baselineGuide)
     setPixelGrid(project.pixelGrid); setBaselineOffset(project.baselineOffset); setDetectionMode(project.detectionMode); setGrid(project.grid); setJoinGap(project.joinGap); setMinPixels(project.minPixels)
+    setRowSelection(project.rowSelection ?? null); setRowFrameCount(project.rowFrameCount ?? 8); setRowBoundaryMode(project.rowBoundaryMode ?? 'equal'); setRowPadding(project.rowPadding ?? 0)
     setSuggestions([]); setSelectedSuggestion(null); setDeleted(null); setPlaying(false); setExportError(null)
     nextNumber.current = project.regions.length + 1
   }
@@ -306,7 +314,7 @@ export default function App() {
       catch { loaded.bitmap.close(); throw new Error('Could not read PNG pixels for local alpha analysis.') }
       sourceRef.current?.bitmap.close()
       sourceRef.current = loaded
-      setSource(loaded); setSourceRecord({ blob: file, name: file.name, type: 'image/png', size: file.size, lastModified: file.lastModified }); setPixels({ data: imageData.data, width: loaded.width, height: loaded.height }); setRegions([]); setSelectedId(null); setSlots([...EMPTY_SLOTS]); setOffsets(emptyOffsets()); setSuggestions([]); setSelectedSuggestion(null); setDeleted(null); setActiveSlot(0); setPlaying(false); nextNumber.current = 1
+      setSource(loaded); setSourceRecord({ blob: file, name: file.name, type: 'image/png', size: file.size, lastModified: file.lastModified }); setPixels({ data: imageData.data, width: loaded.width, height: loaded.height }); setRegions([]); setSelectedId(null); setSlots([...EMPTY_SLOTS]); setOffsets(emptyOffsets()); setSuggestions([]); setSelectedSuggestion(null); setRowSelection(null); setDeleted(null); setActiveSlot(0); setPlaying(false); nextNumber.current = 1
       setAnimationName(loaded.name.replace(/\.png$/i, '') || 'animation'); setExportError(null)
       window.requestAnimationFrame(() => fit(loaded))
     } catch (cause) { if (request === loadCounter.current) setError(cause instanceof Error ? cause.message : 'Could not load the image.') }
@@ -319,15 +327,17 @@ export default function App() {
 
   function updateRegion(next: Region) { setRegions(previous => previous.map(region => region.id === next.id ? next : region)) }
 
-  function startDrag(event: React.PointerEvent, action?: 'move' | Handle, region?: Region) {
+  function startDrag(event: React.PointerEvent, action?: 'move' | Handle, region?: Region, row = false) {
     if (!source || !imageSize || event.button > 1) return
     event.preventDefault(); event.stopPropagation()
     stageRef.current?.setPointerCapture(event.pointerId)
     const point = stagePoint(event)
     if (event.button === 1 || mode === 'pan' || spaceHeld) dragRef.current = { kind: 'pan', start: point, pan }
+    else if (region && action && row) dragRef.current = action === 'move' ? { kind: 'row-move', start: point, region } : { kind: 'row-resize', start: point, region, handle: action }
     else if (region && action) { setSelectedId(region.id); dragRef.current = action === 'move' ? { kind: 'move', start: point, region } : { kind: 'resize', start: point, region, handle: action } }
     else {
       const start = screenToImage(point, pan, zoom, imageSize)
+      if (detectionMode === 'row') { dragRef.current = { kind: 'row-draw', start }; setDraft(regionFromCorners(start, start, 'row-selection', 'Animation row')); return }
       const id = crypto.randomUUID()
       const name = `Frame ${nextNumber.current++}`
       dragRef.current = { kind: 'draw', start, id, name }
@@ -340,19 +350,22 @@ export default function App() {
     if (!drag || !source || !imageSize) return
     const point = stagePoint(event)
     if (drag.kind === 'pan') { setPan({ x: drag.pan.x + point.x - drag.start.x, y: drag.pan.y + point.y - drag.start.y }); return }
-    if (drag.kind === 'draw') { setDraft(regionFromCorners(drag.start, screenToImage(point, pan, zoom, imageSize), drag.id, drag.name)); return }
+    if (drag.kind === 'draw' || drag.kind === 'row-draw') { setDraft(regionFromCorners(drag.start, screenToImage(point, pan, zoom, imageSize), drag.kind === 'draw' ? drag.id : 'row-selection', drag.kind === 'draw' ? drag.name : 'Animation row')); return }
     const dx = Math.round((point.x - drag.start.x) / zoom)
     const dy = Math.round((point.y - drag.start.y) / zoom)
     if (drag.kind === 'move') updateRegion({ ...drag.region, x: clamp(drag.region.x + dx, 0, source.width - drag.region.width), y: clamp(drag.region.y + dy, 0, source.height - drag.region.height) })
-    else updateRegion(resizeRegion(drag.region, drag.handle!, dx, dy, imageSize))
+    else if (drag.kind === 'resize') updateRegion(resizeRegion(drag.region, drag.handle!, dx, dy, imageSize))
+    else if (drag.kind === 'row-move') setRowSelection({ ...drag.region, x: clamp(drag.region.x + dx, 0, source.width - drag.region.width), y: clamp(drag.region.y + dy, 0, source.height - drag.region.height) })
+    else setRowSelection(resizeRegion(drag.region, drag.handle!, dx, dy, imageSize))
   }
 
   function endDrag(event: React.PointerEvent) {
     const drag = dragRef.current
     if (!drag) return
-    if (drag.kind === 'draw' && imageSize) {
-      const finished = regionFromCorners(drag.start, screenToImage(stagePoint(event), pan, zoom, imageSize), drag.id, drag.name)
-      setRegions(previous => [...previous, finished]); setSelectedId(finished.id)
+    if ((drag.kind === 'draw' || drag.kind === 'row-draw') && imageSize) {
+      const finished = regionFromCorners(drag.start, screenToImage(stagePoint(event), pan, zoom, imageSize), drag.kind === 'draw' ? drag.id : 'row-selection', drag.kind === 'draw' ? drag.name : 'Animation row')
+      if (drag.kind === 'row-draw') { setRowSelection(finished); setSuggestions([]); setSelectedSuggestion(null) }
+      else { setRegions(previous => [...previous, finished]); setSelectedId(finished.id) }
     }
     setDraft(null); dragRef.current = null
     if (stageRef.current?.hasPointerCapture(event.pointerId)) stageRef.current.releasePointerCapture(event.pointerId)
@@ -398,7 +411,7 @@ export default function App() {
 
   function resetProject() {
     sourceRef.current?.bitmap.close(); sourceRef.current = null; setSource(null); setSourceRecord(null); setPixels(null); setRegions([]); setSelectedId(null); setSlots([...EMPTY_SLOTS]); setOffsets(emptyOffsets())
-    setSuggestions([]); setSelectedSuggestion(null); setDeleted(null); setActiveSlot(0); setPlaying(false); setFps(8); setAnimationName('animation'); setAlignmentMode('bottom'); setPadding(8); setMinWidth(0); setMinHeight(0)
+    setSuggestions([]); setSelectedSuggestion(null); setRowSelection(null); setRowFrameCount(8); setRowBoundaryMode('equal'); setRowPadding(0); setAssignBatch(false); setDeleted(null); setActiveSlot(0); setPlaying(false); setFps(8); setAnimationName('animation'); setAlignmentMode('bottom'); setPadding(8); setMinWidth(0); setMinHeight(0)
     setOnion(false); setOnionReference('previous'); setFixedReferenceSlot(0); setCentreGuide(true); setBaselineGuide(true); setPixelGrid(false); setBaselineOffset(0); setAlignmentZoom('fit'); setAlignmentPan({ x: 0, y: 0 })
     setDetectionMode('grid'); setGrid({ rows: 5, columns: 8, gapX: 8, gapY: 8, left: 0, right: 0, top: 0, bottom: 0 }); setJoinGap(12); setMinPixels(8); setZoom(1); setPan({ x: 0, y: 0 }); setMode('select'); setActiveTab('extract')
     setError(null); setNotice('Started a new project.'); setSaveError(null); setSaveStatus('unsaved'); nextNumber.current = 1
@@ -488,9 +501,17 @@ export default function App() {
 
   function generateSuggestions() {
     if (!source || !pixels) return
-    const next = detectionMode === 'grid' ? gridSuggestions(source, grid) : alphaSuggestions(pixels, { joinGap, minPixels })
+    const next: RowSuggestion[] = detectionMode === 'grid' ? gridSuggestions(source, grid) : detectionMode === 'alpha' ? alphaSuggestions(pixels, { joinGap, minPixels }) : rowSelection ? animationRowSuggestions(pixels, { selection: rowSelection, frameCount: rowFrameCount, boundaryMode: rowBoundaryMode, padding: rowPadding }) : []
     setSuggestions(next); setSelectedSuggestion(next[0]?.id ?? null)
-    setNotice(next.length ? `${next.length} suggestions ready for review. Existing frames are unchanged.` : 'No regions found. Adjust the layout or use manual selection.')
+    const uncertain = next.filter(item => item.needsReview).length
+    setNotice(next.length ? `${next.length} suggestions ready for review. Existing frames are unchanged.${uncertain ? ` ${uncertain} need manual review.` : ''}` : 'No regions found. Adjust the selection or settings, or use manual selection.')
+  }
+
+  function editRowSelection(key: 'x' | 'y' | 'width' | 'height', raw: string) {
+    if (!rowSelection || !imageSize || raw === '') return
+    const value = Number(raw)
+    if (!Number.isFinite(value)) return
+    setRowSelection(boundedRegion({ ...rowSelection, [key]: value }, imageSize)); setSuggestions([]); setSelectedSuggestion(null)
   }
 
   function editSuggestion(key: 'x' | 'y' | 'width' | 'height', raw: string) {
@@ -511,6 +532,20 @@ export default function App() {
 
   function acceptAll() {
     if (!imageSize || eligibleSuggestions === 0) return
+    if (detectionMode === 'row') {
+      const next = acceptSuggestionBatch(regions, suggestions, imageSize, () => crypto.randomUUID())
+      if (next.error) { setNotice(`No frames were added. ${next.error}`); return }
+      let nextSlots = slots
+      if (assignBatch) {
+        const assignment = slotsFromFrameOrder(next.added, slots)
+        if (assignment.replacesAssignments && !window.confirm('Replace the existing animation slot assignments with this accepted row?')) return
+        nextSlots = assignment.slots
+      }
+      setRegions(next.regions); setSuggestions([]); setSelectedSuggestion(null); setSelectedId(next.added[0]?.id ?? selectedId)
+      if (assignBatch) { setSlots(nextSlots); setOffsets(emptyOffsets()); setActiveSlot(0) }
+      setNotice(`Added ${next.added.length} ordered animation frames${assignBatch ? ' and assigned them to slots' : ''}.`)
+      return
+    }
     const next = acceptAllSuggestions(regions, suggestions, imageSize, () => crypto.randomUUID())
     setRegions(next.regions); setSuggestions(next.suggestions)
     if (next.added) setSelectedId(next.regions.at(-1)?.id ?? selectedId)
@@ -556,12 +591,12 @@ export default function App() {
     <main className={activeTab === 'animate' ? 'workspace animate-workspace' : 'workspace'} style={workspaceStyle}>
       <aside id="workflow-panel-extract" className="panel frames-panel" role="tabpanel" aria-labelledby="workflow-tab-extract" hidden={activeTab !== 'extract'}><div className="section-heading"><div><span className="eyebrow">REGIONS</span><h2>Frame library <em>{regions.length}</em></h2></div><button className="small" disabled={!source} onClick={addFrame}>+ Add</button></div>
         <div className="frames-list">{regions.length === 0 ? <div className="panel-empty"><span>▧</span><strong>No frames yet</strong><p>Drag across the image, add a centered region, or preview suggestions.</p></div> : regions.map((region, index) => <div key={region.id} className={`frame-row ${selectedId === region.id ? 'active' : ''}`}><button className="frame-select" onClick={() => setSelectedId(region.id)}><Thumbnail image={source!.bitmap} region={region} /><span className="frame-text"><strong>{region.name}</strong><small>{region.width} × {region.height} px · {region.x}, {region.y}</small></span><span className="frame-index">{String(index + 1).padStart(2, '0')}</span></button><button className="row-delete" aria-label={`Delete ${region.name}`} title={`Delete ${region.name}`} onClick={() => deleteFrame(region.id)}>×</button></div>)}</div>
-        <DetectionPanel enabled={Boolean(source)} mode={detectionMode} onMode={setDetectionMode} grid={grid} onGrid={setGrid} joinGap={joinGap} onJoinGap={setJoinGap} minPixels={minPixels} onMinPixels={setMinPixels} suggestions={suggestions} selected={suggestion} eligibleCount={eligibleSuggestions} onSelected={setSelectedSuggestion} onGenerate={generateSuggestions} onEdit={editSuggestion} onAccept={accept} onAcceptAll={acceptAll} onReject={reject} onClear={() => { setSuggestions([]); setSelectedSuggestion(null) }} />
+        <DetectionPanel enabled={Boolean(source)} image={source?.bitmap ?? null} mode={detectionMode} onMode={value => { setDetectionMode(value); setSuggestions([]); setSelectedSuggestion(null) }} grid={grid} onGrid={setGrid} joinGap={joinGap} onJoinGap={setJoinGap} minPixels={minPixels} onMinPixels={setMinPixels} rowSelection={rowSelection} onRowEdit={editRowSelection} rowFrameCount={rowFrameCount} onRowFrameCount={setRowFrameCount} rowBoundaryMode={rowBoundaryMode} onRowBoundaryMode={setRowBoundaryMode} rowPadding={rowPadding} onRowPadding={setRowPadding} assignBatch={assignBatch} onAssignBatch={setAssignBatch} suggestions={suggestions} selected={suggestion} eligibleCount={eligibleSuggestions} onSelected={setSelectedSuggestion} onGenerate={generateSuggestions} onEdit={editSuggestion} onAccept={accept} onAcceptAll={acceptAll} onReject={reject} onClear={() => { setSuggestions([]); setSelectedSuggestion(null) }} />
         <div className="panel-foot">Coordinates always use source-image pixels.</div>
       </aside>
-      <section className="canvas-panel" aria-label="Sprite sheet editor"><div className="canvas-toolbar"><div className="tool-group"><button className={mode === 'select' ? 'tool active' : 'tool'} onClick={() => setMode('select')} aria-pressed={mode === 'select'} title="Draw or edit regions">▣ <span>Select</span></button><button className={mode === 'pan' ? 'tool active' : 'tool'} onClick={() => setMode('pan')} aria-pressed={mode === 'pan'} title="Pan canvas">✥ <span>Pan</span></button></div><span className="toolbar-hint">{source ? 'Drag to draw · drag frame to move · handles to resize · Space or middle drag to pan' : 'Import a PNG to start'}</span><div className="zoom-controls"><button aria-label="Zoom out" disabled={!source} onClick={() => setMagnification(zoom / 1.25)}>−</button><output>{Math.round(zoom * 100)}%</output><button aria-label="Zoom in" disabled={!source} onClick={() => setMagnification(zoom * 1.25)}>+</button><button disabled={!source} onClick={() => fit()} title="Fit image in view">Fit</button></div></div>
+      <section className="canvas-panel" aria-label="Sprite sheet editor"><div className="canvas-toolbar"><div className="tool-group"><button className={mode === 'select' ? 'tool active' : 'tool'} onClick={() => setMode('select')} aria-pressed={mode === 'select'} title="Draw or edit regions">▣ <span>Select</span></button><button className={mode === 'pan' ? 'tool active' : 'tool'} onClick={() => setMode('pan')} aria-pressed={mode === 'pan'} title="Pan canvas">✥ <span>Pan</span></button></div><span className="toolbar-hint">{source ? detectionMode === 'row' ? 'Drag to select one animation row · Space or middle drag to pan' : 'Drag to draw · drag frame to move · handles to resize · Space or middle drag to pan' : 'Import a PNG to start'}</span><div className="zoom-controls"><button aria-label="Zoom out" disabled={!source} onClick={() => setMagnification(zoom / 1.25)}>−</button><output>{Math.round(zoom * 100)}%</output><button aria-label="Zoom in" disabled={!source} onClick={() => setMagnification(zoom * 1.25)}>+</button><button disabled={!source} onClick={() => fit()} title="Fit image in view">Fit</button></div></div>
         <div ref={stageRef} className={`stage ${dragOver ? 'drag-over' : ''} ${mode === 'pan' || spaceHeld ? 'panning' : ''}`} onPointerDown={event => startDrag(event)} onPointerMove={moveDrag} onPointerUp={endDrag} onPointerCancel={cancelDrag} onWheel={event => { if (!source) return; event.preventDefault(); const rect = stageRef.current!.getBoundingClientRect(); setMagnification(zoom * (event.deltaY < 0 ? 1.1 : 1 / 1.1), { x: event.clientX - rect.left, y: event.clientY - rect.top }) }} onDragOver={event => { event.preventDefault(); setDragOver(true) }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragOver(false) }} onDrop={event => { event.preventDefault(); setDragOver(false); void importFile(event.dataTransfer.files[0]) }}>
-          {source ? <div className="image-surface checker" style={{ left: pan.x, top: pan.y, width: source.width * zoom, height: source.height * zoom }}><canvas ref={sourceCanvasRef} width={source.width} height={source.height} className="source-canvas" />{suggestions.map(item => <div key={item.id} className={`region suggestion-region ${selectedSuggestion === item.id ? 'focused' : ''}`} style={{ left: item.x * zoom, top: item.y * zoom, width: item.width * zoom, height: item.height * zoom }} onPointerDown={event => { event.stopPropagation(); setSelectedSuggestion(item.id) }}><span className="region-tag">{item.name}</span></div>)}{regions.map(region => <div key={region.id} className={`region ${selectedId === region.id ? 'selected' : ''}`} style={{ left: region.x * zoom, top: region.y * zoom, width: region.width * zoom, height: region.height * zoom }} onPointerDown={event => { setSelectedId(region.id); startDrag(event, 'move', region) }}><span className="region-tag">{region.name}</span>{selectedId === region.id && HANDLES.map(handle => <span key={handle} className={`handle handle-${handle}`} onPointerDown={event => startDrag(event, handle, region)} />)}</div>)}{draft && <div className="region drafting" style={{ left: draft.x * zoom, top: draft.y * zoom, width: draft.width * zoom, height: draft.height * zoom }} />}</div> : <div className="drop-prompt"><div className="drop-mark">▦</div><strong>Drop a PNG to begin</strong><p>Your image stays in this browser. No upload, no server processing.</p><button className="secondary" onClick={() => fileRef.current?.click()}>Choose a file</button></div>}
+          {source ? <div className="image-surface checker" style={{ left: pan.x, top: pan.y, width: source.width * zoom, height: source.height * zoom }}><canvas ref={sourceCanvasRef} width={source.width} height={source.height} className="source-canvas" />{suggestions.map(item => <div key={item.id} className={`region suggestion-region ${selectedSuggestion === item.id ? 'focused' : ''} ${item.needsReview ? 'uncertain' : ''}`} style={{ left: item.x * zoom, top: item.y * zoom, width: item.width * zoom, height: item.height * zoom }} onPointerDown={event => { event.stopPropagation(); setSelectedSuggestion(item.id) }}><span className="region-tag">{item.name}{item.needsReview ? ' ⚠' : ''}</span></div>)}{regions.map(region => <div key={region.id} className={`region ${selectedId === region.id ? 'selected' : ''}`} style={{ left: region.x * zoom, top: region.y * zoom, width: region.width * zoom, height: region.height * zoom }} onPointerDown={event => { setSelectedId(region.id); startDrag(event, 'move', region) }}><span className="region-tag">{region.name}</span>{selectedId === region.id && HANDLES.map(handle => <span key={handle} className={`handle handle-${handle}`} onPointerDown={event => startDrag(event, handle, region)} />)}</div>)}{detectionMode === 'row' && rowSelection && <div className="region row-selection" style={{ left: rowSelection.x * zoom, top: rowSelection.y * zoom, width: rowSelection.width * zoom, height: rowSelection.height * zoom }} onPointerDown={event => startDrag(event, 'move', rowSelection, true)}><span className="region-tag">Animation row</span>{HANDLES.map(handle => <span key={handle} className={`handle handle-${handle}`} onPointerDown={event => startDrag(event, handle, rowSelection, true)} />)}</div>}{draft && <div className={`region drafting ${detectionMode === 'row' ? 'row-selection' : ''}`} style={{ left: draft.x * zoom, top: draft.y * zoom, width: draft.width * zoom, height: draft.height * zoom }} />}</div> : <div className="drop-prompt"><div className="drop-mark">▦</div><strong>Drop a PNG to begin</strong><p>Your image stays in this browser. No upload, no server processing.</p><button className="secondary" onClick={() => fileRef.current?.click()}>Choose a file</button></div>}
           {dragOver && <div className="drop-cover">Release to import PNG</div>}
         </div><div className="stage-footer"><span>{source ? `${source.width} × ${source.height} PX` : 'WAITING FOR SOURCE'}</span><span>NEAREST NEIGHBOUR · ORIGINAL PIXELS</span></div>
       </section>

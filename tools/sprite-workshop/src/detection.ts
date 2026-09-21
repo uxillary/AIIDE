@@ -3,6 +3,9 @@ import type { Region, Size } from './geometry'
 
 export type GridOptions = { rows: number; columns: number; gapX: number; gapY: number; left: number; right: number; top: number; bottom: number }
 export type AlphaOptions = { joinGap: number; minPixels: number }
+export type RowBoundaryMode = 'equal' | 'content'
+export type RowOptions = { selection: Region; frameCount: number; boundaryMode: RowBoundaryMode; padding: number }
+export type RowSuggestion = Region & { needsReview?: boolean; reviewReason?: string }
 export const MAX_FRAME_COUNT = 256
 
 export type SuggestionAcceptance = { regions: Region[]; suggestions: Region[]; added: number; skipped: number; rejected: number }
@@ -61,6 +64,92 @@ export function gridSuggestions(size: Size, options: GridOptions): Region[] {
     regions.push({ id: `suggestion-${row}-${column}`, name: `Row ${row + 1} · Frame ${column + 1}`, x, y, width: endX - x, height: endY - y })
   }
   return regions
+}
+
+function equalRowRegions(selection: Region, frameCount: number, padding: number): RowSuggestion[] {
+  const count = Math.max(1, Math.min(64, Math.round(frameCount)))
+  if (selection.width < count) return []
+  const pad = Math.max(0, Math.round(padding))
+  return Array.from({ length: count }, (_, index) => {
+    // Every edge is derived from the same origin, so rounding never accumulates or leaves gaps.
+    const left = selection.x + Math.round(index * selection.width / count)
+    const right = selection.x + Math.round((index + 1) * selection.width / count)
+    const x = Math.max(selection.x, left - pad)
+    const end = Math.min(selection.x + selection.width, right + pad)
+    return { id: `suggestion-row-${index}`, name: `Animation ${String(index + 1).padStart(2, '0')}`, x, y: selection.y, width: end - x, height: selection.height }
+  })
+}
+
+/** Suggest ordered crops inside one user-selected row. Pixel values are treated as geometry only. */
+export function animationRowSuggestions(source: Pixels, options: RowOptions): RowSuggestion[] {
+  const selection = options.selection
+  if (!validSuggestion(selection, source)) return []
+  const equal = equalRowRegions(selection, options.frameCount, options.padding)
+  if (equal.length === 0) return equal
+
+  const { data, width } = source
+  const density = new Float64Array(selection.width)
+  let minDensity = Infinity, maxDensity = 0
+  for (let localX = 0; localX < selection.width; localX++) {
+    let occupied = 0
+    for (let y = selection.y; y < selection.y + selection.height; y++) {
+      if (data[(y * width + selection.x + localX) * 4 + 3] > 8) occupied++
+    }
+    density[localX] = occupied
+    minDensity = Math.min(minDensity, occupied); maxDensity = Math.max(maxDensity, occupied)
+  }
+  if (options.boundaryMode === 'equal') return equal.map((item, index) => {
+    const left = Math.round(index * selection.width / equal.length), right = Math.round((index + 1) * selection.width / equal.length)
+    const edgeInk = index > 0 && density[left] > 0 || index < equal.length - 1 && density[Math.min(selection.width - 1, right)] > 0
+    return edgeInk ? { ...item, needsReview: true, reviewReason: 'Visible pixels touch an equal boundary and may be clipped.' } : item
+  })
+  // Fully opaque/checkerboard rows and flat alpha masks contain no trustworthy alpha valleys.
+  if (maxDensity - minDensity < Math.max(2, selection.height * 0.04)) {
+    return equal.map(item => ({ ...item, needsReview: true, reviewReason: 'No reliable alpha valleys; equal spacing was used.' }))
+  }
+
+  const count = equal.length, spacing = selection.width / count
+  const boundaries = [0]
+  let ambiguous = false
+  for (let index = 1; index < count; index++) {
+    const expected = index * spacing
+    const radius = Math.max(2, Math.floor(spacing * 0.35))
+    const start = Math.max(boundaries[index - 1] + 1, Math.floor(expected - radius))
+    const end = Math.min(selection.width - (count - index), Math.ceil(expected + radius))
+    let best = Math.round(expected), bestScore = Infinity
+    for (let x = start; x <= end; x++) {
+      const smoothed = (density[Math.max(0, x - 1)] + density[x] + density[Math.min(selection.width - 1, x + 1)]) / 3
+      const score = smoothed + Math.abs(x - expected) * 0.08
+      if (score < bestScore) { bestScore = score; best = x }
+    }
+    if (!Number.isFinite(bestScore) || bestScore > selection.height * 0.3) ambiguous = true
+    boundaries.push(best)
+  }
+  boundaries.push(selection.width)
+  if (ambiguous) return equal.map(item => ({ ...item, needsReview: true, reviewReason: 'Boundaries were ambiguous; equal spacing was used.' }))
+
+  const pad = Math.max(0, Math.round(options.padding))
+  return Array.from({ length: count }, (_, index) => {
+    const rawLeft = boundaries[index], rawRight = boundaries[index + 1]
+    const left = Math.max(0, rawLeft - pad), right = Math.min(selection.width, rawRight + pad)
+    const edgeInk = index > 0 && density[rawLeft] > 0 || index < count - 1 && density[Math.min(selection.width - 1, rawRight)] > 0
+    return {
+      id: `suggestion-row-${index}`, name: `Animation ${String(index + 1).padStart(2, '0')}`,
+      x: selection.x + left, y: selection.y, width: right - left, height: selection.height,
+      ...(edgeInk ? { needsReview: true, reviewReason: 'Visible pixels touch a proposed boundary and may be clipped.' } : {}),
+    }
+  })
+}
+
+export function acceptSuggestionBatch(regions: Region[], suggestions: Region[], size: Size, createId: () => string, maxFrames = MAX_FRAME_COUNT): { regions: Region[]; added: Region[]; error: string | null } {
+  if (regions.length + suggestions.length > maxFrames) return { regions, added: [], error: `Adding this batch would exceed the ${maxFrames}-frame limit.` }
+  const pending: Region[] = []
+  for (const suggestion of suggestions) {
+    if (!validSuggestion(suggestion, size)) return { regions, added: [], error: `${suggestion.name} has invalid source coordinates.` }
+    if ([...regions, ...pending].some(region => sameRegion(region, suggestion))) return { regions, added: [], error: `${suggestion.name} duplicates an existing or proposed frame.` }
+    pending.push({ ...suggestion, id: createId() })
+  }
+  return { regions: [...regions, ...pending], added: pending, error: null }
 }
 
 type Island = { x: number; y: number; right: number; bottom: number; pixels: number }

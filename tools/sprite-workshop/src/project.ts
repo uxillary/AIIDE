@@ -1,5 +1,5 @@
 import type { AlignmentMode, Pixels } from './alignment'
-import type { GridOptions } from './detection'
+import type { GridOptions, RowBoundaryMode } from './detection'
 import type { Point, Region } from './geometry'
 import { loadPng } from './image'
 import type { SourceImage } from './image'
@@ -27,10 +27,14 @@ export type ProjectData = {
   baselineGuide: boolean
   pixelGrid: boolean
   baselineOffset: number
-  detectionMode: 'grid' | 'alpha'
+  detectionMode: 'grid' | 'alpha' | 'row'
   grid: GridOptions
   joinGap: number
   minPixels: number
+  rowSelection?: Region | null
+  rowFrameCount?: number
+  rowBoundaryMode?: RowBoundaryMode
+  rowPadding?: number
 }
 
 export type SourceRecord = { blob: Blob; name: string; type: string; size: number; lastModified: number }
@@ -56,10 +60,14 @@ export function validateProject(value: unknown): ProjectData {
   if (!Array.isArray(project.slots) || project.slots.length !== 8 || !project.slots.every(id => id === null || (typeof id === 'string' && ids.has(id)))) throw new Error('Project slot assignments are malformed.')
   if (!Array.isArray(project.offsets) || project.offsets.length !== 8 || !project.offsets.every(isPoint)) throw new Error('Project alignment offsets are malformed.')
   if (!isNumber(project.fps) || project.fps < 1 || project.fps > 24 || !isNumber(project.activeSlot) || project.activeSlot < 0 || project.activeSlot > 7) throw new Error('Project playback settings are malformed.')
-  if (!['bottom', 'center'].includes(project.alignmentMode ?? '') || !['previous', 'fixed'].includes(project.onionReference ?? '') || !['grid', 'alpha'].includes(project.detectionMode ?? '')) throw new Error('Project mode settings are malformed.')
+  if (!['bottom', 'center'].includes(project.alignmentMode ?? '') || !['previous', 'fixed'].includes(project.onionReference ?? '') || !['grid', 'alpha', 'row'].includes(project.detectionMode ?? '')) throw new Error('Project mode settings are malformed.')
   if (!project.grid || !['rows', 'columns', 'gapX', 'gapY', 'left', 'right', 'top', 'bottom'].every(key => isNumber(project.grid?.[key as keyof GridOptions]))) throw new Error('Project detection settings are malformed.')
   for (const key of ['padding', 'minWidth', 'minHeight', 'fixedReferenceSlot', 'baselineOffset', 'joinGap', 'minPixels'] as const) if (!isNumber(project[key])) throw new Error('Project numeric settings are malformed.')
   for (const key of ['onion', 'centreGuide', 'baselineGuide', 'pixelGrid'] as const) if (typeof project[key] !== 'boolean') throw new Error('Project display settings are malformed.')
+  if (project.rowSelection !== undefined && project.rowSelection !== null && !isRegion(project.rowSelection)) throw new Error('Project animation row selection is malformed.')
+  if (project.rowFrameCount !== undefined && (!isNumber(project.rowFrameCount) || project.rowFrameCount < 1 || project.rowFrameCount > 64)) throw new Error('Project animation row frame count is malformed.')
+  if (project.rowBoundaryMode !== undefined && !['equal', 'content'].includes(project.rowBoundaryMode)) throw new Error('Project animation row boundary mode is malformed.')
+  if (project.rowPadding !== undefined && (!isNumber(project.rowPadding) || project.rowPadding < 0 || project.rowPadding > 256)) throw new Error('Project animation row padding is malformed.')
   if (typeof project.animationName !== 'string' || (project.selectedId !== null && (typeof project.selectedId !== 'string' || !ids.has(project.selectedId)))) throw new Error('Project identity settings are malformed.')
   return project as ProjectData
 }

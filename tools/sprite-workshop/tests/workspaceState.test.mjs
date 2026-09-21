@@ -25,4 +25,5 @@ test('slot fill is owned by Inspect and confirms before replacing assignments', 
   assert.match(inspect, /Fill slots from frame list/)
   assert.doesNotMatch(animate, /Fill slots from frame list/)
   assert.match(source, /replacesAssignments && !window\.confirm/)
+  assert.match(source, /Replace the existing animation slot assignments with this accepted row/)
 })
