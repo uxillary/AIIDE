@@ -96,7 +96,6 @@ export default function App() {
         <div className="center-workspace">
           <LocalChat
             projectOpen={Boolean(project)}
-            projectPath={project?.path}
             projectBusy={busy}
             onOpenProject={openProject}
             onProposal={next => {

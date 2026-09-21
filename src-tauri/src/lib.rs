@@ -42,11 +42,14 @@ pub fn run() {
             image_generation::image_generation_status,
             image_generation::configure_image_generation,
             image_generation::start_image_generation,
+            image_generation::regenerate_image_generation,
             image_generation::get_image_generation,
             image_generation::get_image_preview,
             image_generation::cancel_image_generation,
             image_generation::reject_generated_image,
             image_generation::save_generated_image,
+            image_generation::save_generated_image_as,
+            image_generation::reveal_saved_image,
             image_runtime::managed_image_runtime_status,
         ])
         .run(tauri::generate_context!())

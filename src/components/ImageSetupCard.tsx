@@ -21,17 +21,26 @@ export function ImageSetupCard({ status, checking, saving, onRetry, onConnect, o
   checking: boolean
   saving: boolean
   onRetry: () => void
-  onConnect: (endpoint: string, modelId: string) => Promise<void>
+  onConnect: (endpoint: string, modelId: string, checkpoint: string) => Promise<void>
   onDismiss: () => void
 }) {
   const [endpoint, setEndpoint] = useState(status.endpoint)
+  const [checkpoint, setCheckpoint] = useState(status.checkpoint)
 
   useEffect(() => setEndpoint(status.endpoint), [status.endpoint])
+  useEffect(() => setCheckpoint(status.checkpoint), [status.checkpoint])
+
+  const compatible = status.checkpoints.filter(option => option.compatibility === 'compatible')
+  const unsupported = status.checkpoints.filter(option => option.compatibility !== 'compatible')
 
   return <section className="image-setup-card" aria-labelledby="image-setup-heading">
     <span className="eyebrow">IMAGE SETUP · {status.ownershipMode === 'managed' ? 'MANAGED ENGINE' : 'EXTERNAL ENGINE'}</span>
     <h2 id="image-setup-heading">{heading(status)}</h2>
     <p>{status.error ?? 'The engine and selected model passed the readiness checks. A real GPU generation is still required for acceptance.'}</p>
+
+    <div className="image-setup-actions"><button className="primary-button" onClick={onRetry} disabled={checking || saving}>{checking ? 'Checking…' : status.ready ? 'Check again' : 'Connect / reconnect'}</button><button className="subtle-button" onClick={onDismiss}>Hide details</button></div>
+
+    <details className="image-advanced" open={status.state !== 'unavailable'}><summary>Connection, model and hardware details</summary>
 
     {status.missingFiles.length > 0 && <div className="image-requirements"><strong>Required model file</strong><ul>{status.missingFiles.map(file => <li key={file}><code>{file}</code></li>)}</ul><small>Place this user-provided checkpoint in ComfyUI’s checkpoints folder, then retry. AIIDE does not download models in this stage.</small></div>}
     {status.missingNodes.length > 0 && <div className="image-requirements"><strong>Required core nodes</strong><ul>{status.missingNodes.map(node => <li key={node}><code>{node}</code></li>)}</ul></div>}
@@ -41,14 +50,16 @@ export function ImageSetupCard({ status, checking, saving, onRetry, onConnect, o
       <label htmlFor="comfyui-endpoint">Existing ComfyUI endpoint</label>
       <div>
         <input id="comfyui-endpoint" type="url" inputMode="url" value={endpoint} onChange={event => setEndpoint(event.target.value)} disabled={saving} />
-        <button className="primary-button" onClick={() => void onConnect(endpoint, status.model.id)} disabled={saving || !endpoint.trim()}>{saving ? 'Saving…' : 'Connect'}</button>
+        <button className="primary-button" onClick={() => void onConnect(endpoint, status.model.id, checkpoint)} disabled={saving || !endpoint.trim() || !checkpoint}>{saving ? 'Saving…' : 'Save and connect'}</button>
       </div>
       <small>Loopback HTTP only. AIIDE remembers this connection but never starts, stops, modifies, or uninstalls the external engine.</small>
     </div>}
 
     {status.managedMessage && <div className="image-requirements"><strong>Managed engine · experimental</strong><small>{status.managedMessage}</small>{!status.managedAcquisitionEnabled && <small>No install or download action is available in this build.</small>}</div>}
 
-    <div className="image-setup-model"><span>Selected model</span><strong>{status.model.displayName}</strong><small>{status.model.architecture} · {status.model.workflowId}</small></div>
-    <div className="image-setup-actions"><button className="small-button" onClick={onRetry} disabled={checking || saving}>{checking ? 'Checking…' : 'Retry'}</button><button className="subtle-button" onClick={onDismiss}>Skip for now</button></div>
+    <div className="image-setup-model"><span>Image model</span><strong>{status.model.displayName}</strong><small>{status.model.architecture} · {status.model.workflowId}</small></div>
+    {compatible.length > 0 && <label className="image-checkpoint-select">Compatible checkpoint<select value={checkpoint} onChange={event => setCheckpoint(event.target.value)} disabled={saving}>{compatible.map(option => <option key={option.checkpoint} value={option.checkpoint}>{option.displayName} · {option.checkpoint}</option>)}</select></label>}
+    {unsupported.length > 0 && <div className="image-requirements"><strong>Unavailable for this workflow</strong><ul>{unsupported.map(option => <li key={option.checkpoint}><code>{option.checkpoint}</code> — {option.reason}</li>)}</ul></div>}
+    </details>
   </section>
 }

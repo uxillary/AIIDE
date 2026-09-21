@@ -1,6 +1,7 @@
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -21,6 +22,8 @@ const CONFIG_FILE: &str = "image-generation.json";
 const MINIMUM_GUIDANCE_VRAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_PROMPT_CHARS: usize = 4_000;
 const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+const MAX_SESSION_IMAGES: usize = 8;
+const MAX_SAVED_PATHS: usize = 16;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
@@ -179,6 +182,9 @@ struct PendingImage {
     provider_prompt_id: Option<String>,
     prompt: String,
     seed: u64,
+    model_id: String,
+    model_display_name: String,
+    checkpoint: String,
     phase: JobPhase,
     status_label: String,
     error: Option<String>,
@@ -186,10 +192,16 @@ struct PendingImage {
     cancellation_supported: bool,
 }
 
-#[derive(Default)]
 struct ImageStateData {
     next_job: u64,
-    current: Option<PendingImage>,
+    jobs: VecDeque<PendingImage>,
+    saved_paths: VecDeque<PathBuf>,
+}
+
+impl Default for ImageStateData {
+    fn default() -> Self {
+        Self { next_job: 0, jobs: VecDeque::new(), saved_paths: VecDeque::new() }
+    }
 }
 
 pub struct ImageGenerationState {
@@ -214,27 +226,15 @@ impl Drop for ImageGenerationState {
     }
 }
 
-impl ImageGenerationState {
-    pub fn clear_for_project_change(&self) {
-        let removed = self.inner.lock().ok().and_then(|mut state| {
-            if state.current.as_ref().is_some_and(|job| job.phase.active()) {
-                None
-            } else {
-                state.current.take()
-            }
-        });
-        if let Some(path) = removed.and_then(|job| job.temporary_path) {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageJob {
     job_id: String,
     prompt: String,
     seed: u64,
+    model_id: String,
+    model_display_name: String,
+    checkpoint: String,
     status: &'static str,
     status_label: String,
     preview_available: bool,
@@ -248,6 +248,9 @@ impl From<&PendingImage> for ImageJob {
             job_id: job.job_id.clone(),
             prompt: job.prompt.clone(),
             seed: job.seed,
+            model_id: job.model_id.clone(),
+            model_display_name: job.model_display_name.clone(),
+            checkpoint: job.checkpoint.clone(),
             status: job.phase.name(),
             status_label: job.status_label.clone(),
             preview_available: job.temporary_path.is_some() && job.phase == JobPhase::Ready,
@@ -305,6 +308,7 @@ pub struct ImageEngineStatus {
     endpoint: String,
     model: ImageModelSummary,
     checkpoint: String,
+    checkpoints: Vec<ImageCheckpointSummary>,
     busy: bool,
     engine_status: &'static str,
     model_status: &'static str,
@@ -313,6 +317,15 @@ pub struct ImageEngineStatus {
     missing_files: Vec<String>,
     hardware_message: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageCheckpointSummary {
+    checkpoint: String,
+    display_name: String,
+    compatibility: &'static str,
+    reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -801,6 +814,7 @@ fn persist_configuration(
     path: &Path,
     endpoint: String,
     model_id: String,
+    checkpoint: Option<String>,
 ) -> Result<ImageGenerationConfiguration, String> {
     let model = model_definition(&model_id)
         .ok_or("The selected image model is not supported by this AIIDE build.")?;
@@ -811,10 +825,14 @@ fn persist_configuration(
         ImageGenerationConfiguration::defaults()
     };
     configuration.ownership_mode = ImageEngineOwnershipMode::External;
+    let checkpoint = checkpoint.unwrap_or_else(|| model.checkpoint.into());
+    if checkpoint != model.checkpoint {
+        return Err("This checkpoint has unknown or incompatible architecture metadata and cannot be used with AIIDE's fixed SDXL workflow.".into());
+    }
     configuration.external = ExternalImageEngineConfiguration {
         endpoint: provider.endpoint.as_str().trim_end_matches('/').to_owned(),
         model_id,
-        checkpoint: model.checkpoint.into(),
+        checkpoint,
     };
     let configuration = validate_configuration(configuration)?;
     let parent = path
@@ -902,6 +920,7 @@ fn probe_failure_status(
         endpoint: configuration.endpoint.clone(),
         model: model.into(),
         checkpoint: configuration.checkpoint.clone(),
+        checkpoints: vec![],
         busy: local_busy,
         engine_status,
         model_status: "unknown",
@@ -915,6 +934,32 @@ fn probe_failure_status(
 
 fn malformed_probe(message: &str) -> ReadinessProbeError {
     ReadinessProbeError::Incompatible(message.into())
+}
+
+fn checkpoint_summaries(checkpoints: &[Value], selected: &str) -> Vec<ImageCheckpointSummary> {
+    checkpoints
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|checkpoint| {
+            let compatible = checkpoint == DEFAULT_CHECKPOINT;
+            ImageCheckpointSummary {
+                checkpoint: checkpoint.to_owned(),
+                display_name: if compatible { "SDXL 1.0 Base".into() } else { checkpoint.to_owned() },
+                compatibility: if compatible { "compatible" } else { "unknown" },
+                reason: if compatible {
+                    "Verified against AIIDE's fixed SDXL Base 1.0 workflow.".into()
+                } else {
+                    "ComfyUI does not expose reliable architecture metadata for this checkpoint, so AIIDE will not submit it to the SDXL workflow.".into()
+                },
+            }
+        })
+        .chain((!checkpoints.iter().any(|value| value.as_str() == Some(selected))).then(|| ImageCheckpointSummary {
+            checkpoint: selected.to_owned(),
+            display_name: selected.to_owned(),
+            compatibility: "unavailable",
+            reason: "The selected checkpoint is not installed in this ComfyUI instance.".into(),
+        }))
+        .collect()
 }
 
 async fn readiness_with_provider(
@@ -991,6 +1036,7 @@ async fn readiness_with_provider(
             endpoint: configuration.endpoint.clone(),
             model: model.into(),
             checkpoint: configuration.checkpoint.clone(),
+            checkpoints: vec![],
             busy,
             engine_status: if busy { "busy" } else { "reachable" },
             model_status: "missing_nodes",
@@ -1017,6 +1063,7 @@ async fn readiness_with_provider(
             malformed_probe("ComfyUI's checkpoint API is incompatible with this AIIDE build."),
         );
     };
+    let checkpoint_options = checkpoint_summaries(checkpoints, &configuration.checkpoint);
     let checkpoint_installed = checkpoints
         .iter()
         .filter_map(Value::as_str)
@@ -1032,6 +1079,7 @@ async fn readiness_with_provider(
             endpoint: configuration.endpoint.clone(),
             model: model.into(),
             checkpoint: configuration.checkpoint.clone(),
+            checkpoints: checkpoint_options,
             busy,
             engine_status: if busy { "busy" } else { "reachable" },
             model_status: "missing_checkpoint",
@@ -1040,6 +1088,28 @@ async fn readiness_with_provider(
             missing_files: vec![configuration.checkpoint.clone()],
             hardware_message,
             error: Some("The selected SDXL checkpoint is not installed in ComfyUI.".into()),
+        };
+    }
+    if configuration.checkpoint != model.checkpoint {
+        return ImageEngineStatus {
+            state: "incompatible",
+            ready: false,
+            ownership_mode: "external",
+            managed_state: "disabled",
+            managed_acquisition_enabled: MANAGED_ACQUISITION_ENABLED,
+            managed_message: Some(managed_image_runtime_status().message.to_owned()),
+            endpoint: configuration.endpoint.clone(),
+            model: model.into(),
+            checkpoint: configuration.checkpoint.clone(),
+            checkpoints: checkpoint_options,
+            busy,
+            engine_status: if busy { "busy" } else { "reachable" },
+            model_status: "unknown",
+            hardware_status,
+            missing_nodes: vec![],
+            missing_files: vec![],
+            hardware_message,
+            error: Some("ComfyUI does not expose reliable architecture metadata for this checkpoint. AIIDE will only submit the verified SDXL Base 1.0 checkpoint to this workflow.".into()),
         };
     }
     ImageEngineStatus {
@@ -1052,6 +1122,7 @@ async fn readiness_with_provider(
         endpoint: configuration.endpoint.clone(),
         model: model.into(),
         checkpoint: configuration.checkpoint.clone(),
+        checkpoints: checkpoint_options,
         busy,
         engine_status: if busy { "busy" } else { "reachable" },
         model_status: "ready",
@@ -1087,6 +1158,7 @@ fn managed_disabled_status(configuration: &ImageGenerationConfiguration) -> Imag
         endpoint: String::new(),
         model: model.into(),
         checkpoint: model.checkpoint.into(),
+        checkpoints: vec![],
         busy: false,
         engine_status: "unavailable",
         model_status: "unknown",
@@ -1157,12 +1229,8 @@ fn validate_png(bytes: &[u8]) -> Result<(), String> {
 
 fn release_failed_reservation(state: &ImageGenerationState, job_id: &str) {
     if let Ok(mut inner) = state.inner.lock() {
-        if inner
-            .current
-            .as_ref()
-            .is_some_and(|job| job.job_id == job_id)
-        {
-            inner.current = None;
+        if let Some(index) = inner.jobs.iter().position(|job| job.job_id == job_id) {
+            inner.jobs.remove(index);
         }
     }
 }
@@ -1181,19 +1249,21 @@ async fn start_with_provider(
             .inner
             .lock()
             .map_err(|_| "Image generation state unavailable")?;
-        if inner.current.is_some() {
+        if inner.jobs.iter().any(|job| job.phase.active()) {
             return Err(
-                "Finish, save, or reject the current image before starting another generation."
-                    .into(),
+                "Finish or cancel the active image generation before starting another.".into(),
             );
         }
         inner.next_job += 1;
         let job_id = format!("image-{}", inner.next_job);
-        inner.current = Some(PendingImage {
+        inner.jobs.push_back(PendingImage {
             job_id: job_id.clone(),
             provider_prompt_id: None,
             prompt: prompt.clone(),
             seed,
+            model_id: model.id.into(),
+            model_display_name: model.display_name.into(),
+            checkpoint: checkpoint.into(),
             phase: JobPhase::Submitting,
             status_label: "Submitting to ComfyUI…".into(),
             error: None,
@@ -1231,15 +1301,21 @@ async fn start_with_provider(
         .inner
         .lock()
         .map_err(|_| "Image generation state unavailable")?;
-    let job = inner
-        .current
-        .as_mut()
-        .filter(|job| job.job_id == job_id)
+    let job = inner.jobs.iter_mut()
+        .find(|job| job.job_id == job_id)
         .ok_or("Image generation state changed unexpectedly.")?;
     job.provider_prompt_id = Some(prompt_id);
     job.phase = JobPhase::Queued;
     job.status_label = "Queued in ComfyUI".into();
-    Ok(ImageJob::from(&*job))
+    let result = ImageJob::from(&*job);
+    let evicted_path = if inner.jobs.len() > MAX_SESSION_IMAGES {
+        inner.jobs.pop_front().and_then(|job| job.temporary_path)
+    } else {
+        None
+    };
+    drop(inner);
+    if let Some(path) = evicted_path { let _ = fs::remove_file(path); }
+    Ok(result)
 }
 
 fn write_temporary_image(
@@ -1273,10 +1349,8 @@ fn fail_active_job(
         .inner
         .lock()
         .map_err(|_| "Image generation state unavailable")?;
-    let job = inner
-        .current
-        .as_mut()
-        .filter(|job| job.job_id == job_id)
+    let job = inner.jobs.iter_mut()
+        .find(|job| job.job_id == job_id)
         .ok_or("This image generation is no longer available.")?;
     if job.phase.active() {
         job.phase = JobPhase::Failed;
@@ -1296,10 +1370,8 @@ async fn refresh_with_provider(
             .inner
             .lock()
             .map_err(|_| "Image generation state unavailable")?;
-        inner
-            .current
-            .as_ref()
-            .filter(|job| job.job_id == job_id)
+        inner.jobs.iter()
+            .find(|job| job.job_id == job_id)
             .cloned()
             .ok_or("This image generation is no longer available.")?
     };
@@ -1331,10 +1403,8 @@ async fn refresh_with_provider(
         .inner
         .lock()
         .map_err(|_| "Image generation state unavailable")?;
-    let job = inner
-        .current
-        .as_mut()
-        .filter(|job| job.job_id == job_id)
+    let job = inner.jobs.iter_mut()
+        .find(|job| job.job_id == job_id)
         .ok_or("This image generation is no longer available.")?;
     if !job.phase.active() {
         if let Some(path) = temporary_path {
@@ -1382,10 +1452,8 @@ async fn cancel_with_provider(
             .inner
             .lock()
             .map_err(|_| "Image generation state unavailable")?;
-        let job = inner
-            .current
-            .as_ref()
-            .filter(|job| job.job_id == job_id)
+        let job = inner.jobs.iter()
+            .find(|job| job.job_id == job_id)
             .ok_or("This image generation is no longer available.")?;
         if !job.phase.active() {
             return Ok(ImageJob::from(job));
@@ -1399,10 +1467,8 @@ async fn cancel_with_provider(
         .inner
         .lock()
         .map_err(|_| "Image generation state unavailable")?;
-    let job = inner
-        .current
-        .as_mut()
-        .filter(|job| job.job_id == job_id)
+    let job = inner.jobs.iter_mut()
+        .find(|job| job.job_id == job_id)
         .ok_or("This image generation is no longer available.")?;
     match result {
         ProviderCancellation::Cancelled => {
@@ -1432,7 +1498,7 @@ pub async fn image_generation_status(
         .inner
         .lock()
         .ok()
-        .and_then(|inner| inner.current.as_ref().map(|job| job.phase.active()))
+        .map(|inner| inner.jobs.iter().any(|job| job.phase.active()))
         .unwrap_or(false);
     if configuration.ownership_mode == ImageEngineOwnershipMode::Managed {
         return Ok(managed_disabled_status(&configuration));
@@ -1446,6 +1512,7 @@ pub async fn image_generation_status(
 pub async fn configure_image_generation(
     endpoint: String,
     model_id: String,
+    checkpoint: Option<String>,
     state: State<'_, ImageGenerationState>,
     app: tauri::AppHandle,
 ) -> Result<ImageEngineStatus, String> {
@@ -1453,15 +1520,15 @@ pub async fn configure_image_generation(
         .inner
         .lock()
         .map_err(|_| "Image generation state unavailable")?
-        .current
-        .as_ref()
-        .is_some_and(|job| job.phase.active());
+        .jobs
+        .iter()
+        .any(|job| job.phase.active());
     if local_busy {
         return Err(
             "Cancel or finish the active image generation before changing its connection.".into(),
         );
     }
-    let configuration = persist_configuration(&configuration_path(&app)?, endpoint, model_id)?;
+    let configuration = persist_configuration(&configuration_path(&app)?, endpoint, model_id, checkpoint)?;
     let external = external_configuration(&configuration)?;
     let provider = ComfyUiProvider::new(&external.endpoint, Duration::from_secs(4))?;
     Ok(readiness_with_provider(&provider, external, false).await)
@@ -1494,6 +1561,39 @@ pub async fn start_image_generation(
         eprintln!("[AIIDE][image] submitted {}", job.job_id);
     }
     result
+}
+
+#[tauri::command]
+pub async fn regenerate_image_generation(
+    job_id: String,
+    state: State<'_, ImageGenerationState>,
+    app: tauri::AppHandle,
+) -> Result<ImageJob, String> {
+    let (prompt, model_id, checkpoint) = {
+        let inner = state.inner.lock().map_err(|_| "Image generation state unavailable")?;
+        let original = inner.jobs.iter().find(|job| job.job_id == job_id)
+            .ok_or("This image generation is no longer available.")?;
+        if original.phase.active() {
+            return Err("Wait for the current generation to finish before regenerating it.".into());
+        }
+        (original.prompt.clone(), original.model_id.clone(), original.checkpoint.clone())
+    };
+    let configuration = selected_configuration(&app)?;
+    let external = external_configuration(&configuration)?;
+    let model = model_definition(&model_id)
+        .ok_or("The original image model is no longer supported by this AIIDE build.")?;
+    if checkpoint != model.checkpoint {
+        return Err("The original checkpoint is no longer verified for AIIDE's SDXL workflow.".into());
+    }
+    let provider = ComfyUiProvider::new(&external.endpoint, Duration::from_secs(20))?;
+    let original_configuration = ExternalImageEngineConfiguration {
+        endpoint: external.endpoint.clone(), model_id, checkpoint: checkpoint.clone(),
+    };
+    let readiness = readiness_with_provider(&provider, &original_configuration, false).await;
+    if !readiness.ready || readiness.busy {
+        return Err(readiness.error.unwrap_or_else(|| "Image generation is not ready.".into()));
+    }
+    start_with_provider(&provider, &state, prompt, model, &checkpoint).await
 }
 
 #[tauri::command]
@@ -1537,10 +1637,8 @@ pub fn get_image_preview(
             .inner
             .lock()
             .map_err(|_| "Image generation state unavailable")?;
-        let job = inner
-            .current
-            .as_ref()
-            .filter(|job| job.job_id == job_id)
+        let job = inner.jobs.iter()
+            .find(|job| job.job_id == job_id)
             .ok_or("This image generation is no longer available.")?;
         if job.phase != JobPhase::Ready {
             return Err("The image preview is not ready.".into());
@@ -1673,6 +1771,43 @@ fn save_bytes_to_project(root: &Path, relative_path: &str, bytes: &[u8]) -> Resu
     Err("Could not find an available filename for the approved image.".into())
 }
 
+fn save_bytes_to_absolute(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    validate_png(bytes)?;
+    if !path.is_absolute() || path.extension().and_then(|value| value.to_str()).is_none_or(|extension| !extension.eq_ignore_ascii_case("png")) {
+        return Err("Choose an absolute .png destination from the Save As dialog.".into());
+    }
+    if protected(path) {
+        return Err("Protected paths are unavailable.".into());
+    }
+    let parent = path.parent().ok_or("The selected destination has no parent folder.")?;
+    let metadata = fs::symlink_metadata(parent).map_err(|_| "The selected destination folder is unavailable.".to_owned())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("The selected destination must be inside a real folder.".into());
+    }
+    for index in 1..=10_000 {
+        let candidate = collision_candidate(path, index);
+        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(bytes) {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(format!("Could not save the approved image: {error}"));
+                }
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("Could not create the approved image file.".into()),
+        }
+    }
+    Err("Could not find an available filename for the approved image.".into())
+}
+
+fn remember_saved_path(state: &ImageGenerationState, path: PathBuf) {
+    if let Ok(mut inner) = state.inner.lock() {
+        if inner.saved_paths.len() >= MAX_SAVED_PATHS { inner.saved_paths.pop_front(); }
+        inner.saved_paths.push_back(path);
+    }
+}
+
 fn save_ready_image(
     state: &ImageGenerationState,
     root: &Path,
@@ -1684,10 +1819,8 @@ fn save_ready_image(
             .inner
             .lock()
             .map_err(|_| "Image generation state unavailable")?;
-        let job = inner
-            .current
-            .as_ref()
-            .filter(|job| job.job_id == job_id)
+        let job = inner.jobs.iter()
+            .find(|job| job.job_id == job_id)
             .ok_or("This image generation is no longer available.")?;
         if job.phase != JobPhase::Ready {
             return Err("Only a ready preview can be saved.".into());
@@ -1704,15 +1837,7 @@ fn save_ready_image(
             .inner
             .lock()
             .map_err(|_| "Image generation state unavailable")?;
-        if inner
-            .current
-            .as_ref()
-            .is_some_and(|job| job.job_id == job_id)
-        {
-            inner.current.take()
-        } else {
-            None
-        }
+        inner.jobs.iter().position(|job| job.job_id == job_id).and_then(|index| inner.jobs.remove(index))
     };
     if let Some(path) = removed.and_then(|job| job.temporary_path) {
         let _ = fs::remove_file(path);
@@ -1734,8 +1859,51 @@ pub fn save_generated_image(
         .clone()
         .ok_or("Open a project before saving an image.")?;
     let saved = save_ready_image(&state, &root, &job_id, &relative_path)?;
-    eprintln!("[AIIDE][image] saved {job_id} as {saved}");
-    Ok(saved)
+    let absolute = root.join(&saved);
+    remember_saved_path(&state, absolute.clone());
+    let absolute = absolute.to_string_lossy().into_owned();
+    eprintln!("[AIIDE][image] saved {job_id} as {absolute}");
+    Ok(absolute)
+}
+
+#[tauri::command]
+pub fn save_generated_image_as(
+    job_id: String,
+    absolute_path: String,
+    state: State<'_, ImageGenerationState>,
+) -> Result<String, String> {
+    let temporary_path = {
+        let inner = state.inner.lock().map_err(|_| "Image generation state unavailable")?;
+        let job = inner.jobs.iter().find(|job| job.job_id == job_id)
+            .ok_or("This image generation is no longer available.")?;
+        if job.phase != JobPhase::Ready { return Err("Only a ready preview can be saved.".into()); }
+        job.temporary_path.clone().ok_or("The image preview is unavailable.")?
+    };
+    let bytes = fs::read(&temporary_path).map_err(|_| "The temporary image preview is unavailable.".to_owned())?;
+    let saved = save_bytes_to_absolute(Path::new(&absolute_path), &bytes)?;
+    let removed = {
+        let mut inner = state.inner.lock().map_err(|_| "Image generation state unavailable")?;
+        inner.jobs.iter().position(|job| job.job_id == job_id).and_then(|index| inner.jobs.remove(index))
+    };
+    if let Some(path) = removed.and_then(|job| job.temporary_path) { let _ = fs::remove_file(path); }
+    remember_saved_path(&state, saved.clone());
+    Ok(saved.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub fn reveal_saved_image(path: String, state: State<'_, ImageGenerationState>) -> Result<(), String> {
+    let requested = PathBuf::from(&path);
+    let allowed = state.inner.lock().map_err(|_| "Image generation state unavailable")?
+        .saved_paths.iter().any(|saved| saved == &requested);
+    if !allowed { return Err("Only an image saved in this session can be revealed.".into()); }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer.exe").arg(format!("/select,{}", requested.display()))
+            .spawn().map_err(|_| "Could not open File Explorer.".to_owned())?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    { Err("Reveal in Explorer is available on Windows only.".into()) }
 }
 
 fn reject_image(state: &ImageGenerationState, job_id: &str) -> Result<(), String> {
@@ -1744,15 +1912,15 @@ fn reject_image(state: &ImageGenerationState, job_id: &str) -> Result<(), String
             .inner
             .lock()
             .map_err(|_| "Image generation state unavailable")?;
-        let job = inner
-            .current
-            .as_ref()
-            .filter(|job| job.job_id == job_id)
+        let job = inner.jobs.iter()
+            .find(|job| job.job_id == job_id)
             .ok_or("This image generation is no longer available.")?;
         if job.phase.active() {
             return Err("Cancel the active generation before rejecting it.".into());
         }
-        inner.current.take()
+        let index = inner.jobs.iter().position(|job| job.job_id == job_id)
+            .ok_or("This image generation is no longer available.")?;
+        inner.jobs.remove(index)
     };
     if let Some(path) = removed.and_then(|job| job.temporary_path) {
         let _ = fs::remove_file(path);
@@ -1964,6 +2132,27 @@ mod tests {
     }
 
     #[test]
+    fn readiness_exposes_only_verified_sdxl_checkpoint_as_compatible() {
+        let object_info = object_info(Some(DEFAULT_CHECKPOINT), None);
+        let checkpoints = object_info["CheckpointLoaderSimple"]["input"]["required"]["ckpt_name"][0]
+            .as_array().unwrap();
+        let summaries = checkpoint_summaries(checkpoints, DEFAULT_CHECKPOINT);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].compatibility, "compatible");
+
+        let mut unknown_configuration = configuration();
+        unknown_configuration.checkpoint = "unknown-model.safetensors".into();
+        let status = tauri::async_runtime::block_on(readiness_with_provider(
+            &readiness_provider(Some("unknown-model.safetensors"), None),
+            &unknown_configuration,
+            false,
+        ));
+        assert_eq!(status.state, "incompatible");
+        assert!(!status.ready);
+        assert_eq!(status.checkpoints[0].compatibility, "unknown");
+    }
+
+    #[test]
     fn readiness_reports_unsupported_unavailable_and_malformed_apis() {
         let unavailable = MockReadinessProvider {
             system_stats: Err(ReadinessProbeError::Unavailable(
@@ -2034,6 +2223,7 @@ mod tests {
             &path,
             "http://localhost:9000".into(),
             DEFAULT_MODEL_ID.into(),
+            None,
         )
         .unwrap();
         assert_eq!(saved.external.endpoint, "http://localhost:9000");
@@ -2078,6 +2268,7 @@ mod tests {
             &path,
             "http://localhost:9000".into(),
             SDXL_BASELINE_MODEL_ID.into(),
+            None,
         )
         .unwrap();
         assert_eq!(saved.ownership_mode, ImageEngineOwnershipMode::External);
@@ -2147,7 +2338,7 @@ mod tests {
         ))
         .unwrap_err();
         assert!(error.contains("unavailable"));
-        assert!(state.inner.lock().unwrap().current.is_none());
+        assert!(state.inner.lock().unwrap().jobs.is_empty());
     }
 
     #[test]
@@ -2173,7 +2364,7 @@ mod tests {
             DEFAULT_CHECKPOINT,
         ))
         .unwrap_err();
-        assert!(duplicate.contains("current image"));
+        assert!(duplicate.contains("active image"));
         let running =
             tauri::async_runtime::block_on(refresh_with_provider(&provider, &state, &job.job_id))
                 .unwrap();
@@ -2187,8 +2378,8 @@ mod tests {
             .inner
             .lock()
             .unwrap()
-            .current
-            .as_ref()
+            .jobs
+            .front()
             .unwrap()
             .temporary_path
             .clone()
@@ -2196,6 +2387,53 @@ mod tests {
         assert!(path.exists());
         reject_image(&state, &job.job_id).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn regeneration_preserves_original_and_history_is_bounded() {
+        let provider = MockProvider::new(vec![ProviderJobState::Complete(image_ref()); MAX_SESSION_IMAGES + 1]);
+        let state = ImageGenerationState::default();
+        let mut first_path = None;
+        let mut previous_seed = None;
+        for index in 0..=MAX_SESSION_IMAGES {
+            let job = tauri::async_runtime::block_on(start_with_provider(
+                &provider,
+                &state,
+                format!("image {index}"),
+                model_definition(DEFAULT_MODEL_ID).unwrap(),
+                DEFAULT_CHECKPOINT,
+            )).unwrap();
+            if let Some(seed) = previous_seed { assert_ne!(seed, job.seed); }
+            previous_seed = Some(job.seed);
+            tauri::async_runtime::block_on(refresh_with_provider(&provider, &state, &job.job_id)).unwrap();
+            if index == 0 {
+                first_path = state.inner.lock().unwrap().jobs.front().unwrap().temporary_path.clone();
+            }
+        }
+        let inner = state.inner.lock().unwrap();
+        assert_eq!(inner.jobs.len(), MAX_SESSION_IMAGES);
+        assert_eq!(inner.jobs.front().unwrap().prompt, "image 1");
+        assert!(inner.jobs.iter().all(|job| job.model_id == DEFAULT_MODEL_ID && job.checkpoint == DEFAULT_CHECKPOINT));
+        drop(inner);
+        assert!(!first_path.unwrap().exists());
+    }
+
+    #[test]
+    fn failed_new_submission_does_not_evict_reviewable_history() {
+        let provider = MockProvider::new(vec![ProviderJobState::Complete(image_ref())]);
+        let state = ImageGenerationState::default();
+        let job = tauri::async_runtime::block_on(start_with_provider(
+            &provider, &state, "kept".into(), model_definition(DEFAULT_MODEL_ID).unwrap(), DEFAULT_CHECKPOINT,
+        )).unwrap();
+        tauri::async_runtime::block_on(refresh_with_provider(&provider, &state, &job.job_id)).unwrap();
+        let path = state.inner.lock().unwrap().jobs.front().unwrap().temporary_path.clone().unwrap();
+        let mut unavailable = MockProvider::new(vec![]);
+        unavailable.available = false;
+        assert!(tauri::async_runtime::block_on(start_with_provider(
+            &unavailable, &state, "fails".into(), model_definition(DEFAULT_MODEL_ID).unwrap(), DEFAULT_CHECKPOINT,
+        )).is_err());
+        assert_eq!(state.inner.lock().unwrap().jobs.len(), 1);
+        assert!(path.exists());
     }
 
     #[test]
@@ -2282,7 +2520,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_image_never_writes_and_project_change_cleans_terminal_preview() {
+    fn project_change_preserves_reviewable_preview_until_rejected() {
         let project = fixture("reject");
         let provider = MockProvider::new(vec![ProviderJobState::Complete(image_ref())]);
         let state = ImageGenerationState::default();
@@ -2300,13 +2538,14 @@ mod tests {
             .inner
             .lock()
             .unwrap()
-            .current
-            .as_ref()
+            .jobs
+            .front()
             .unwrap()
             .temporary_path
             .clone()
             .unwrap();
-        state.clear_for_project_change();
+        assert!(temp.exists());
+        reject_image(&state, &job.job_id).unwrap();
         assert!(!temp.exists());
         assert!(fs::read_dir(&project).unwrap().next().is_none());
         fs::remove_dir_all(project).unwrap();
@@ -2320,6 +2559,18 @@ mod tests {
         assert_eq!(first, "assets/elma.png");
         assert_eq!(second, "assets/elma-2.png");
         assert_eq!(fs::read(root.join(&first)).unwrap(), png());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_as_is_absolute_collision_safe_and_rejects_protected_paths() {
+        let root = fixture("save-as");
+        let target = root.join("elma.png");
+        let first = save_bytes_to_absolute(&target, &png()).unwrap();
+        let second = save_bytes_to_absolute(&target, &png()).unwrap();
+        assert_eq!(first, target);
+        assert_eq!(second, root.join("elma-2.png"));
+        assert!(save_bytes_to_absolute(&root.join(".env").join("image.png"), &png()).unwrap_err().contains("Protected"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2342,8 +2593,8 @@ mod tests {
             .inner
             .lock()
             .unwrap()
-            .current
-            .as_ref()
+            .jobs
+            .front()
             .unwrap()
             .temporary_path
             .clone()
@@ -2353,7 +2604,7 @@ mod tests {
             "image.png"
         );
         assert!(!temporary.exists());
-        assert!(state.inner.lock().unwrap().current.is_none());
+        assert!(state.inner.lock().unwrap().jobs.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 

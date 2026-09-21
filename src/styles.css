@@ -4,7 +4,7 @@
 * { box-sizing: border-box; }
 button { cursor: pointer; }
 button:disabled { cursor: wait; opacity: .55; }
-button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid #6ee7b7; outline-offset: 2px; }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid #6ee7b7; outline-offset: 2px; }
 
 @keyframes elma-sprite-frames { from { background-position: 0 0; } to { background-position: calc(var(--elma-size) * -8) 0; } }
 .elma-sprite { --elma-size: 32px; display: block; width: var(--elma-size); height: var(--elma-size); flex: 0 0 var(--elma-size); background-repeat: no-repeat; background-size: calc(var(--elma-size) * 8) var(--elma-size); image-rendering: pixelated; animation: elma-sprite-frames var(--elma-duration) steps(8) infinite; }
@@ -184,21 +184,29 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .image-setup-model strong { color: #ded9d2; }
 .image-setup-model small { grid-column: 2; color: #77716b; font-family: ui-monospace, monospace; font-size: 9px; }
 .image-setup-actions { display: flex; align-items: center; gap: 11px; margin-top: 15px; }
+.image-advanced { margin-top: 14px; border-top: 1px solid #29322d; padding-top: 10px; }
+.image-advanced summary { cursor: pointer; color: #9fb3a7; font-size: 11px; }
+.image-checkpoint-select { display: grid; gap: 6px; margin-top: 12px; color: #8ba394; font-family: ui-monospace, monospace; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.image-checkpoint-select select { min-width: 0; border: 1px solid #38443d; border-radius: 5px; background: #1a1f1c; padding: 8px 9px; color: #eeeae4; font-family: ui-monospace, monospace; font-size: 11px; text-transform: none; }
 .image-result-card { max-width: 680px; overflow: hidden; border: 1px solid #324139; border-radius: 6px; background: #0d110e; }
 .image-result-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid #29352e; padding: 9px 11px; font-size: 11px; }
 .image-result-heading span { color: #86efac; font-family: ui-monospace, monospace; font-size: 9px; font-weight: 800; letter-spacing: .12em; }
 .image-result-heading strong { color: #b9b3ab; font-weight: 650; }
 .image-result-failed, .image-result-cancelled { border-color: #513837; }
-.image-preview { display: block; width: 100%; max-height: 560px; background: #090b09; object-fit: contain; }
+.image-preview-button { display: block; width: 100%; overflow: hidden; border: 0; background: #090b09; padding: 0; }
+.image-preview { display: block; width: 100%; max-width: 100%; max-height: 380px; background: #090b09; object-fit: contain; }
 .image-preview-placeholder { display: grid; min-height: 240px; place-items: center; color: #78716c; font-size: 12px; }
 .image-progress { display: flex; align-items: center; gap: 9px; padding: 15px 12px; color: #aaa39b; font-size: 12px; }
 .image-error { margin: 11px 12px 0; color: #fca5a5; font-size: 11px; line-height: 1.5; }
 .image-save-row { display: flex; align-items: stretch; gap: 8px; padding: 12px 12px 0; }
 .image-save-row input { min-width: 0; flex: 1; border: 1px solid #38443d; border-radius: 5px; background: #171c18; padding: 8px 9px; color: #eeeae4; font-family: ui-monospace, monospace; font-size: 11px; }
-.image-saved-path { padding: 11px 12px 0; color: #8ed4a6; font-size: 11px; }
-.image-saved-path code { color: #c5e8d1; font-family: ui-monospace, monospace; }
+.image-saved-path { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 11px 12px 0; color: #8ed4a6; font-size: 11px; }
+.image-saved-path code { max-width: 100%; overflow-wrap: anywhere; color: #c5e8d1; font-family: ui-monospace, monospace; }
 .image-actions { display: flex; align-items: center; gap: 8px; padding: 10px 12px 0; }
 .image-result-meta { padding: 10px 12px 11px; color: #625e59; font-family: ui-monospace, monospace; font-size: 9px; }
+.image-viewer { position: fixed; z-index: 50; inset: 0; display: grid; place-items: center; background: rgb(0 0 0 / 82%); padding: 42px; }
+.image-viewer img { max-width: 100%; max-height: 100%; object-fit: contain; box-shadow: 0 18px 70px rgb(0 0 0 / 65%); }
+.image-viewer-close { position: absolute; top: 14px; right: 18px; width: 34px; height: 34px; border: 1px solid #718079; border-radius: 50%; background: #171c18; color: #eeeae4; font-size: 22px; line-height: 1; }
 
 /* Changes panel and Git integration */
 .changes-panel { width: 322px; min-height: 0; flex: none; overflow-y: auto; scrollbar-gutter: stable; border-left: 1px solid #272c29; background: #151816; }

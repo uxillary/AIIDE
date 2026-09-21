@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use tauri::State;
-use crate::image_generation::ImageGenerationState;
 use crate::repository::PendingChanges;
 
 const MAX_DEPTH: usize = 3;
@@ -109,7 +108,7 @@ fn read_tree(root: &Path, folder: &Path, depth: usize, remaining: &mut usize, an
 }
 
 #[tauri::command]
-pub fn inspect_project(path: String, open_project: State<'_, OpenProject>, pending: State<'_, PendingChanges>, images: State<'_, ImageGenerationState>) -> Result<ProjectInfo, String> {
+pub fn inspect_project(path: String, open_project: State<'_, OpenProject>, pending: State<'_, PendingChanges>) -> Result<ProjectInfo, String> {
     let path = fs::canonicalize(path).map_err(|error| format!("Cannot open folder: {error}"))?;
     if !path.is_dir() { return Err("Selected path is not a folder".to_owned()); }
     let mut remaining = MAX_ENTRIES;
@@ -117,7 +116,6 @@ pub fn inspect_project(path: String, open_project: State<'_, OpenProject>, pendi
     let tree = read_tree(&path, &path, 0, &mut remaining, &mut tree_truncated)?;
     *open_project.0.lock().map_err(|_| "Project state unavailable")? = Some(path.clone());
     *pending.0.lock().map_err(|_| "Pending change state unavailable")? = None;
-    images.clear_for_project_change();
     Ok(ProjectInfo {
         name: name_of(&path),
         path: path.display().to_string(),

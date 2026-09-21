@@ -4,11 +4,21 @@ export interface ImageJob {
   jobId: string
   prompt: string
   seed: number
+  modelId: string
+  modelDisplayName: string
+  checkpoint: string
   status: ImageJobStatus
   statusLabel: string
   previewAvailable: boolean
   cancellationSupported: boolean
   error: string | null
+}
+
+export interface ImageCheckpointSummary {
+  checkpoint: string
+  displayName: string
+  compatibility: 'compatible' | 'unknown' | 'unavailable'
+  reason: string
 }
 
 export interface ImageModelSummary {
@@ -36,6 +46,7 @@ export interface ImageEngineStatus {
   endpoint: string
   model: ImageModelSummary
   checkpoint: string
+  checkpoints: ImageCheckpointSummary[]
   busy: boolean
   engineStatus: 'unavailable' | 'reachable' | 'incompatible' | 'starting' | 'busy'
   modelStatus: 'unknown' | 'missing_nodes' | 'missing_checkpoint' | 'ready'

@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
+import { save } from '@tauri-apps/plugin-dialog'
 import { Elma, type ElmaState } from './Elma'
 import { ImageResultCard } from './ImageResultCard'
 import { ImageSetupCard } from './ImageSetupCard'
@@ -9,6 +10,10 @@ import type { ChatMessage, PendingProposal, ProviderStatus } from '../types/ai'
 import type { ImageEngineStatus, ImageJob } from '../types/image'
 
 const MODEL_KEY = 'aiide.selected-model'
+const MODE_KEY = 'aiide.composer-mode'
+const CHAT_DRAFT_KEY = 'aiide.chat-draft'
+const IMAGE_DRAFT_KEY = 'aiide.image-draft'
+const IMAGE_HISTORY_LIMIT = 8
 const INSPECTION_DISPLAY_MS = 700
 const SUCCESS_DISPLAY_MS = 1300
 const ERROR_DISPLAY_MS = 2000
@@ -65,24 +70,25 @@ function unavailableImageStatus(message: string): ImageEngineStatus {
     ownershipMode: 'external', managedState: 'disabled', managedAcquisitionEnabled: false,
     managedMessage: 'Managed ComfyUI acquisition and execution are disabled pending approval.',
     checkpoint: FALLBACK_IMAGE_MODEL.checkpoint, busy: false, engineStatus: 'unavailable', modelStatus: 'unknown',
+    checkpoints: [],
     hardwareStatus: 'unavailable', missingNodes: [], missingFiles: [], hardwareMessage: null, error: message,
   }
 }
 
-export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject, onProposal, changeState }: { projectOpen: boolean; projectPath?: string; projectBusy: boolean; onOpenProject: () => void; onProposal: (proposal: PendingProposal) => void; changeState: 'working' | 'success' | 'error' | null }) {
-  const [mode, setMode] = useState<'chat' | 'image'>('chat')
+export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal, changeState }: { projectOpen: boolean; projectBusy: boolean; onOpenProject: () => void; onProposal: (proposal: PendingProposal) => void; changeState: 'working' | 'success' | 'error' | null }) {
+  const [mode, setMode] = useState<'chat' | 'image'>(() => localStorage.getItem(MODE_KEY) === 'image' ? 'image' : 'chat')
   const [status, setStatus] = useState<ProviderStatus | null>(null)
   const [imageEngine, setImageEngine] = useState<ImageEngineStatus | null>(null)
   const [selectedModel, setSelectedModel] = useState('')
   const [messages, setMessages] = useState<ConversationMessage[]>([])
-  const [prompt, setPrompt] = useState('')
+  const [drafts, setDrafts] = useState(() => ({ chat: localStorage.getItem(CHAT_DRAFT_KEY) ?? '', image: localStorage.getItem(IMAGE_DRAFT_KEY) ?? '' }))
   const [loading, setLoading] = useState(false)
   const [imageSubmitting, setImageSubmitting] = useState(false)
   const [imageActionJob, setImageActionJob] = useState<string | null>(null)
   const [checking, setChecking] = useState(false)
   const [checkingImage, setCheckingImage] = useState(false)
   const [configuringImage, setConfiguringImage] = useState(false)
-  const [imageSetupDismissed, setImageSetupDismissed] = useState(false)
+  const [imageSetupDismissed, setImageSetupDismissed] = useState(true)
   const [activeSteps, setActiveSteps] = useState<string[]>([])
   const [retrying, setRetrying] = useState(false)
   const [inspecting, setInspecting] = useState(false)
@@ -94,13 +100,34 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
   const [copyStatus, setCopyStatus] = useState('')
   const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({})
   const previewUrlsRef = useRef<Record<string, string>>({})
-  const projectPathRef = useRef(projectPath)
   const conversationSequenceRef = useRef(0)
+  const promptRef = useRef<HTMLTextAreaElement>(null)
+  const chatSubmitRef = useRef(false)
+  const imageSubmitRef = useRef(false)
   const endRef = useRef<HTMLDivElement>(null)
   const checkingRef = useRef(false)
   const checkingImageRef = useRef(false)
   const inspectionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const terminalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const prompt = drafts[mode]
+
+  function setPrompt(value: string) {
+    setDrafts(current => ({ ...current, [mode]: value }))
+  }
+
+  function setDraft(channel: 'chat' | 'image', value: string) {
+    setDrafts(current => ({ ...current, [channel]: value }))
+  }
+
+  function restoreDraft(channel: 'chat' | 'image', value: string) {
+    setDrafts(current => ({ ...current, [channel]: current[channel].trim() ? `${value}\n${current[channel]}` : value }))
+  }
+
+  function selectMode(next: 'chat' | 'image') {
+    setMode(next)
+    setError(null)
+    if (next === 'image' && imageEngine && !imageEngine.ready) setImageSetupDismissed(false)
+  }
 
   function showTerminalState(state: 'success' | 'error', duration: number) {
     if (terminalTimerRef.current) clearTimeout(terminalTimerRef.current)
@@ -108,7 +135,7 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
     terminalTimerRef.current = setTimeout(() => setTerminalState(null), duration)
   }
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     if (checkingRef.current) return
     checkingRef.current = true
     setChecking(true)
@@ -124,23 +151,32 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
     } catch (cause) {
       setStatus({ state: 'offline', models: [], error: { code: 'unavailable', message: messageOf(cause) } })
     } finally { checkingRef.current = false; setChecking(false) }
-  }
+  }, [])
 
-  async function refreshImage() {
+  const refreshImage = useCallback(async () => {
     if (checkingImageRef.current) return
     checkingImageRef.current = true
     setCheckingImage(true)
-    try { setImageEngine(await comfyUiProvider.getStatus()) }
-    catch (cause) { setImageEngine(unavailableImageStatus(messageOf(cause))) }
+    try {
+      const next = await comfyUiProvider.getStatus()
+      setImageEngine(next)
+      if (!next.ready) setImageSetupDismissed(false)
+    }
+    catch (cause) {
+      const message = messageOf(cause)
+      setImageEngine(current => current ? { ...current, state: 'unavailable', ready: false, engineStatus: 'unavailable', error: message } : unavailableImageStatus(message))
+      setImageSetupDismissed(false)
+    }
     finally { checkingImageRef.current = false; setCheckingImage(false) }
-  }
+  }, [])
 
-  async function configureImage(endpoint: string, modelId: string) {
+  async function configureImage(endpoint: string, modelId: string, checkpoint: string) {
     setConfiguringImage(true)
     setError(null)
     try {
-      setImageEngine(await comfyUiProvider.configure(endpoint, modelId))
-      setImageSetupDismissed(false)
+      const next = await comfyUiProvider.configure(endpoint, modelId, checkpoint)
+      setImageEngine(next)
+      setImageSetupDismissed(next.ready)
     } catch (cause) {
       setError(messageOf(cause))
     } finally { setConfiguringImage(false) }
@@ -148,6 +184,30 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
 
   function updateImageJob(next: ImageJob) {
     setMessages(current => current.map(message => message.imageJob?.jobId === next.jobId ? { ...message, imageJob: next } : message))
+    setImageEngine(current => current ? {
+      ...current,
+      ready: true,
+      busy: imageActive(next),
+      state: imageActive(next) ? 'busy' : 'ready',
+      engineStatus: imageActive(next) ? 'busy' : 'reachable',
+      error: null,
+    } : current)
+  }
+
+  function appendImageJob(job: ImageJob) {
+    setImageEngine(current => current ? { ...current, busy: true, state: 'busy', engineStatus: 'busy' } : current)
+    setMessages(current => {
+      const existing = current.filter(message => message.imageJob).map(message => message.imageJob!.jobId)
+      if (existing.length < IMAGE_HISTORY_LIMIT) return [...current, { role: 'assistant', content: '', channel: 'image', imageJob: job, imageOutcome: null }]
+      const evicted = existing[0]
+      const url = previewUrlsRef.current[evicted]
+      if (url) URL.revokeObjectURL(url)
+      const nextUrls = { ...previewUrlsRef.current }
+      delete nextUrls[evicted]
+      previewUrlsRef.current = nextUrls
+      setPreviewUrls(nextUrls)
+      return [...current.filter(message => message.imageJob?.jobId !== evicted), { role: 'assistant', content: '', channel: 'image', imageJob: job, imageOutcome: null }]
+    })
   }
 
   function setImageOutcome(jobId: string, outcome: ImageOutcome) {
@@ -161,14 +221,9 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
     setPreviewUrls(previewUrlsRef.current)
   }
 
-  useEffect(() => { void refresh(); void getAgentDebugStatus().then(value => { setDebug(value.enabled); setHasTrace(value.hasTrace) }) }, [])
-  useEffect(() => { if (mode === 'image' && !imageEngine) void refreshImage() }, [mode, imageEngine])
-  useEffect(() => {
-    if (projectPathRef.current && projectPathRef.current !== projectPath) {
-      setMessages(current => current.map(message => message.imageJob && !message.imageOutcome && !imageActive(message.imageJob) ? { ...message, imageOutcome: { kind: 'rejected' } } : message))
-    }
-    projectPathRef.current = projectPath
-  }, [projectPath])
+  useEffect(() => { void refresh(); void refreshImage(); void getAgentDebugStatus().then(value => { setDebug(value.enabled); setHasTrace(value.hasTrace) }) }, [refresh, refreshImage])
+  useEffect(() => { localStorage.setItem(MODE_KEY, mode); requestAnimationFrame(() => promptRef.current?.focus()) }, [mode])
+  useEffect(() => { localStorage.setItem(CHAT_DRAFT_KEY, drafts.chat); localStorage.setItem(IMAGE_DRAFT_KEY, drafts.image) }, [drafts])
   useEffect(() => { const subscription = listen('repository-inspection-start', () => {
     setRetrying(false)
     setInspecting(true)
@@ -194,11 +249,21 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
   useEffect(() => {
     if (!activeImage) return
     let stopped = false
-    const timer = setTimeout(() => {
+    let inFlight = false
+    const poll = () => {
+      if (inFlight) return
+      inFlight = true
       void comfyUiProvider.getJob(activeImage.jobId).then(job => { if (!stopped) updateImageJob(job) })
-        .catch(cause => { if (!stopped) setError(messageOf(cause)) })
-    }, IMAGE_POLL_MS)
-    return () => { stopped = true; clearTimeout(timer) }
+        .catch(cause => {
+          if (!stopped) {
+            const message = messageOf(cause)
+            setError(message)
+            setImageEngine(current => current ? { ...current, state: 'unavailable', ready: false, engineStatus: 'unavailable', error: message } : current)
+          }
+        }).finally(() => { inFlight = false })
+    }
+    const timer = setInterval(poll, IMAGE_POLL_MS)
+    return () => { stopped = true; clearInterval(timer) }
   }, [activeImage])
 
   const previewPending = messages.find(message => message.imageJob?.status === 'ready' && message.imageJob.previewAvailable && !previewUrls[message.imageJob.jobId])?.imageJob
@@ -213,13 +278,15 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
   }, [previewPending])
 
   async function sendChat() {
-    const content = prompt.trim()
-    if (!content || !selectedModel || loading || imageSubmitting || activeImage || status?.state !== 'connected') return
+    const content = drafts.chat.trim()
+    if (!content || !selectedModel || chatSubmitRef.current || loading || status?.state !== 'connected') return
+    chatSubmitRef.current = true
     const model = selectedModel
-    const previous = messages
-    const nextMessages: ConversationMessage[] = [...messages, { role: 'user', content, channel: 'chat' }]
+    conversationSequenceRef.current += 1
+    const conversationId = `chat-request-${conversationSequenceRef.current}`
+    const nextMessages: ConversationMessage[] = [...messages, { role: 'user', content, channel: 'chat', conversationId }]
     setMessages(nextMessages)
-    setPrompt('')
+    setDraft('chat', '')
     setLoading(true)
     setActiveSteps([])
     setRetrying(false)
@@ -236,13 +303,13 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
       showTerminalState('success', SUCCESS_DISPLAY_MS)
     } catch (cause) {
       setError(messageOf(cause))
-      setPrompt(content)
-      setMessages(previous)
+      restoreDraft('chat', content)
+      setMessages(current => current.filter(message => message.conversationId !== conversationId))
       showTerminalState('error', ERROR_DISPLAY_MS)
       await refresh()
     } finally {
       if (debug) { try { const state = await getAgentDebugStatus(); setHasTrace(state.hasTrace); setDebugTrace(null) } catch { setHasTrace(false) } }
-      setLoading(false); setInspecting(false); setRetrying(false)
+      chatSubmitRef.current = false; setLoading(false); setInspecting(false); setRetrying(false)
     }
   }
 
@@ -250,7 +317,7 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
     conversationSequenceRef.current += 1
     const conversationId = `image-request-${conversationSequenceRef.current}`
     setMessages(current => [...current, { role: 'user', content, channel: 'image', conversationId }])
-    setPrompt('')
+    setDraft('image', '')
     setImageSubmitting(true)
     setError(null)
     try {
@@ -258,18 +325,20 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
       setImageEngine(engine)
       if (!engine.ready || engine.busy) throw new Error(engine.error ?? 'Image generation is not ready.')
       const job = await comfyUiProvider.start(content)
-      setMessages(current => [...current, { role: 'assistant', content: '', channel: 'image', imageJob: job, imageOutcome: null }])
+      appendImageJob(job)
     } catch (cause) {
       setMessages(current => current.filter(message => message.conversationId !== conversationId))
-      setPrompt(content)
+      restoreDraft('image', content)
       setError(messageOf(cause))
     } finally { setImageSubmitting(false) }
   }
 
   async function sendImage() {
-    const content = prompt.trim()
-    if (!content || loading || imageSubmitting || activeImage) return
-    await startImagePrompt(content)
+    const content = drafts.image.trim()
+    if (!content || loading || imageSubmitRef.current || imageSubmitting || activeImage) return
+    imageSubmitRef.current = true
+    try { await startImagePrompt(content) }
+    finally { imageSubmitRef.current = false }
   }
 
   async function cancelImage(job: ImageJob) {
@@ -287,13 +356,15 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
   }
 
   async function regenerateImage(job: ImageJob) {
+    if (imageSubmitRef.current || activeImage) return
+    imageSubmitRef.current = true
     setImageActionJob(job.jobId); setError(null)
     try {
-      await comfyUiProvider.reject(job.jobId)
-      setImageOutcome(job.jobId, { kind: 'rejected' })
-      setImageActionJob(null)
-      await startImagePrompt(job.prompt)
+      const regenerated = await comfyUiProvider.regenerate(job.jobId)
+      setMessages(current => [...current, { role: 'user', content: job.prompt, channel: 'image' }])
+      appendImageJob(regenerated)
     } catch (cause) { setError(messageOf(cause)); setImageActionJob(null) }
+    finally { imageSubmitRef.current = false; setImageActionJob(null) }
   }
 
   async function saveImage(job: ImageJob, relativePath: string) {
@@ -301,6 +372,20 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
     try { setImageOutcome(job.jobId, { kind: 'saved', path: await comfyUiProvider.save(job.jobId, relativePath) }) }
     catch (cause) { setError(messageOf(cause)) }
     finally { setImageActionJob(null) }
+  }
+
+  async function saveImageAs(job: ImageJob) {
+    const path = await save({ title: 'Save generated image', defaultPath: 'generated-image.png', filters: [{ name: 'PNG image', extensions: ['png'] }] })
+    if (!path) return
+    setImageActionJob(job.jobId); setError(null)
+    try { setImageOutcome(job.jobId, { kind: 'saved', path: await comfyUiProvider.saveAs(job.jobId, path) }) }
+    catch (cause) { setError(messageOf(cause)) }
+    finally { setImageActionJob(null) }
+  }
+
+  async function revealImage(path: string) {
+    try { await comfyUiProvider.reveal(path) }
+    catch (cause) { setError(messageOf(cause)) }
   }
 
   async function toggleDebug() {
@@ -320,10 +405,9 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
   }
 
   const connected = status?.state === 'connected'
-  const chatReady = projectOpen && connected && status.models.length > 0 && !activeImage
-  const openImage = [...messages].reverse().find(message => message.imageJob && !message.imageOutcome)?.imageJob
-  const imageReady = projectOpen && Boolean(imageEngine?.ready) && !imageEngine?.busy && !openImage && !loading
-  const imageNeedsAttention = Boolean(imageEngine && (!imageEngine.ready || imageEngine.busy || imageEngine.hardwareStatus !== 'sufficient'))
+  const chatReady = projectOpen && connected && status.models.length > 0
+  const imageReady = Boolean(imageEngine?.ready) && !imageEngine?.busy && !activeImage && !loading
+  const imageNeedsAttention = Boolean(imageEngine && !imageEngine.ready)
   const ready = mode === 'chat' ? chatReady : imageReady
   const working = loading || imageSubmitting || Boolean(activeImage)
   const elmaState: ElmaState = changeState ?? terminalState ?? (working ? inspecting ? 'inspecting' : retrying ? 'working' : imageSubmitting || activeImage ? 'working' : 'thinking' : 'idle')
@@ -350,7 +434,7 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
         <div className="workspace-controls"><label htmlFor="model">Model</label><select id="model" className="model-select" value={selectedModel} disabled={!chatReady || loading} onChange={event => { setSelectedModel(event.target.value); localStorage.setItem(MODEL_KEY, event.target.value) }}><option value="">{connected && status.models.length ? 'Select model' : 'No models'}</option>{status?.models.map(model => <option key={model.id} value={model.id}>{model.name} — {model.profile.label}</option>)}</select><button className="small-button" aria-pressed={debug} disabled={loading} onClick={() => void toggleDebug()}><span aria-hidden="true">›_</span> Debug {debug ? 'on' : 'off'}</button><button className="icon-button" aria-label="Retry Ollama connection" title="Retry connection" onClick={() => void refresh()} disabled={checking || loading}>↻</button></div>
       </> : <>
         <div className="provider-state"><span className={`connection-dot ${imageEngine?.engineStatus === 'reachable' || imageEngine?.engineStatus === 'busy' ? 'connected' : ''}`} /><span>{comfyUiProvider.name}</span><span className="connection-state">{imageConnectionLabel(imageEngine, checkingImage)}</span></div>
-        <div className="workspace-controls"><span className="image-model-label">{imageEngine?.model.displayName ?? 'SDXL 1.0 Base'} · {imageEngine?.checkpoint ?? 'sd_xl_base_1.0.safetensors'}</span>{imageNeedsAttention && imageSetupDismissed && <button className="small-button" onClick={() => setImageSetupDismissed(false)}>Configure</button>}<button className="icon-button" aria-label="Retry ComfyUI readiness" title="Retry readiness" onClick={() => void refreshImage()} disabled={checkingImage || imageSubmitting}>↻</button></div>
+        <div className="workspace-controls"><span className="image-model-label">{imageEngine?.model.displayName ?? 'SDXL 1.0 Base'} · {imageEngine?.checkpoint ?? 'sd_xl_base_1.0.safetensors'}</span><button className="small-button" onClick={() => setImageSetupDismissed(false)}>{imageNeedsAttention ? imageEngine?.engineStatus === 'unavailable' ? 'Connect / reconnect' : 'Configure' : 'Details'}</button><button className="icon-button" aria-label="Retry ComfyUI readiness" title="Retry readiness" onClick={() => void refreshImage()} disabled={checkingImage || imageSubmitting}>↻</button></div>
       </>}
     </div>
     {mode === 'chat' && debug && (
@@ -400,10 +484,10 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
       </details>
     )}
 
-    {projectOpen && (
+    {(projectOpen || mode === 'image') && (
       <div className="chat-notice">
         {mode === 'image'
-          ? 'Generated images stay temporary until you approve a project-relative save.'
+          ? `Generated images stay temporary until you approve ${projectOpen ? 'a project save or Save As.' : 'a Save As destination.'}`
           : 'Elma can inspect your project and prepare changes. Files are modified only after you approve.'}
       </div>
     )}
@@ -420,24 +504,24 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
       </div>
     )}
     <div className="chat-history">
-      {!projectOpen && messages.length === 0 && <div className="chat-empty welcome-state"><Elma state="idle" size="hero" /><span className="eyebrow">LOCAL-FIRST CODING COMPANION</span><h2>Open a project and we'll take a look</h2><p>Elma can inspect your project, prepare focused changes, or generate an image for you to review.</p><button className="primary-button" disabled={projectBusy} onClick={onOpenProject}><span aria-hidden="true">▣</span> {projectBusy ? 'Opening…' : 'Open project'}</button></div>}
+      {!projectOpen && mode === 'chat' && messages.length === 0 && <div className="chat-empty welcome-state"><Elma state="idle" size="hero" /><span className="eyebrow">LOCAL-FIRST CODING COMPANION</span><h2>Open a project and we'll take a look</h2><p>Elma can inspect your project, prepare focused changes, or switch to Image without opening a folder.</p><button className="primary-button" disabled={projectBusy} onClick={onOpenProject}><span aria-hidden="true">▣</span> {projectBusy ? 'Opening…' : 'Open project'}</button></div>}
       {projectOpen && mode === 'chat' && !status && <div className="chat-empty">Checking for a local Ollama service…</div>}
       {projectOpen && mode === 'chat' && status?.state === 'offline' && <div className="chat-empty"><h2>Ollama not detected</h2><p>Start your local Ollama service, then try again.</p><button className="primary-button" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
       {projectOpen && mode === 'chat' && status?.state === 'error' && <div className="chat-empty"><h2>Ollama connection issue</h2><p>{status.error?.message}</p><button className="primary-button" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
       {projectOpen && mode === 'chat' && connected && !status.models.length && <div className="chat-empty"><h2>No local models installed</h2><p>Ollama is connected, but no local models are installed. Pull a model with the Ollama CLI, then retry.</p></div>}
-      {projectOpen && mode === 'image' && !imageEngine && <div className="chat-empty">Checking the ComfyUI engine and selected model…</div>}
-      {projectOpen && mode === 'image' && imageEngine && imageNeedsAttention && !imageSetupDismissed && !openImage && <ImageSetupCard status={imageEngine} checking={checkingImage} saving={configuringImage} onRetry={() => void refreshImage()} onConnect={configureImage} onDismiss={() => setImageSetupDismissed(true)} />}
+      {mode === 'image' && !imageEngine && <div className="chat-empty">Checking the ComfyUI engine and selected model…</div>}
+      {mode === 'image' && imageEngine && !imageSetupDismissed && !activeImage && <ImageSetupCard status={imageEngine} checking={checkingImage} saving={configuringImage} onRetry={() => void refreshImage()} onConnect={configureImage} onDismiss={() => setImageSetupDismissed(true)} />}
       {projectOpen && mode === 'chat' && chatReady && messages.length === 0 && <div className="chat-empty project-start"><Elma state="idle" size="hero" /><span className="eyebrow">READY TO HAVE A LOOK</span><h2>What are we working on?</h2><p>I can inspect this project, explain what I find, or prepare a focused edit for review.</p><div className="starter-prompts">{STARTER_PROMPTS.map(starter => <button key={starter} onClick={() => setPrompt(starter)}>{starter}<span aria-hidden="true">→</span></button>)}</div></div>}
-      {projectOpen && mode === 'image' && imageReady && (!imageNeedsAttention || imageSetupDismissed) && messages.length === 0 && <div className="chat-empty project-start"><Elma state="idle" size="hero" /><span className="eyebrow">LOCAL SDXL · REVIEW BEFORE SAVE</span><h2>What should we make?</h2><p>Describe one image. Readiness checks passed, but only a real GPU generation can confirm acceptance.</p></div>}
-      {messages.map((message, index) => <div className={`chat-message chat-message-${message.role}`} key={message.imageJob?.jobId ?? index}><div className="chat-speaker"><span>{message.role === 'user' ? 'YOU' : 'ELMA'}</span>{message.role === 'assistant' && message.model && <small>{message.model}</small>}{message.channel === 'image' && <small>IMAGE</small>}</div>{Boolean(message.activity?.length) && <details className="message-activity"><summary>Inspected {message.activity?.length} items</summary><ul>{message.activity?.map((item, step) => <li key={step}>✓ {item.label}</li>)}</ul></details>}{message.content && <div className="message-body">{message.content}</div>}{message.imageJob && <ImageResultCard job={message.imageJob} previewUrl={previewUrls[message.imageJob.jobId]} outcome={message.imageOutcome ?? null} busy={imageActionJob === message.imageJob.jobId} onCancel={() => void cancelImage(message.imageJob!)} onReject={() => void rejectImage(message.imageJob!)} onRegenerate={() => void regenerateImage(message.imageJob!)} onSave={path => void saveImage(message.imageJob!, path)} />}</div>)}
+      {mode === 'image' && imageReady && (!imageNeedsAttention || imageSetupDismissed) && messages.length === 0 && <div className="chat-empty project-start"><Elma state="idle" size="hero" /><span className="eyebrow">LOCAL SDXL · REVIEW BEFORE SAVE</span><h2>What should we make?</h2><p>Describe one image. Readiness checks passed, but only a real GPU generation can confirm acceptance.</p></div>}
+      {messages.map((message, index) => <div className={`chat-message chat-message-${message.role}`} key={message.imageJob?.jobId ?? index}><div className="chat-speaker"><span>{message.role === 'user' ? 'YOU' : 'ELMA'}</span>{message.role === 'assistant' && message.model && <small>{message.model}</small>}{message.channel === 'image' && <small>IMAGE</small>}</div>{Boolean(message.activity?.length) && <details className="message-activity"><summary>Inspected {message.activity?.length} items</summary><ul>{message.activity?.map((item, step) => <li key={step}>✓ {item.label}</li>)}</ul></details>}{message.content && <div className="message-body">{message.content}</div>}{message.imageJob && <ImageResultCard job={message.imageJob} previewUrl={previewUrls[message.imageJob.jobId]} outcome={message.imageOutcome ?? null} busy={imageActionJob === message.imageJob.jobId} projectOpen={projectOpen} onCancel={() => void cancelImage(message.imageJob!)} onReject={() => void rejectImage(message.imageJob!)} onRegenerate={() => void regenerateImage(message.imageJob!)} onSave={path => void saveImage(message.imageJob!, path)} onSaveAs={() => void saveImageAs(message.imageJob!)} onReveal={path => void revealImage(path)} />}</div>)}
       {loading && <div className="chat-message activity-message"><div>{retrying ? 'Working on it…' : inspecting ? 'Checking files…' : activeSteps.length ? 'Preparing an answer…' : 'Thinking…'}</div>{activeSteps.map((step, index) => <div className="activity-step" key={index}>✓ {step}</div>)}</div>}
       {imageSubmitting && <div className="chat-message activity-message">Submitting the fixed SDXL workflow to ComfyUI…</div>}
       <div ref={endRef} />
     </div>
     <div className="chat-composer">
-      <div className="composer-mode" role="group" aria-label="Request type"><button aria-pressed={mode === 'chat'} disabled={loading || imageSubmitting} onClick={() => { setMode('chat'); setError(null) }}>Chat</button><button aria-pressed={mode === 'image'} disabled={loading || imageSubmitting} onClick={() => { setMode('image'); setImageSetupDismissed(false); setError(null) }}>Image</button></div>
+      <div className="composer-mode" role="group" aria-label="Request type"><button aria-pressed={mode === 'chat'} onClick={() => selectMode('chat')}>Chat</button><button aria-pressed={mode === 'image'} onClick={() => selectMode('image')}>Image</button></div>
       {error && <div role="alert" className="composer-error">{error}</div>}
-      <div className="composer-row"><textarea aria-label={mode === 'image' ? 'Image prompt' : 'Prompt'} className="prompt-input" value={prompt} disabled={!ready || loading || imageSubmitting} maxLength={mode === 'image' ? 4000 : 12000} placeholder={placeholder} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void (mode === 'image' ? sendImage() : sendChat()) } }} /><button className="primary-button send-button" onClick={() => void (mode === 'image' ? sendImage() : sendChat())} disabled={!ready || !prompt.trim() || loading || imageSubmitting}>{mode === 'image' ? 'Generate' : 'Send'}</button></div>
+      <div className="composer-row"><textarea ref={promptRef} aria-label={mode === 'image' ? 'Image prompt' : 'Prompt'} className="prompt-input" value={prompt} maxLength={mode === 'image' ? 4000 : 12000} placeholder={placeholder} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void (mode === 'image' ? sendImage() : sendChat()) } }} /><button className="primary-button send-button" onClick={() => void (mode === 'image' ? sendImage() : sendChat())} disabled={!ready || !prompt.trim() || (mode === 'chat' ? loading : imageSubmitting)}>{mode === 'image' ? 'Generate' : 'Send'}</button></div>
       <p className="composer-hint"><kbd>Enter</kbd> {mode === 'image' ? 'generate' : 'send'} <span>·</span> <kbd>Shift</kbd> + <kbd>Enter</kbd> new line <span>·</span> {mode === 'image' ? 'One local GPU job at a time' : 'Session-only chat'}</p>
     </div>
   </main>
