@@ -1,13 +1,25 @@
 # AIIDE Codex working rules
 
-Use minimum sufficient context. After this file, read [codex/REPO-MAP.md](codex/REPO-MAP.md). Read [codex/CONTEXT.md](codex/CONTEXT.md) for durable architecture and current-versus-planned capabilities; use targeted sections of [PROJECT.md](PROJECT.md) for the roadmap or broader product decisions. Treat any future `codex/archive/` as cold history.
+## Context discipline
 
-Start with user-named files or the mapped subsystem. Inspect relevant files and only necessary call boundaries; use targeted searches when ownership is unclear. Avoid broad repository audits, generated/dependency output, and unnecessary context loading. Do not inspect secrets or local credentials by default.
+Read this file first, then [codex/REPO-MAP.md](codex/REPO-MAP.md). Read [codex/CONTEXT.md](codex/CONTEXT.md) only when the task needs broader architectural context, and use targeted sections of [PROJECT.md](PROJECT.md) only for product status, roadmap, or wider decisions. Treat `codex/archive/` as cold history.
 
-Prefer small, scoped implementation tasks and the smallest reliable change. Do not refactor or reformat unrelated code, upgrade dependencies, or revisit adjacent UI. Preserve the trusted Rust/Tauri boundary: model output is untrusted and repository access must be project-relative, protected, and bounded. See `src-tauri/src/repository.rs` for current rules.
+Start with files named by the user. Explore progressively: task → repository map → relevant files → direct dependencies → targeted search → wider subsystem only when justified. Initially aim for 3–8 relevant source files and expand only when necessary. Stop once there is enough evidence to act safely.
 
-Preserve existing passing behavior and tests. Add a regression test for each confirmed bug fix. Never weaken tests to make CI pass. Get explicit approval before changing an established behavioral contract.
+Avoid whole-repository scans, recursive exploration, large file dumps, repeated reads of unchanged files, historical documentation, and unrelated subsystems. Do not inspect generated output, dependencies, binaries, large asset collections, or secrets unless the task specifically requires them. For a large file, inspect headings, targeted matches, or relevant ranges before reading it in full.
 
-Validate proportionally: focused tests/checks first, then affected type/lint/compiler checks; use a broader build only when warranted. Use a focused live Ollama pass for model behavior when needed, and stop repeating a runtime-dependent check after about two similar failures. Report what passed, timed out, and whether direct connectivity worked. Do not fix unrelated warnings.
+Make the smallest reliable change. Reuse existing patterns; do not perform unrelated refactoring, cleanup, dependency upgrades, UI revisits, or documentation rewrites.
 
-The current application has bounded inspection, an approved one-file proposal path, narrow application-led HTML heading selection, and approved local Git staging/commit operations. Broader deterministic editing, controlled project commands, GitHub/remote operations, and standalone runtime management remain planned. Feature-branch work such as M08A image generation is not part of `main` until merged. Use current code as implementation truth and [codex/CONTEXT.md](codex/CONTEXT.md) for status and architectural direction.
+## Verification
+
+Do **not** run AIIDE benchmarks by default or automatically after implementations, fixes, or refactors. The user runs benchmarks manually. Run the benchmark harness only when the user explicitly requests it.
+
+Run only tests directly affected by modified code and add focused regression coverage when new behaviour requires it. Prefer scoped lint or type checks where supported. Run broader tests or builds only when a repository rule requires them or the change justifies them. Do not repeat a passing check without a relevant change, weaken mandatory safety checks or CI requirements, or fix unrelated warnings and pre-existing failures.
+
+For documentation-only work, validate changed paths and references and run `git diff --check`; do not run application tests, benchmarks, lint, type checks, or builds unless mandatory. Report checks performed, checks intentionally skipped, and genuine remaining risks.
+
+## Safety and Git
+
+Preserve application-led editing, repository grounding, the trusted Rust/Tauri boundary, and human approval for consequential actions. Model output is untrusted; repository access must remain project-relative, protected, and bounded. See `src-tauri/src/repository.rs` for the enforced rules.
+
+Never inspect or expose credentials unnecessarily. Preserve user changes. Do not commit, push, merge, reset, discard work, or change an established behavioural contract unless explicitly requested. Never weaken tests merely to make CI pass.
