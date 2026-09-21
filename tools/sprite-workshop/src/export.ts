@@ -1,15 +1,15 @@
 import type { Region } from './geometry'
 import type { Layout } from './alignment'
-import { drawPlacement } from './render'
+import { drawFrame, drawPlacement } from './render'
+import type { TouchUps } from './touchups'
 
-export function cropToCanvas(image: ImageBitmap, region: Region): HTMLCanvasElement {
+export function cropToCanvas(image: ImageBitmap, region: Region, touchUps: TouchUps = {}): HTMLCanvasElement {
   const canvas = document.createElement('canvas')
   canvas.width = region.width
   canvas.height = region.height
   const context = canvas.getContext('2d')
   if (!context) throw new Error('Canvas is unavailable in this browser.')
-  context.imageSmoothingEnabled = false
-  context.drawImage(image, region.x, region.y, region.width, region.height, 0, 0, region.width, region.height)
+  drawFrame(context, image, region, touchUps[region.id] ?? [], 0, 0)
   return canvas
 }
 
@@ -17,12 +17,12 @@ export function pngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
   return new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('PNG export failed.')), 'image/png'))
 }
 
-export function alignedCanvas(image: ImageBitmap, layout: Layout, slot: number): HTMLCanvasElement {
+export function alignedCanvas(image: ImageBitmap, layout: Layout, slot: number, touchUps: TouchUps = {}): HTMLCanvasElement {
   const canvas = document.createElement('canvas')
   canvas.width = layout.width; canvas.height = layout.height
   const context = canvas.getContext('2d')
   if (!context) throw new Error('Canvas is unavailable in this browser.')
-  drawPlacement(context, image, layout.placements[slot] ?? null)
+  drawPlacement(context, image, layout.placements[slot] ?? null, touchUps)
   return canvas
 }
 
@@ -71,7 +71,7 @@ export function validateAnimation(slots: (string | null)[], regions: Region[], l
   return null
 }
 
-export function spriteSheetCanvas(image: ImageBitmap, layout: Layout): HTMLCanvasElement {
+export function spriteSheetCanvas(image: ImageBitmap, layout: Layout, touchUps: TouchUps = {}): HTMLCanvasElement {
   const canvas = document.createElement('canvas')
   canvas.width = layout.width * 8; canvas.height = layout.height
   const context = canvas.getContext('2d')
@@ -79,7 +79,7 @@ export function spriteSheetCanvas(image: ImageBitmap, layout: Layout): HTMLCanva
   for (let slot = 0; slot < 8; slot++) {
     const placement = layout.placements[slot]
     if (!placement) throw new Error(`Slot ${slot + 1} has no placement.`)
-    drawPlacement(context, image, { ...placement, x: placement.x + slot * layout.width })
+    drawPlacement(context, image, { ...placement, x: placement.x + slot * layout.width }, touchUps)
   }
   return canvas
 }
@@ -93,11 +93,11 @@ function triggerDownload(url: string, filename: string): void {
   finally { link.remove() }
 }
 
-export async function downloadAnimation(image: ImageBitmap, slots: (string | null)[], regions: Region[], layout: Layout, name: string, fps: number): Promise<void> {
+export async function downloadAnimation(image: ImageBitmap, slots: (string | null)[], regions: Region[], layout: Layout, name: string, fps: number, touchUps: TouchUps = {}): Promise<void> {
   const issue = validateAnimation(slots, regions, layout, name, fps)
   if (issue) throw new Error(issue)
   const metadata = animationMetadata(name, fps, layout)
-  const png = await pngBlob(spriteSheetCanvas(image, layout))
+  const png = await pngBlob(spriteSheetCanvas(image, layout, touchUps))
   // Prepare both files before triggering either download.
   const json = new Blob([JSON.stringify(metadata, null, 2) + '\n'], { type: 'application/json' })
   const pngUrl = URL.createObjectURL(png)
@@ -112,8 +112,8 @@ export async function downloadAnimation(image: ImageBitmap, slots: (string | nul
   }
 }
 
-export async function downloadRegion(image: ImageBitmap, region: Region, sourceName: string): Promise<void> {
-  const blob = await pngBlob(cropToCanvas(image, region))
+export async function downloadRegion(image: ImageBitmap, region: Region, sourceName: string, touchUps: TouchUps = {}): Promise<void> {
+  const blob = await pngBlob(cropToCanvas(image, region, touchUps))
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   const base = sourceName.replace(/\.png$/i, '').replace(/[^a-z0-9_-]+/gi, '-').replace(/^-|-$/g, '') || 'sprite'
@@ -126,8 +126,8 @@ export async function downloadRegion(image: ImageBitmap, region: Region, sourceN
   window.setTimeout(() => URL.revokeObjectURL(url), 30_000)
 }
 
-export async function downloadAlignedSlot(image: ImageBitmap, layout: Layout, slot: number, sourceName: string): Promise<void> {
-  const blob = await pngBlob(alignedCanvas(image, layout, slot))
+export async function downloadAlignedSlot(image: ImageBitmap, layout: Layout, slot: number, sourceName: string, touchUps: TouchUps = {}): Promise<void> {
+  const blob = await pngBlob(alignedCanvas(image, layout, slot, touchUps))
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   const base = sourceName.replace(/\.png$/i, '').replace(/[^a-z0-9_-]+/gi, '-').replace(/^-|-$/g, '') || 'sprite'

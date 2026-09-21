@@ -55,8 +55,27 @@ const frames = Array.from({ length: 8 }, (_, i) => ({ id: `frame-${i}`, name: `F
 const slots = frames.map(frame => frame.id)
 const layout = {
   width: 20, height: 16,
-  placements: frames.map((frame, i) => ({ source: { x: frame.x, y: frame.y, width: 4, height: 5 }, x: 2 + i, y: i })),
+  placements: frames.map((frame, i) => ({ source: { x: frame.x, y: frame.y, width: 4, height: 5 }, frameId: frame.id, x: 2 + i, y: i })),
 }
+
+test('crop, aligned slot, and sprite sheet exports all apply the same frame erases', () => {
+  const clears = []
+  globalThis.document = {
+    createElement: () => ({
+      width: 0, height: 0,
+      getContext: () => ({
+        set imageSmoothingEnabled(_value) {}, drawImage() {},
+        clearRect: (...args) => clears.push(args),
+      }),
+    }),
+  }
+  const image = { width: 100, height: 100 }
+  const touchUps = { 'frame-0': [{ x: 1, y: 2, width: 2, height: 2 }] }
+  cropToCanvas(image, frames[0], touchUps)
+  alignedCanvas(image, layout, 0, touchUps)
+  spriteSheetCanvas(image, layout, touchUps)
+  assert.deepEqual(clears, Array.from({ length: 3 }, () => [1, 2, 2, 2]))
+})
 
 test('sheet uses eight ordered fixed cells, exact offsets, and transparent backgrounds', () => {
   const draws = []

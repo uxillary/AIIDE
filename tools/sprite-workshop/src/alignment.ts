@@ -4,7 +4,7 @@ export type Pixels = { data: Uint8ClampedArray; width: number; height: number }
 export type Bounds = { x: number; y: number; width: number; height: number }
 export type AlignmentMode = 'bottom' | 'center'
 export type AlignmentOptions = { mode: AlignmentMode; padding: number; minWidth: number; minHeight: number }
-export type Placement = { source: Bounds; x: number; y: number }
+export type Placement = { source: Bounds; x: number; y: number; frameId?: string }
 export type Layout = { width: number; height: number; anchorX: number; anchorY: number; placements: (Placement | null)[] }
 export type AlignmentZoom = 'fit' | 1 | 2 | 4 | 8
 
@@ -36,6 +36,7 @@ export function calculateLayout(frames: (Region | null)[], offsets: Point[], opt
     const offset = offsets[index] ?? { x: 0, y: 0 }
     return {
       source: { x: frame.x, y: frame.y, width: frame.width, height: frame.height },
+      frameId: frame.id,
       x: anchorX - Math.floor(frame.width / 2) + Math.round(offset.x),
       y: (options.mode === 'bottom' ? anchorY - frame.height : anchorY - Math.floor(frame.height / 2)) + Math.round(offset.y),
     }

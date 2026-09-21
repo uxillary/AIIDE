@@ -3,6 +3,8 @@ import type { GridOptions, RowBoundaryMode } from './detection'
 import type { Point, Region } from './geometry'
 import { loadPng } from './image'
 import type { SourceImage } from './image'
+import { validateTouchUps } from './touchups'
+import type { TouchUps } from './touchups'
 
 export const PROJECT_SCHEMA_VERSION = 1
 export const PORTABLE_PROJECT_KIND = 'aiide-sprite-workshop-project'
@@ -35,6 +37,7 @@ export type ProjectData = {
   rowFrameCount?: number
   rowBoundaryMode?: RowBoundaryMode
   rowPadding?: number
+  touchUps?: TouchUps
 }
 
 export type SourceRecord = { blob: Blob; name: string; type: string; size: number; lastModified: number }
@@ -69,7 +72,7 @@ export function validateProject(value: unknown): ProjectData {
   if (project.rowBoundaryMode !== undefined && !['equal', 'content'].includes(project.rowBoundaryMode)) throw new Error('Project animation row boundary mode is malformed.')
   if (project.rowPadding !== undefined && (!isNumber(project.rowPadding) || project.rowPadding < 0 || project.rowPadding > 256)) throw new Error('Project animation row padding is malformed.')
   if (typeof project.animationName !== 'string' || (project.selectedId !== null && (typeof project.selectedId !== 'string' || !ids.has(project.selectedId)))) throw new Error('Project identity settings are malformed.')
-  return project as ProjectData
+  return { ...project, touchUps: validateTouchUps(project.touchUps, project.regions) } as ProjectData
 }
 
 function requestResult<T>(request: IDBRequest<T>): Promise<T> {

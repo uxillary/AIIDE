@@ -5,7 +5,7 @@ import type { Handle, Point, Region } from './geometry'
 import { downloadAlignedSlot, downloadAnimation, downloadRegion, validateAnimation } from './export'
 import { loadPng } from './image'
 import type { SourceImage } from './image'
-import { SpriteCanvas, Thumbnail } from './Preview'
+import { SpriteCanvas, Thumbnail, TouchUpEditor } from './Preview'
 import { alignmentDragOffset, alignmentScale, calculateLayout, emptyOffsets, referenceSlotFor } from './alignment'
 import type { AlignmentMode, AlignmentZoom, Pixels } from './alignment'
 import { acceptAllSuggestions, acceptSuggestion, acceptSuggestionBatch, alphaSuggestions, animationRowSuggestions, eligibleSuggestionCount, gridSuggestions, rejectSuggestion } from './detection'
@@ -15,6 +15,8 @@ import type { DeletedFrame } from './frameActions'
 import { DetectionPanel } from './DetectionPanel'
 import { deserializePortableProject, loadLatestProject, PROJECT_SCHEMA_VERSION, projectFileName, restoreSource, saveLatestProject, saveWithStatus, serializePortableProject } from './project'
 import type { ProjectData, SourceRecord, StoredProject } from './project'
+import { appendErase, resetFrameTouchUps, stepTouchUpHistory } from './touchups'
+import type { EraseRect, TouchUps } from './touchups'
 
 type Drag =
   | { kind: 'draw'; start: Point; id: string; name: string }
@@ -56,6 +58,11 @@ export default function App() {
   const [pixels, setPixels] = useState<Pixels | null>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [deleted, setDeleted] = useState<DeletedFrame | null>(null)
+  const [touchUps, setTouchUps] = useState<TouchUps>({})
+  const [touchUpUndo, setTouchUpUndo] = useState<TouchUps[]>([])
+  const [touchUpRedo, setTouchUpRedo] = useState<TouchUps[]>([])
+  const [eraseMode, setEraseMode] = useState(false)
+  const [touchUpZoom, setTouchUpZoom] = useState(4)
   const [suggestions, setSuggestions] = useState<RowSuggestion[]>([])
   const [selectedSuggestion, setSelectedSuggestion] = useState<string | null>(null)
   const [detectionMode, setDetectionMode] = useState<'grid' | 'alpha' | 'row'>('grid')
@@ -135,8 +142,8 @@ export default function App() {
   const projectData = useMemo<ProjectData>(() => ({
     schemaVersion: PROJECT_SCHEMA_VERSION, regions, selectedId, slots, activeSlot, fps, animationName, alignmentMode, offsets, padding, minWidth, minHeight,
     onion, onionReference, fixedReferenceSlot, centreGuide, baselineGuide, pixelGrid, baselineOffset, detectionMode, grid, joinGap, minPixels,
-    rowSelection, rowFrameCount, rowBoundaryMode, rowPadding,
-  }), [regions, selectedId, slots, activeSlot, fps, animationName, alignmentMode, offsets, padding, minWidth, minHeight, onion, onionReference, fixedReferenceSlot, centreGuide, baselineGuide, pixelGrid, baselineOffset, detectionMode, grid, joinGap, minPixels, rowSelection, rowFrameCount, rowBoundaryMode, rowPadding])
+    rowSelection, rowFrameCount, rowBoundaryMode, rowPadding, touchUps,
+  }), [regions, selectedId, slots, activeSlot, fps, animationName, alignmentMode, offsets, padding, minWidth, minHeight, onion, onionReference, fixedReferenceSlot, centreGuide, baselineGuide, pixelGrid, baselineOffset, detectionMode, grid, joinGap, minPixels, rowSelection, rowFrameCount, rowBoundaryMode, rowPadding, touchUps])
 
   function applyProject(project: ProjectData) {
     setRegions(project.regions); setSelectedId(project.selectedId); setSlots(project.slots); setActiveSlot(project.activeSlot); setFps(project.fps); setAnimationName(project.animationName)
@@ -144,6 +151,7 @@ export default function App() {
     setOnion(project.onion); setOnionReference(project.onionReference); setFixedReferenceSlot(project.fixedReferenceSlot); setCentreGuide(project.centreGuide); setBaselineGuide(project.baselineGuide)
     setPixelGrid(project.pixelGrid); setBaselineOffset(project.baselineOffset); setDetectionMode(project.detectionMode); setGrid(project.grid); setJoinGap(project.joinGap); setMinPixels(project.minPixels)
     setRowSelection(project.rowSelection ?? null); setRowFrameCount(project.rowFrameCount ?? 8); setRowBoundaryMode(project.rowBoundaryMode ?? 'equal'); setRowPadding(project.rowPadding ?? 0)
+    setTouchUps(project.touchUps ?? {}); setTouchUpUndo([]); setTouchUpRedo([]); setEraseMode(false)
     setSuggestions([]); setSelectedSuggestion(null); setDeleted(null); setPlaying(false); setExportError(null)
     nextNumber.current = project.regions.length + 1
   }
@@ -314,7 +322,7 @@ export default function App() {
       catch { loaded.bitmap.close(); throw new Error('Could not read PNG pixels for local alpha analysis.') }
       sourceRef.current?.bitmap.close()
       sourceRef.current = loaded
-      setSource(loaded); setSourceRecord({ blob: file, name: file.name, type: 'image/png', size: file.size, lastModified: file.lastModified }); setPixels({ data: imageData.data, width: loaded.width, height: loaded.height }); setRegions([]); setSelectedId(null); setSlots([...EMPTY_SLOTS]); setOffsets(emptyOffsets()); setSuggestions([]); setSelectedSuggestion(null); setRowSelection(null); setDeleted(null); setActiveSlot(0); setPlaying(false); nextNumber.current = 1
+      setSource(loaded); setSourceRecord({ blob: file, name: file.name, type: 'image/png', size: file.size, lastModified: file.lastModified }); setPixels({ data: imageData.data, width: loaded.width, height: loaded.height }); setRegions([]); setSelectedId(null); setSlots([...EMPTY_SLOTS]); setOffsets(emptyOffsets()); setSuggestions([]); setSelectedSuggestion(null); setRowSelection(null); setDeleted(null); setTouchUps({}); setTouchUpUndo([]); setTouchUpRedo([]); setEraseMode(false); setActiveSlot(0); setPlaying(false); nextNumber.current = 1
       setAnimationName(loaded.name.replace(/\.png$/i, '') || 'animation'); setExportError(null)
       window.requestAnimationFrame(() => fit(loaded))
     } catch (cause) { if (request === loadCounter.current) setError(cause instanceof Error ? cause.message : 'Could not load the image.') }
@@ -325,7 +333,13 @@ export default function App() {
     return { x: event.clientX - rect.left, y: event.clientY - rect.top }
   }
 
-  function updateRegion(next: Region) { setRegions(previous => previous.map(region => region.id === next.id ? next : region)) }
+  function updateRegion(next: Region) {
+    setRegions(previous => previous.map(region => region.id === next.id ? next : region))
+    const valid = (touchUps[next.id] ?? []).filter(rect => rect.x + rect.width <= next.width && rect.y + rect.height <= next.height)
+    if (valid.length !== (touchUps[next.id]?.length ?? 0)) {
+      setTouchUps(valid.length ? { ...touchUps, [next.id]: valid } : resetFrameTouchUps(touchUps, next.id)); setTouchUpUndo([]); setTouchUpRedo([])
+    }
+  }
 
   function startDrag(event: React.PointerEvent, action?: 'move' | Handle, region?: Region, row = false) {
     if (!source || !imageSize || event.button > 1) return
@@ -410,7 +424,7 @@ export default function App() {
   }
 
   function resetProject() {
-    sourceRef.current?.bitmap.close(); sourceRef.current = null; setSource(null); setSourceRecord(null); setPixels(null); setRegions([]); setSelectedId(null); setSlots([...EMPTY_SLOTS]); setOffsets(emptyOffsets())
+    sourceRef.current?.bitmap.close(); sourceRef.current = null; setSource(null); setSourceRecord(null); setPixels(null); setRegions([]); setSelectedId(null); setSlots([...EMPTY_SLOTS]); setOffsets(emptyOffsets()); setTouchUps({}); setTouchUpUndo([]); setTouchUpRedo([]); setEraseMode(false)
     setSuggestions([]); setSelectedSuggestion(null); setRowSelection(null); setRowFrameCount(8); setRowBoundaryMode('equal'); setRowPadding(0); setAssignBatch(false); setDeleted(null); setActiveSlot(0); setPlaying(false); setFps(8); setAnimationName('animation'); setAlignmentMode('bottom'); setPadding(8); setMinWidth(0); setMinHeight(0)
     setOnion(false); setOnionReference('previous'); setFixedReferenceSlot(0); setCentreGuide(true); setBaselineGuide(true); setPixelGrid(false); setBaselineOffset(0); setAlignmentZoom('fit'); setAlignmentPan({ x: 0, y: 0 })
     setDetectionMode('grid'); setGrid({ rows: 5, columns: 8, gapX: 8, gapY: 8, left: 0, right: 0, top: 0, bottom: 0 }); setJoinGap(12); setMinPixels(8); setZoom(1); setPan({ x: 0, y: 0 }); setMode('select'); setActiveTab('extract')
@@ -490,6 +504,7 @@ export default function App() {
     const result = removeFrame({ regions, slots, selectedId }, id)
     if (!result.undo) return
     setRegions(result.state.regions); setSlots(result.state.slots); setSelectedId(result.state.selectedId); setDeleted(result.undo)
+    setTouchUps(previous => resetFrameTouchUps(previous, id)); setTouchUpUndo([]); setTouchUpRedo([])
     setNotice(`${result.undo.region.name} deleted.`)
   }
 
@@ -497,6 +512,33 @@ export default function App() {
     if (!deleted) return
     const restored = restoreFrame({ regions, slots, selectedId }, deleted)
     setRegions(restored.regions); setSlots(restored.slots); setSelectedId(restored.selectedId); setDeleted(null); setNotice(`${deleted.region.name} restored.`)
+  }
+
+  function commitTouchUps(next: TouchUps, message: string) {
+    if (next === touchUps) { setNotice('This frame has reached the 512 rectangle touch-up limit.'); return }
+    setTouchUpUndo(previous => [...previous.slice(-99), touchUps]); setTouchUpRedo([]); setTouchUps(next); setNotice(message)
+  }
+
+  function erasePixels(rect: EraseRect) {
+    if (!selected) return
+    commitTouchUps(appendErase(touchUps, selected.id, rect), `Erased ${rect.width} × ${rect.height} px from ${selected.name}.`)
+  }
+
+  function undoTouchUp() {
+    const step = stepTouchUpHistory(touchUpUndo, touchUpRedo, touchUps)
+    if (!step) return
+    setTouchUpUndo(step.from); setTouchUpRedo(step.to); setTouchUps(step.touchUps); setNotice('Undid touch-up edit.')
+  }
+
+  function redoTouchUp() {
+    const step = stepTouchUpHistory(touchUpRedo, touchUpUndo, touchUps)
+    if (!step) return
+    setTouchUpRedo(step.from); setTouchUpUndo(step.to); setTouchUps(step.touchUps); setNotice('Redid touch-up edit.')
+  }
+
+  function resetSelectedTouchUps() {
+    if (!selected || !(selected.id in touchUps)) return
+    commitTouchUps(resetFrameTouchUps(touchUps, selected.id), `Reset touch-ups for ${selected.name}.`)
   }
 
   function generateSuggestions() {
@@ -561,21 +603,21 @@ export default function App() {
   async function exportOne(region: Region) {
     if (!source) return
     setError(null)
-    try { await downloadRegion(source.bitmap, region, source.name); setNotice(`Downloaded ${region.name} as a source crop PNG.`) }
+    try { await downloadRegion(source.bitmap, region, source.name, touchUps); setNotice(`Downloaded ${region.name} as an edited crop PNG.`) }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'Export failed.') }
   }
 
   async function exportAligned() {
     if (!source || !assigned[activeSlot]) return
     setError(null)
-    try { await downloadAlignedSlot(source.bitmap, layout, activeSlot, source.name); setNotice(`Downloaded aligned animation slot ${activeSlot + 1}.`) }
+    try { await downloadAlignedSlot(source.bitmap, layout, activeSlot, source.name, touchUps); setNotice(`Downloaded aligned animation slot ${activeSlot + 1}.`) }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'Export failed.') }
   }
 
   async function exportAnimation() {
     if (!source || exporting) return
     setExportError(null); setError(null); setExporting(true)
-    try { await downloadAnimation(source.bitmap, slots, regions, layout, animationName, fps); setNotice('Downloaded animation PNG sprite sheet and JSON metadata.') }
+    try { await downloadAnimation(source.bitmap, slots, regions, layout, animationName, fps, touchUps); setNotice('Downloaded animation PNG sprite sheet and JSON metadata.') }
     catch (cause) { setExportError(cause instanceof Error ? cause.message : 'Animation export failed.') }
     finally { setExporting(false) }
   }
@@ -590,7 +632,7 @@ export default function App() {
     <nav className="workflow-tabs" role="tablist" aria-label="Sprite workflow">{WORKFLOW_TABS.map((tab, index) => <button key={tab.id} ref={element => { tabRefs.current[index] = element }} id={`workflow-tab-${tab.id}`} role="tab" aria-selected={activeTab === tab.id} aria-controls={`workflow-panel-${tab.id}`} tabIndex={activeTab === tab.id ? 0 : -1} onClick={() => selectTab(tab.id)} onKeyDown={event => handleTabKeyDown(event, index)}>{tab.label}</button>)}</nav>
     <main className={activeTab === 'animate' ? 'workspace animate-workspace' : 'workspace'} style={workspaceStyle}>
       <aside id="workflow-panel-extract" className="panel frames-panel" role="tabpanel" aria-labelledby="workflow-tab-extract" hidden={activeTab !== 'extract'}><div className="section-heading"><div><span className="eyebrow">REGIONS</span><h2>Frame library <em>{regions.length}</em></h2></div><button className="small" disabled={!source} onClick={addFrame}>+ Add</button></div>
-        <div className="frames-list">{regions.length === 0 ? <div className="panel-empty"><span>▧</span><strong>No frames yet</strong><p>Drag across the image, add a centered region, or preview suggestions.</p></div> : regions.map((region, index) => <div key={region.id} className={`frame-row ${selectedId === region.id ? 'active' : ''}`}><button className="frame-select" onClick={() => setSelectedId(region.id)}><Thumbnail image={source!.bitmap} region={region} /><span className="frame-text"><strong>{region.name}</strong><small>{region.width} × {region.height} px · {region.x}, {region.y}</small></span><span className="frame-index">{String(index + 1).padStart(2, '0')}</span></button><button className="row-delete" aria-label={`Delete ${region.name}`} title={`Delete ${region.name}`} onClick={() => deleteFrame(region.id)}>×</button></div>)}</div>
+        <div className="frames-list">{regions.length === 0 ? <div className="panel-empty"><span>▧</span><strong>No frames yet</strong><p>Drag across the image, add a centered region, or preview suggestions.</p></div> : regions.map((region, index) => <div key={region.id} className={`frame-row ${selectedId === region.id ? 'active' : ''}`}><button className="frame-select" onClick={() => setSelectedId(region.id)}><Thumbnail image={source!.bitmap} region={region} touchUps={touchUps} /><span className="frame-text"><strong>{region.name}</strong><small>{region.width} × {region.height} px · {region.x}, {region.y}</small></span><span className="frame-index">{String(index + 1).padStart(2, '0')}</span></button><button className="row-delete" aria-label={`Delete ${region.name}`} title={`Delete ${region.name}`} onClick={() => deleteFrame(region.id)}>×</button></div>)}</div>
         <DetectionPanel enabled={Boolean(source)} image={source?.bitmap ?? null} mode={detectionMode} onMode={value => { setDetectionMode(value); setSuggestions([]); setSelectedSuggestion(null) }} grid={grid} onGrid={setGrid} joinGap={joinGap} onJoinGap={setJoinGap} minPixels={minPixels} onMinPixels={setMinPixels} rowSelection={rowSelection} onRowEdit={editRowSelection} rowFrameCount={rowFrameCount} onRowFrameCount={setRowFrameCount} rowBoundaryMode={rowBoundaryMode} onRowBoundaryMode={setRowBoundaryMode} rowPadding={rowPadding} onRowPadding={setRowPadding} assignBatch={assignBatch} onAssignBatch={setAssignBatch} suggestions={suggestions} selected={suggestion} eligibleCount={eligibleSuggestions} onSelected={setSelectedSuggestion} onGenerate={generateSuggestions} onEdit={editSuggestion} onAccept={accept} onAcceptAll={acceptAll} onReject={reject} onClear={() => { setSuggestions([]); setSelectedSuggestion(null) }} />
         <div className="panel-foot">Coordinates always use source-image pixels.</div>
       </aside>
@@ -602,15 +644,18 @@ export default function App() {
       </section>
       {resizeHandle()}
       <aside className="panel detail-panel" aria-label="Workflow tools">
-        <div id="workflow-panel-inspect" className="workflow-panel" role="tabpanel" aria-labelledby="workflow-tab-inspect" hidden={activeTab !== 'inspect'}><section className="inspect-suggestions"><span className="eyebrow">ORGANISE</span><h2>Frame order and assignments</h2><p>Slots 1–8 follow the current frame-list order. Existing assignments are confirmed before replacement.</p><button className="primary" disabled={!regions.length} onClick={fillSlotsFromFrames}>Fill slots from frame list</button><div className="inspect-frame-strip" aria-label="Frame thumbnails">{regions.map((region, index) => <button key={region.id} className={selectedId === region.id ? 'active' : ''} aria-label={`Select ${region.name}`} aria-pressed={selectedId === region.id} onClick={() => setSelectedId(region.id)}>{source && <Thumbnail image={source.bitmap} region={region} />}<span>{index + 1}</span></button>)}</div></section>{selected && source ? <div className="details">
+        <div id="workflow-panel-inspect" className="workflow-panel" role="tabpanel" aria-labelledby="workflow-tab-inspect" hidden={activeTab !== 'inspect'}><section className="inspect-suggestions"><span className="eyebrow">ORGANISE</span><h2>Frame order and assignments</h2><p>Slots 1–8 follow the current frame-list order. Existing assignments are confirmed before replacement.</p><button className="primary" disabled={!regions.length} onClick={fillSlotsFromFrames}>Fill slots from frame list</button><div className="inspect-frame-strip" aria-label="Frame thumbnails">{regions.map((region, index) => <button key={region.id} className={selectedId === region.id ? 'active' : ''} aria-label={`Select ${region.name}`} aria-pressed={selectedId === region.id} onClick={() => setSelectedId(region.id)}>{source && <Thumbnail image={source.bitmap} region={region} touchUps={touchUps} />}<span>{index + 1}</span></button>)}</div></section>{selected && source ? <div className="details" onKeyDown={event => { const target = event.target; if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'z' || target instanceof HTMLInputElement || target instanceof HTMLSelectElement || target instanceof HTMLTextAreaElement) return; event.preventDefault(); if (event.shiftKey) redoTouchUp(); else undoTouchUp() }}>
           <div className="section-heading"><div><span className="eyebrow">SELECTED FRAME</span><h2>Crop inspection</h2></div></div>
           <div className="inspect-nav"><button className="small" onClick={() => selectAdjacentFrame(-1)}>← Previous</button><button className="small" onClick={fitSelected}>Fit selected frame</button><button className="small" onClick={() => selectAdjacentFrame(1)}>Next →</button></div>
           <label className="field"><span>Name</span><input value={selected.name} maxLength={48} onChange={event => updateRegion({ ...selected, name: event.target.value })} /></label>
           <div className="field-grid">{(['x', 'y', 'width', 'height'] as const).map(key => <label className="field" key={key}><span>{key === 'width' ? 'Width' : key === 'height' ? 'Height' : key.toUpperCase()}</span><input type="number" min={key === 'width' || key === 'height' ? 1 : 0} max={key === 'x' ? source.width - 1 : key === 'y' ? source.height - 1 : key === 'width' ? source.width - selected.x : source.height - selected.y} value={selected[key]} onChange={event => editNumber(key, event.target.value)} /></label>)}</div>
-          <div className="preview-label">SOURCE CROP <span>{selected.width} × {selected.height} PX</span></div>
-          <div className="selected-preview checker"><SpriteCanvas image={source.bitmap} region={selected} width={selected.width} height={selected.height} /></div>
+          <div className="preview-label">EDITED CROP <span>{selected.width} × {selected.height} PX</span></div>
+          <div className="touchup-toolbar" aria-label="Pixel touch-up controls"><button className={eraseMode ? 'tool active' : 'tool'} aria-pressed={eraseMode} onClick={() => setEraseMode(value => !value)}>▧ <span>Rectangle Erase</span></button><button className="small" disabled={!touchUpUndo.length} onClick={undoTouchUp} aria-keyshortcuts="Control+Z">Undo</button><button className="small" disabled={!touchUpRedo.length} onClick={redoTouchUp} aria-keyshortcuts="Control+Shift+Z">Redo</button><button className="small" disabled={!touchUps[selected.id]?.length} onClick={resetSelectedTouchUps}>Reset touch-ups</button></div>
+          <div className="touchup-zoom"><span>Zoom</span>{[1, 2, 4, 8].map(value => <button key={value} className={touchUpZoom === value ? 'active' : ''} aria-pressed={touchUpZoom === value} onClick={() => setTouchUpZoom(value)}>{value}×</button>)}</div>
+          <div className={eraseMode ? 'selected-preview touchup-preview checker editing' : 'selected-preview touchup-preview checker'}><TouchUpEditor image={source.bitmap} region={selected} erases={touchUps[selected.id] ?? []} active={eraseMode} zoom={touchUpZoom} onErase={erasePixels} /></div>
+          <p className="touchup-status" role="status">{eraseMode ? `Rectangle Erase active · ${touchUps[selected.id]?.length ?? 0} edit${touchUps[selected.id]?.length === 1 ? '' : 's'} · drag pixels or use arrows, Shift+arrows and Enter` : `${touchUps[selected.id]?.length ?? 0} touch-up edit${touchUps[selected.id]?.length === 1 ? '' : 's'} · source PNG unchanged`}</p>
           <div className="detail-actions"><button className="danger" onClick={() => deleteFrame(selected.id)}>Delete frame</button></div>
-          <p className="help">Crop coordinates use source-image pixels. Animation placement is edited in Animate.</p>
+          <p className="help">Touch-ups use frame-local pixels and never alter the source PNG or crop coordinates. Animation placement is edited in Animate.</p>
         </div> : <div className="panel-empty details-empty"><span>◇</span><strong>{source ? 'No frame selected' : 'No source image'}</strong><p>{source ? 'Choose a frame thumbnail above or create one in Extract.' : 'Import a PNG or reopen a local project to inspect frames.'}</p></div>}</div>
         <div id="workflow-panel-animate" className="workflow-panel" role="tabpanel" aria-labelledby="workflow-tab-animate" hidden={activeTab !== 'animate'}>
         <section className="tool-section animate-alignment"><div className="section-heading"><div><span className="eyebrow">ALIGNMENT</span><h2>Animation alignment</h2></div></div><p className="section-help">Assign crops, then place each slot on one pixel canvas. Drag the preview or use exact offsets.</p>
@@ -624,7 +669,7 @@ export default function App() {
             </div>
             <div ref={alignmentPreviewRef} className={alignmentPanMode ? 'alignment-preview checker pan-mode' : 'alignment-preview checker'} tabIndex={assigned[activeSlot] ? 0 : -1} role="group" aria-label={`Animation slot ${activeSlot + 1} alignment preview. Drag to align, use Pan to move the view, or press arrow keys to move one source pixel.`} onKeyDown={event => { const directions: Record<string, Point> = { ArrowLeft: { x: -1, y: 0 }, ArrowRight: { x: 1, y: 0 }, ArrowUp: { x: 0, y: -1 }, ArrowDown: { x: 0, y: 1 } }; const direction = directions[event.key]; if (direction) { event.preventDefault(); nudge(direction.x, direction.y) } }} onPointerDown={event => { if (!assigned[activeSlot] || event.button > 1) return; event.preventDefault(); const panning = alignmentPanMode || event.button === 1; if (!panning) setPlaying(false); alignmentDrag.current = { kind: panning ? 'pan' : 'move', x: event.clientX, y: event.clientY, offset: panning ? alignmentPan : offsets[activeSlot], slot: activeSlot, scale: previewScale }; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.focus() }} onPointerMove={moveAlignment} onPointerUp={event => { alignmentDrag.current = null; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }} onPointerCancel={() => { alignmentDrag.current = null }}>
               {source && assigned[activeSlot] ? <div className="alignment-surface" style={{ width: layout.width * previewScale, height: layout.height * previewScale, transform: `translate(calc(-50% + ${alignmentPan.x}px), calc(-50% + ${alignmentPan.y}px))` }}>
-                <SpriteCanvas image={source.bitmap} placement={layout.placements[activeSlot]} onionPlacement={onion && !playing && referenceSlot !== activeSlot ? layout.placements[referenceSlot] : null} width={layout.width} height={layout.height} />
+                <SpriteCanvas image={source.bitmap} placement={layout.placements[activeSlot]} onionPlacement={onion && !playing && referenceSlot !== activeSlot ? layout.placements[referenceSlot] : null} width={layout.width} height={layout.height} touchUps={touchUps} />
                 {pixelGrid && previewScale >= 2 && <div className="alignment-grid" style={{ backgroundSize: `${previewScale}px ${previewScale}px` }} />}
                 {centreGuide && <div className="alignment-centre" style={{ left: layout.anchorX * previewScale }} />}
                 {baselineGuide && <div className="alignment-baseline" style={{ top: baselineY * previewScale }} />}
