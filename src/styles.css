@@ -46,14 +46,14 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .files-heading { padding: 14px 15px 8px; color: #756f69; font-family: ui-monospace, monospace; font-size: 10px; font-weight: 750; letter-spacing: .14em; }
 .file-tree-scroll { min-height: 0; overflow-y: auto; }
 @supports not selector(::-webkit-scrollbar) {
-  .file-tree-scroll, .chat-history, .changes-panel { scrollbar-width: thin; scrollbar-color: #42564b #151816; }
-  .file-tree-scroll:hover, .chat-history:hover, .changes-panel:hover { scrollbar-color: #638473 #151816; }
+.file-tree-scroll, .chat-history, .changes-panel, .file-viewer-body, .source-lines, .change-diff, .git-diff pre, .commit-review pre { scrollbar-width: thin; scrollbar-color: #42564b #151816; }
+  .file-tree-scroll:hover, .chat-history:hover, .changes-panel:hover, .file-viewer-body:hover, .source-lines:hover, .change-diff:hover, .git-diff pre:hover, .commit-review pre:hover { scrollbar-color: #638473 #151816; }
 }
-.file-tree-scroll::-webkit-scrollbar, .chat-history::-webkit-scrollbar, .changes-panel::-webkit-scrollbar { width: 7px; height: 7px; }
-.file-tree-scroll::-webkit-scrollbar-track, .chat-history::-webkit-scrollbar-track, .changes-panel::-webkit-scrollbar-track { background: #151816; }
-.file-tree-scroll::-webkit-scrollbar-thumb, .chat-history::-webkit-scrollbar-thumb, .changes-panel::-webkit-scrollbar-thumb { border: 1px solid #151816; border-radius: 6px; background: #42564b; }
-.file-tree-scroll::-webkit-scrollbar-thumb:hover, .chat-history::-webkit-scrollbar-thumb:hover, .changes-panel::-webkit-scrollbar-thumb:hover { background: #638473; }
-.file-tree-scroll::-webkit-scrollbar-button, .chat-history::-webkit-scrollbar-button, .changes-panel::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+.file-tree-scroll::-webkit-scrollbar, .chat-history::-webkit-scrollbar, .changes-panel::-webkit-scrollbar, .file-viewer-body::-webkit-scrollbar, .source-lines::-webkit-scrollbar, .change-diff::-webkit-scrollbar, .git-diff pre::-webkit-scrollbar, .commit-review pre::-webkit-scrollbar { width: 7px; height: 7px; }
+.file-tree-scroll::-webkit-scrollbar-track, .chat-history::-webkit-scrollbar-track, .changes-panel::-webkit-scrollbar-track, .file-viewer-body::-webkit-scrollbar-track, .source-lines::-webkit-scrollbar-track, .change-diff::-webkit-scrollbar-track, .git-diff pre::-webkit-scrollbar-track, .commit-review pre::-webkit-scrollbar-track { background: #151816; }
+.file-tree-scroll::-webkit-scrollbar-thumb, .chat-history::-webkit-scrollbar-thumb, .changes-panel::-webkit-scrollbar-thumb, .file-viewer-body::-webkit-scrollbar-thumb, .source-lines::-webkit-scrollbar-thumb, .change-diff::-webkit-scrollbar-thumb, .git-diff pre::-webkit-scrollbar-thumb, .commit-review pre::-webkit-scrollbar-thumb { border: 1px solid #151816; border-radius: 6px; background: #42564b; }
+.file-tree-scroll::-webkit-scrollbar-thumb:hover, .chat-history::-webkit-scrollbar-thumb:hover, .changes-panel::-webkit-scrollbar-thumb:hover, .file-viewer-body::-webkit-scrollbar-thumb:hover, .source-lines::-webkit-scrollbar-thumb:hover, .change-diff::-webkit-scrollbar-thumb:hover, .git-diff pre::-webkit-scrollbar-thumb:hover, .commit-review pre::-webkit-scrollbar-thumb:hover { background: #638473; }
+.file-tree-scroll::-webkit-scrollbar-button, .chat-history::-webkit-scrollbar-button, .changes-panel::-webkit-scrollbar-button, .file-viewer-body::-webkit-scrollbar-button, .source-lines::-webkit-scrollbar-button, .change-diff::-webkit-scrollbar-button, .git-diff pre::-webkit-scrollbar-button, .commit-review pre::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
 .tree-row { display: flex; width: 100%; height: 28px; align-items: center; gap: 7px; overflow: hidden; border-left: 2px solid transparent; padding-right: 10px; text-align: left; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .tree-row:hover { border-left-color: #2f71d0; background: #1e2421; }
 .tree-row:focus-visible { position: relative; z-index: 1; background: #202c24; }
@@ -71,8 +71,29 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .tree-name { min-width: 0; overflow: hidden; color: #a8a29e; text-overflow: ellipsis; white-space: nowrap; }
 .tree-name-folder { color: #dedbd5; }
 .tree-hint { color: #78716c; font-size: 11px; }
+.file-context-menu { position: fixed; z-index: 30; display: grid; min-width: 172px; border: 1px solid #3a4640; border-radius: 5px; background: #1b201d; padding: 4px; box-shadow: 0 12px 32px rgb(0 0 0 / 45%); }
+.file-context-menu button { display: flex; align-items: center; gap: 9px; border: 0; border-radius: 3px; background: transparent; padding: 7px 9px; color: #d6d3d1; text-align: left; font-size: 11px; }
+.file-context-menu button:hover, .file-context-menu button:focus-visible { background: #26332c; color: #f5f5f4; }
+.file-context-menu span { width: 14px; color: #79b997; text-align: center; }
 
+.center-workspace { position: relative; min-width: 0; flex: 1; display: flex; }
 .main-panel { min-width: 0; flex: 1; display: flex; flex-direction: column; background: #101311; }
+.file-viewer { position: absolute; z-index: 10; inset: 0; display: flex; min-width: 0; flex-direction: column; background: #101311; }
+.file-viewer-header { min-height: 76px; display: flex; flex: none; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid #2b332f; background: #151816; padding: 11px 18px; }
+.file-viewer-header > div { min-width: 0; }
+.file-viewer-header h2 { display: inline; margin-left: 9px; color: #eeeae4; font-family: ui-monospace, monospace; font-size: 13px; font-weight: 700; }
+.file-viewer-header p { overflow: hidden; margin-top: 7px; color: #7d7770; font-family: ui-monospace, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.viewer-badge { border: 1px solid #426454; border-radius: 3px; padding: 3px 5px; color: #8fd9ad; font-family: ui-monospace, monospace; font-size: 8px; font-weight: 800; letter-spacing: .1em; }
+.file-viewer-body { min-height: 0; flex: 1; overflow: auto; }
+.viewer-state { display: grid; gap: 6px; padding: 28px; color: #8d867e; font-size: 12px; }
+.viewer-state strong { color: #e7e5e4; font-size: 13px; }
+.viewer-error span { color: #f87171; }
+.viewer-warning { position: sticky; z-index: 1; top: 0; border-bottom: 1px solid #594820; background: #2b2417; padding: 7px 18px; color: #e8bd61; font-size: 10px; }
+.source-lines { min-width: max-content; min-height: 100%; margin: 0; padding: 14px 18px 18px 62px; background: #0c0f0d; color: #d6d3d1; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; line-height: 1.65; }
+.source-lines li { min-height: 1.65em; padding-left: 13px; white-space: pre; }
+.source-lines li::marker { color: #555f59; font-size: 10px; }
+.source-lines li:hover { background: #151b17; }
+.source-lines code { font: inherit; }
 .chat-toolbar { min-height: 54px; display: flex; flex: none; align-items: center; justify-content: space-between; gap: 14px; padding: 9px 18px; border-bottom: 1px solid #272c29; background: #151816; }
 .provider-state { display: inline-flex; min-height: 30px; align-items: center; gap: 8px; border: 1px solid #26362f; background: #111a15; padding: 0 10px; color: #ddd8d1; font-size: 11px; font-weight: 650; }
 .connection-state { color: #8a837b; font-family: ui-monospace, monospace; font-size: 10px; font-weight: 600; }
@@ -143,6 +164,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .composer-hint kbd { border: 1px solid #303a34; border-bottom-color: #222923; background: #111512; padding: 1px 5px; color: #a9b8ae; font-family: ui-monospace, monospace; font-size: 10px; }
 .composer-hint span { color: #434943; }
 
+/* Image generation */
 .image-result-card { max-width: 680px; overflow: hidden; border: 1px solid #324139; border-radius: 6px; background: #0d110e; }
 .image-result-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid #29352e; padding: 9px 11px; font-size: 11px; }
 .image-result-heading span { color: #86efac; font-family: ui-monospace, monospace; font-size: 9px; font-weight: 800; letter-spacing: .12em; }
@@ -159,7 +181,12 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .image-actions { display: flex; align-items: center; gap: 8px; padding: 10px 12px 0; }
 .image-result-meta { padding: 10px 12px 11px; color: #625e59; font-family: ui-monospace, monospace; font-size: 9px; }
 
-.changes-panel { width: 322px; flex: none; overflow-y: auto; border-left: 1px solid #272c29; background: #151816; }
+/* Changes panel and Git integration */
+.changes-panel { width: 322px; min-height: 0; flex: none; overflow-y: auto; scrollbar-gutter: stable; border-left: 1px solid #272c29; background: #151816; }
+.changes-panel > .main-label { position: sticky; z-index: 2; top: 0; background: #151816; }
+.proposal-panel { border-bottom: 1px solid #303632; }
+.panel-section-label, .git-panel > h2, .git-heading h2, .git-history h2 { color: #756f69; font-family: ui-monospace, monospace; font-size: 9px; font-weight: 750; letter-spacing: .13em; }
+.panel-section-label { padding: 12px 15px 0; }
 .changes-review { padding: 15px; }
 .changes-empty { display: grid; justify-items: start; gap: 8px; padding: 22px 17px; color: #827d76; font-size: 12px; line-height: 1.55; }
 .changes-empty-motif { position: relative; width: 42px; height: 36px; display: flex; align-items: center; }
@@ -179,6 +206,63 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .diff-meta { color: #60a5fa; }
 .change-actions { display: flex; align-items: center; gap: 8px; margin-top: 15px; }
 .change-error { margin-top: 11px; color: #f87171; font-size: 11px; line-height: 1.45; }
+.changes-panel-error { margin: 15px; }
+.change-history { border-top: 1px solid #272c29; padding: 13px 15px 18px; }
+.change-history > h2 { margin-bottom: 9px; color: #756f69; font-family: ui-monospace, monospace; font-size: 9px; font-weight: 750; letter-spacing: .13em; }
+.history-entry { border: 1px solid #2b322e; border-radius: 4px; background: #121512; }
+.history-entry + .history-entry { margin-top: 8px; }
+.history-entry summary { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 7px; cursor: pointer; padding: 9px; list-style: none; }
+.history-entry summary::-webkit-details-marker { display: none; }
+.history-badge { border-left: 2px solid; padding: 3px 5px; font-family: ui-monospace, monospace; font-size: 8px; font-weight: 800; letter-spacing: .06em; }
+.history-applied { border-color: #6ee7b7; background: #13251b; color: #86efac; }
+.history-rejected { border-color: #f87171; background: #2a1717; color: #fca5a5; }
+.history-summary { overflow: hidden; color: #c9c4bd; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.history-entry time { color: #716b65; font-family: ui-monospace, monospace; font-size: 8px; }
+.history-detail { border-top: 1px solid #29302c; padding: 10px 9px 11px; }
+.history-detail > p { margin-bottom: 8px; color: #89837c; font-family: ui-monospace, monospace; font-size: 9px; overflow-wrap: anywhere; }
+.git-panel { padding: 13px 15px 18px; }
+.git-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.git-refresh { border: 0; background: transparent; color: #789184; font-size: 14px; }
+.git-branch { display: flex; align-items: center; gap: 7px; margin-bottom: 11px; color: #7fd99d; font-family: ui-monospace, monospace; font-size: 10px; }
+.git-branch strong { min-width: 0; overflow: hidden; color: #d6d3d1; text-overflow: ellipsis; white-space: nowrap; }
+.git-warning { border: 1px solid #704f25; padding: 2px 4px; color: #f2b85c; font-size: 8px; }
+.git-clean { display: flex; gap: 9px; border: 1px solid #294534; background: #111b15; padding: 11px; color: #7fd99d; font-size: 12px; }
+.git-clean strong, .git-clean small { display: block; }
+.git-clean small, .git-muted { margin-top: 3px; color: #77716b; font-size: 10px; }
+.git-files { display: grid; gap: 5px; }
+.git-file { border: 1px solid #29302c; background: #111411; }
+.git-file-selected { border-color: #426454; }
+.git-file-main { display: grid; width: 100%; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 7px; border: 0; background: transparent; padding: 7px; text-align: left; }
+.git-file-main:hover { background: #1b221e; }
+.git-kind { border-left: 2px solid #a8a29e; padding: 2px 4px; color: #aaa39b; font-family: ui-monospace, monospace; font-size: 7px; font-weight: 800; }
+.git-kind-added, .git-kind-untracked { border-color: #6ee7b7; color: #86efac; }
+.git-kind-deleted { border-color: #f87171; color: #fca5a5; }
+.git-kind-renamed { border-color: #60a5fa; color: #93c5fd; }
+.git-path { min-width: 0; overflow: hidden; color: #d6d3d1; font-family: ui-monospace, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.git-path small { display: block; overflow: hidden; margin-top: 2px; color: #716b65; font-size: 8px; text-overflow: ellipsis; }
+.git-sides { display: flex; gap: 3px; font-family: ui-monospace, monospace; font-size: 8px; }
+.git-sides b, .git-sides i { width: 15px; border-radius: 2px; padding: 2px 0; text-align: center; font-style: normal; }
+.git-sides b { background: #153421; color: #86efac; }.git-sides i { background: #342615; color: #f2b85c; }
+.git-file-actions { display: flex; flex-wrap: wrap; gap: 5px; border-top: 1px solid #252b27; padding: 5px 7px; }
+.git-file-actions button { border: 0; background: transparent; color: #8fa799; font-size: 9px; }
+.git-file-actions button:hover { color: #d8f2e2; }
+.git-diff { margin-top: 10px; border: 1px solid #2b2d2b; background: #0d0f0d; }
+.git-diff > div { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px solid #2b2d2b; padding: 7px 8px; font-family: ui-monospace, monospace; font-size: 8px; }
+.git-diff > div strong { min-width: 0; overflow: hidden; color: #d6d3d1; text-overflow: ellipsis; }.git-diff > div span { flex: none; color: #6b8f7d; }
+.git-diff pre, .commit-review pre, .commit-detail { max-height: 240px; overflow: auto; padding: 8px; color: #a8a29e; font-family: ui-monospace, monospace; font-size: 9px; line-height: 1.5; white-space: pre; }
+.git-error, .git-notice { margin-top: 10px; font-size: 10px; line-height: 1.45; }.git-error { color: #f87171; }.git-notice { color: #86efac; }
+.git-commit-action { display: grid; justify-items: start; gap: 5px; margin-top: 12px; }.git-commit-action small { color: #77716b; font-size: 9px; }
+.commit-review { display: grid; gap: 9px; margin-top: 12px; border: 1px solid #3b493f; background: #111512; padding: 10px; }
+.commit-review p { display: flex; justify-content: space-between; gap: 8px; color: #827d76; font-size: 10px; }.commit-review p strong { color: #d6d3d1; font-family: ui-monospace, monospace; }
+.commit-review > div > span, .commit-review label { display: block; margin-bottom: 5px; color: #827d76; font-size: 9px; font-weight: 700; text-transform: uppercase; }
+.commit-review ul { display: grid; gap: 3px; color: #d6d3d1; font-family: ui-monospace, monospace; font-size: 9px; overflow-wrap: anywhere; }
+.commit-review pre { border: 1px solid #292c29; background: #090a09; }
+.commit-review textarea { min-height: 62px; resize: vertical; border: 1px solid #38443d; border-radius: 4px; background: #1a1f1c; padding: 8px; color: #eeeae4; font-size: 11px; }
+.commit-review > small { color: #716b65; font-size: 8px; line-height: 1.4; }.commit-buttons { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.git-history { margin-top: 17px; border-top: 1px solid #2b302d; padding-top: 12px; }.git-history h2 { margin-bottom: 8px; }
+.git-history > button { display: grid; width: 100%; grid-template-columns: auto minmax(0, 1fr) auto; gap: 7px; border: 0; border-bottom: 1px solid #252a27; background: transparent; padding: 7px 2px; text-align: left; }
+.git-history > button:hover { background: #1a1f1c; }.git-history code { color: #79b997; font-size: 8px; }.git-history button span { overflow: hidden; color: #bab4ad; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }.git-history time { color: #716b65; font-size: 8px; }
+.commit-detail { margin-top: 8px; border: 1px solid #292c29; background: #090a09; white-space: pre-wrap; }
 .footer { height: 28px; flex: none; display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 0 15px; border-top: 1px solid #272c29; background: #171a18; color: #68635f; font-family: ui-monospace, monospace; font-size: 9px; font-weight: 650; letter-spacing: .08em; }
 
 @media (max-width: 1100px) { .sidebar { width: 230px; } .changes-panel { width: 280px; } .brand-project { display: none; } }

@@ -300,9 +300,72 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
         <div className="workspace-controls"><span className="image-model-label">SDXL 1.0 · {imageEngine?.checkpoint ?? 'sd_xl_base_1.0.safetensors'}</span><button className="icon-button" aria-label="Retry ComfyUI connection" title="Retry connection" onClick={() => void refreshImage()} disabled={checkingImage || imageSubmitting}>↻</button></div>
       </>}
     </div>
-    {mode === 'chat' && debug && <details className="diagnostics" onToggle={event => { if (event.currentTarget.open && hasTrace && !debugTrace) void loadTrace() }}><summary><span aria-hidden="true">›_</span> Agent diagnostics</summary><div className="diagnostics-tools"><button className="small-button" disabled={!hasTrace} onClick={() => void copyTrace()}><span aria-hidden="true">⧉</span> Copy trace</button>{copyStatus && <span role="status" className={copyStatus === 'Copy failed' ? 'copy-error' : 'copy-success'}>{copyStatus}</span>}<span className="diagnostics-note">Local traces may contain prompts, paths, and source context. Review before sharing.</span></div>{debugTrace && <pre className="debug-trace">{debugTrace}</pre>}</details>}
-    {projectOpen && <div className="chat-notice">{mode === 'image' ? 'Generated images stay temporary until you approve a project-relative save.' : 'Elma has controlled read-only access to this project.'}</div>}
-    {showElmaStatus && <div className="elma-status"><Elma state={elmaState} size="presence" /><div><strong>{elmaStatus}</strong>{loading && currentActivity && <span>{currentActivity}</span>}</div></div>}
+    {mode === 'chat' && debug && (
+      <details
+        className="diagnostics"
+        onToggle={event => {
+          if (event.currentTarget.open && hasTrace && !debugTrace) {
+            void loadTrace()
+          }
+        }}
+      >
+        <summary>
+          <span aria-hidden="true">›_</span> Agent diagnostics
+        </summary>
+
+        <div className="diagnostics-tools">
+          <button
+            className="small-button"
+            disabled={!hasTrace}
+            onClick={() => void copyTrace()}
+          >
+            <span aria-hidden="true">⧉</span> Copy trace
+          </button>
+
+          {copyStatus && (
+            <span
+              role="status"
+              className={
+                copyStatus === 'Copy failed'
+                  ? 'copy-error'
+                  : 'copy-success'
+              }
+            >
+              {copyStatus}
+            </span>
+          )}
+
+          <span className="diagnostics-note">
+            Local traces may contain prompts, paths, and source context.
+            Review before sharing.
+          </span>
+        </div>
+
+        {debugTrace && (
+          <pre className="debug-trace">{debugTrace}</pre>
+        )}
+      </details>
+    )}
+
+    {projectOpen && (
+      <div className="chat-notice">
+        {mode === 'image'
+          ? 'Generated images stay temporary until you approve a project-relative save.'
+          : 'Elma can inspect your project and prepare changes. Files are modified only after you approve.'}
+      </div>
+    )}
+
+    {showElmaStatus && (
+      <div className="elma-status">
+        <Elma state={elmaState} size="presence" />
+        <div>
+          <strong>{elmaStatus}</strong>
+          {loading && currentActivity && (
+            <span>{currentActivity}</span>
+          )}
+        </div>
+      </div>
+    )}
     <div className="chat-history">
       {!projectOpen && messages.length === 0 && <div className="chat-empty welcome-state"><Elma state="idle" size="hero" /><span className="eyebrow">LOCAL-FIRST CODING COMPANION</span><h2>Open a project and we'll take a look</h2><p>Elma can inspect your project, prepare focused changes, or generate an image for you to review.</p><button className="primary-button" disabled={projectBusy} onClick={onOpenProject}><span aria-hidden="true">▣</span> {projectBusy ? 'Opening…' : 'Open project'}</button></div>}
       {projectOpen && mode === 'chat' && !status && <div className="chat-empty">Checking for a local Ollama service…</div>}

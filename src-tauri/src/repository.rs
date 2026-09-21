@@ -45,6 +45,13 @@ pub struct PendingProposal {
     pub changes: Vec<PendingChange>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewedFile {
+    content: String,
+    truncated: bool,
+}
+
 #[derive(Default)]
 pub struct PendingChanges(pub Mutex<Option<PendingProposal>>);
 
@@ -63,6 +70,13 @@ pub fn apply_pending_change(open_project: State<'_, OpenProject>, pending: State
 pub fn reject_pending_change(pending: State<'_, PendingChanges>) -> Result<(), String> {
     *pending.0.lock().map_err(|_| "Pending change state unavailable")? = None;
     Ok(())
+}
+
+#[tauri::command]
+pub fn view_repository_file(path: String, open_project: State<'_, OpenProject>) -> Result<ViewedFile, String> {
+    let root = open_project.0.lock().map_err(|_| "Project state unavailable")?.clone()
+        .ok_or_else(|| "No project is open.".to_owned())?;
+    view_file(&root, &path)
 }
 
 #[derive(Deserialize)]
@@ -291,6 +305,22 @@ fn read_file(root: &Path, path: &str) -> Result<String, String> {
     Ok(output)
 }
 
+fn view_file(root: &Path, path: &str) -> Result<ViewedFile, String> {
+    if path.is_empty() { return Err("A file path is required.".into()); }
+    let relative_path = allowed_relative(path)?;
+    if protected(&relative_path) { return Err("Protected file: contents are unavailable.".into()); }
+    let file = resolve(root, path)?;
+    if protected(&file) { return Err("Protected file: contents are unavailable.".into()); }
+    let content = read_text_file(&file)?;
+    if content.as_bytes().contains(&0) { return Err("Binary file: contents are unavailable.".into()); }
+    if content.len() <= MAX_READ_BYTES {
+        return Ok(ViewedFile { content, truncated: false });
+    }
+    let mut end = MAX_READ_BYTES;
+    while !content.is_char_boundary(end) { end -= 1; }
+    Ok(ViewedFile { content: content[..end].to_owned(), truncated: true })
+}
+
 fn search_files(root: &Path, query: &str) -> Result<String, String> {
     if query.trim().is_empty() || query.len() > 120 { return Err("Search query must be 1–120 characters.".into()); }
     if query.trim().starts_with("*.") || (query.contains('*') && query.split_whitespace().count() > 1) {
@@ -342,6 +372,21 @@ mod tests {
         assert!(read_file(&root, "binary.bin").unwrap_err().contains("Binary"));
         fs::write(root.join("huge.txt"), vec![b'a'; MAX_FILE_BYTES as usize + 1]).unwrap();
         assert!(read_file(&root, "huge.txt").unwrap_err().contains("limit"));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn viewer_uses_repository_boundaries_and_read_limits() {
+        let root = fixture();
+        let viewed = view_file(&root, "hello.txt").unwrap();
+        assert_eq!(viewed.content, "hello\nworld");
+        assert!(!viewed.truncated);
+        assert!(view_file(&root, "../outside.txt").is_err());
+        fs::write(root.join(".env"), "secret").unwrap();
+        assert!(view_file(&root, ".env").unwrap_err().contains("Protected"));
+        fs::write(root.join("long.txt"), "é".repeat(MAX_READ_BYTES)).unwrap();
+        let viewed = view_file(&root, "long.txt").unwrap();
+        assert!(viewed.truncated);
+        assert!(viewed.content.len() <= MAX_READ_BYTES);
+        assert!(std::str::from_utf8(viewed.content.as_bytes()).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
     #[test] fn bounds() {

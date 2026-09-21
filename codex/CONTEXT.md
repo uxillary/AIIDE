@@ -1,17 +1,32 @@
 # Durable AIIDE context
 
-AIIDE is the current repository/application name. **Elma** is its local AI coding assistant and candidate product identity. AIIDE is a Windows-first, local-first coding application, not a full IDE. The intended workflow is **Open → Ask → Inspect → Edit → Review → Test → Commit**. See [PROJECT.md](../PROJECT.md) for the development roadmap; planned stages are not proof of implemented features.
+AIIDE is a Windows-first desktop AI development companion; Elma is the user-facing assistant. It is not a full IDE and is not yet a standalone end-user install. The intended workflow is **Open → Ask → Inspect → Edit → Review → Test → Commit**. [PROJECT.md](../PROJECT.md) is the canonical product vision, capability inventory, and roadmap; planned stages are not proof of implementation.
 
-## Current implementation
+## Current `main`
 
-The frontend uses React, TypeScript, Vite, and Tailwind CSS; the desktop backend uses Tauri 2 and Rust. Local inference runs through Ollama, primarily tested with `qwen2.5-coder:7b`. The design should allow interchangeable local models. Users can open a project, inspect its file tree and Git summary, and ask Elma questions. Elma can request bounded `list_files`, `search_files`, and `read_file` operations. The current experimental editing path lets Elma propose up to four exact replacements in one existing UTF-8 text file. Rust validates the path and unique source text, captures the original snapshot, and generates a reviewable pending change. Only the user's Apply action writes, after a stale-snapshot check. File creation, multi-file edits, command execution, and Git mutations are not implemented. [REPO-MAP.md](REPO-MAP.md) identifies current owners; `src-tauri/src/repository.rs` defines current limits.
+React/TypeScript/Vite/Tailwind form the frontend; Tauri 2/Rust is the trusted backend. Users can open a folder, browse a bounded tree, view permitted text files, inspect Git status, and chat through Ollama. The bounded agent can list, search, and read repository content, with project-specific answers gated on evidence. OpenRouter has a tested Rust provider and benchmark route but no desktop selector or credential UI.
 
-## Application-led direction
+Editing has two limited paths. The application-led path discovers verified HTML candidates and supports complete visible `<h1>` plain-text replacement: the model selects an opaque candidate ID and supplies replacement content; Rust revalidates and assembles the proposal. The older fallback permits up to four exact replacements in one existing UTF-8 file after inspection. Both remain experimental for real-world reliability. Only Apply writes, after path, proposal, and stale-snapshot validation; Reject writes nothing. File creation, arbitrary source-range editing, multi-file changes, commands/tests, durable recovery, and automatic repair are not implemented.
 
-Experiments on `fix/reliable-editing` improved source validation but did not achieve reliable real-world editing acceptance: the small model still selected incorrect source targets. That branch is historical/experimental and is not approved for merging. Do not treat its implementation as the active design.
+Local Git is separate from AI editing. AIIDE supports bounded status/diffs, stage/unstage, an approved snapshot-checked local commit, recent history, and an optional Ollama commit-subject suggestion. It does not create branches, amend, push, authenticate to GitHub, read issues, or create pull requests.
 
-AIIDE should own repository discovery and contextual retrieval, verified file and source references, deterministic file creation and editing, change assembly and diffs, snapshot and path validation, explicit review and approval, and test execution through controlled, authorised commands. Later it should prepare Git branches, commits, and optional GitHub pull requests. Elma should interpret requests, analyse supplied code, generate replacement content, help choose among verified candidates, explain changes and test failures, and suggest fixes. The model must not invent original source text, silently resolve ambiguous targets, write arbitrary files, or execute unrestricted commands. In the first deterministic editing stage, the user selects the file and source range; Elma is not required.
+Agent Debug Mode is an observability-only in-memory trace of the latest request. The controlled benchmark covers grounded answer, lookup, and no-write edit cases for Ollama or OpenRouter. Current audit evidence: 82 Rust tests passed and 6 opt-in live Ollama tests were ignored on 2026-09-19. Deterministic tests do not establish live model reliability.
 
-The Rust/Tauri backend remains the trusted project and filesystem boundary. Model output and tool arguments are untrusted; access must be project-relative, protected, and bounded. The user approves changes before application and controls external publishing actions. Keep the current bounded inspection and approved one-file proposal behavior accurate while building the new workflow in small stages. Preserve existing passing behavior unless an established contract change is explicitly approved.
+Elma's canonical personality is [PERSONALITY.md](PERSONALITY.md). Implemented sprite states are idle, thinking, working, inspecting, success, and error, with reduced-motion CSS. Elma never reports success without application confirmation.
 
-Elma's personality instructions remain separate from core protocol and safety rules. Agent Debug Mode is an observability-only, in-memory trace of the latest request, available in the UI and development terminal when enabled; it must not alter prompts, schemas, model settings, permissions, or behavior.
+## Feature-branch context
+
+M08A exists only on `image-generation`. It implements a separate ComfyUI/SDXL image-provider path, one active or reviewable job, real queue/generation states, PNG preview, Save/Reject approval, protected project-relative saving, collision naming, temporary cleanup, prompt-specific cancellation where supported, and a minimal Chat/Image composer toggle. The feature commit reports 81 Rust tests plus lint, typecheck, build, and diff checks passing. ComfyUI was unavailable during its probe, so real GPU generation, output quality, memory behaviour, and the live acceptance flow are unverified. Its design file is `codex/M08A-IMAGE-GENERATION-DESIGN.md` on that branch.
+
+M08B image editing and M08C vision-based image analysis are planned, not implemented. Additional visual tooling is proposed only.
+
+## Durable decisions
+
+- Rust/Tauri owns project identity, path safety, candidate discovery, snapshots, diff assembly, writes, Git mutations, and future controlled command execution.
+- Model/provider output is untrusted. A model may interpret intent, rank verified candidates, and generate content; it must not invent source locations, bypass ambiguity, or claim an unconfirmed action.
+- Text inference, image generation, image editing, and vision are separate capability contracts. Provider support for one does not imply support for another.
+- File changes and remote mutations require explicit review/approval. Optional services must not disable the core local workflow.
+- The release direction is a small Windows installer with guided, optional capability setup; existing Ollama and ComfyUI installations remain usable. Application-managed runtimes may follow. Fully embedded inference remains an open option.
+- Reliability and live acceptance precede feature expansion. Immediate priority is M08A real-GPU acceptance and stabilisation.
+
+See [REPO-MAP.md](REPO-MAP.md) for owners and [STANDALONE-DISTRIBUTION-DESIGN.md](STANDALONE-DISTRIBUTION-DESIGN.md) for the planned installer/onboarding architecture.
