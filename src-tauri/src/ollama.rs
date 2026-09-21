@@ -25,8 +25,22 @@ pub struct AgentDebug(Mutex<DebugData>);
 #[serde(rename_all = "camelCase")]
 pub struct DebugStatus { enabled: bool, has_trace: bool }
 
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ModelUsage {
+    pub calls: usize,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub estimated_input_tokens: u64,
+    pub estimated_output_tokens: u64,
+    pub missing_usage_calls: usize,
+    pub duration_ms: u128,
+    pub retries: usize,
+    pub repair_attempts: usize,
+}
+
 #[derive(Default)]
-struct TraceBuffer { lines: Vec<String>, next_turn: usize, echo: bool }
+struct TraceBuffer { lines: Vec<String>, next_turn: usize, echo: bool, usage: ModelUsage }
 type Trace = Arc<Mutex<TraceBuffer>>;
 
 fn debug_log(trace: Option<&Trace>, category: &str, message: impl AsRef<str>) {
@@ -43,6 +57,36 @@ fn trace_turn(trace: Option<&Trace>) -> usize {
     let Ok(mut buffer) = trace.lock() else { return 0 };
     buffer.next_turn += 1;
     buffer.next_turn
+}
+
+fn estimated_tokens(text: &str) -> u64 {
+    text.chars().count().div_ceil(4) as u64
+}
+
+fn record_repair_attempt(trace: Option<&Trace>) {
+    if let Some(trace) = trace {
+        if let Ok(mut buffer) = trace.lock() { buffer.usage.repair_attempts += 1; }
+    }
+}
+
+fn usage_summary(trace: &Trace) {
+    let summary = {
+        let Ok(buffer) = trace.lock() else { return };
+        let usage = &buffer.usage;
+        format!(
+            "Aggregate model usage\nCalls: {}\nInput tokens: {} (estimated: {})\nOutput tokens: {} (estimated: {})\nCalls missing provider usage: {}\nModel-call duration: {}ms\nRetries: {}\nRepair attempts: {}",
+            usage.calls,
+            usage.input_tokens,
+            usage.estimated_input_tokens,
+            usage.output_tokens,
+            usage.estimated_output_tokens,
+            usage.missing_usage_calls,
+            usage.duration_ms,
+            usage.retries,
+            usage.repair_attempts,
+        )
+    };
+    debug_log(Some(trace), "usage", summary);
 }
 
 #[tauri::command]
@@ -104,6 +148,158 @@ enum RequestScope { General, Repository, Unknown }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum RequestIntent { Answer, Edit }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectionReply { result: String, candidate_id: Option<String> }
+
+#[derive(Debug)]
+enum SelectionOutcome { Selected(CandidateView), Ambiguous, NoMatch }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplacementReply { replacement: String }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CandidateEditRoute { Legacy, Heading, Unsupported }
+
+fn candidate_heading_edit_route(prompt: &str, intent: RequestIntent) -> CandidateEditRoute {
+    if intent != RequestIntent::Edit { return CandidateEditRoute::Legacy; }
+    let lower = prompt.trim().to_ascii_lowercase();
+    let heading = ["main page heading", "main heading", "visible h1", "visible heading"]
+        .iter().any(|target| lower.contains(target));
+    if !heading { return CandidateEditRoute::Legacy; }
+    let structural = ["preserve", "retain", "span", "markup", "<h1", "html", " tag", "attribute", " class", "style", "format", "bold", "emphasis", "link"]
+        .iter().any(|term| lower.contains(term));
+    let direct_replacement = ["change", "replace", "rename", "set", "update"].iter().any(|verb| lower.contains(verb))
+        && (lower.contains(" to ") || lower.contains(" with "));
+    if structural || !direct_replacement { CandidateEditRoute::Unsupported } else { CandidateEditRoute::Heading }
+}
+
+fn requests_candidate_selection(prompt: &str, intent: RequestIntent) -> bool {
+    if intent != RequestIntent::Answer { return false; }
+    let lower = prompt.trim().to_ascii_lowercase();
+    lower.starts_with("select ") || lower.starts_with("identify the target")
+        || lower.starts_with("find the target") || (lower.starts_with("which ") && lower.contains(" should ") && (lower.contains(" edit") || lower.contains(" change")))
+}
+
+fn is_html_path(path: &str) -> bool {
+    std::path::Path::new(path).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm"))
+}
+
+fn selection_schema() -> Value {
+    json!({"type":"object","properties":{
+        "result":{"type":"string","enum":["selected","ambiguous","no_match"]},
+        "candidate_id":{"type":"string","description":"Required only for selected; copy one listed ID exactly."}
+    },"required":["result"],"additionalProperties":false})
+}
+
+fn replacement_schema() -> Value {
+    json!({"type":"object","properties":{
+        "replacement":{"type":"string","minLength":1,"maxLength":repository::MAX_PROPOSAL_BYTES}
+    },"required":["replacement"],"additionalProperties":false})
+}
+
+fn resolve_selection(raw: &str, registry: &CandidateRegistry, root: &std::path::Path) -> Result<SelectionOutcome, String> {
+    let reply: SelectionReply = serde_json::from_str(raw.trim()).map_err(|_| "Candidate selection response was malformed.")?;
+    match (reply.result.as_str(), reply.candidate_id) {
+        ("selected", Some(id)) if !id.is_empty() => {
+            let candidate = registry.verify_current(root, &id)?;
+            let view = registry.model_view().into_iter().find(|view| view.id == candidate.id()).ok_or("Unknown candidate ID.")?;
+            Ok(SelectionOutcome::Selected(view))
+        }
+        ("ambiguous", None) => Ok(SelectionOutcome::Ambiguous),
+        ("no_match", None) => Ok(SelectionOutcome::NoMatch),
+        _ => Err("Candidate selection response was malformed.".into()),
+    }
+}
+
+async fn select_candidate(provider: &impl ModelProvider, model: &str, prompt: &str, root: &std::path::Path, registry: &CandidateRegistry, required_role: Option<CandidateRole>, trace: Option<&Trace>) -> Result<SelectionOutcome, String> {
+    let views = registry.model_view().into_iter().filter(|view| required_role.is_none_or(|role| view.role == role)).collect::<Vec<_>>();
+    let candidates = serde_json::to_string(&views).map_err(|_| "Could not prepare candidate views.")?;
+    let schema = selection_schema();
+    let messages = [
+        ChatMessage { role: "system".into(), content: "Select a verified source target for the user's request using only the listed candidate IDs. Compare each candidate's role, roleIndex (its position among candidates of that role), path, lines, excerpt, and bounded preceding context with the request. A document title, visible h1 heading, and paragraph are distinct targets. When exactly one listed candidate has the requested role, select it rather than returning ambiguous. Return exactly one JSON object: {\"result\":\"selected\",\"candidate_id\":\"<listed ID>\"}, {\"result\":\"ambiguous\"}, or {\"result\":\"no_match\"}. If several plausible targets remain and the request does not distinguish them, return ambiguous. Do not invent an ID, source text, replacement code, or a proposal.".into() },
+        ChatMessage { role: "user".into(), content: format!("Request: {prompt}\nVerified candidates: {candidates}") },
+    ];
+    // Keep candidate excerpts, source context, and the user's request out of the debug trace.
+    debug_log(trace, "selection", format!("Selection call started\nCandidate count: {}\nSchema supplied: {schema}", views.len()));
+    let started = Instant::now();
+    let response = chat_turn(provider, model, &messages, schema, PROTOCOL_TEMPERATURE, "CANDIDATE SELECTION", false, trace).await.map_err(|error| {
+        debug_log(trace, "selection", format!("Selection call failed after {}ms\nValidation: not run", started.elapsed().as_millis()));
+        error
+    })?;
+    debug_log(trace, "selection", format!("Selection response received in {}ms", started.elapsed().as_millis()));
+    if response.done_reason.as_deref() == Some("length") {
+        debug_log(trace, "selection", "Structured action: unavailable\nValidation: failed\nError: Candidate selection response was malformed.");
+        return Err("Candidate selection response was malformed.".into());
+    }
+    let action = serde_json::from_str::<SelectionReply>(response.message.content.trim()).ok();
+    let action_name = action.as_ref().map_or("malformed", |reply| match reply.result.as_str() {
+        "selected" => "selected", "ambiguous" => "ambiguous", "no_match" => "no_match", _ => "invalid",
+    });
+    let id = if action_name == "selected" {
+        action.as_ref().and_then(|reply| reply.candidate_id.as_deref())
+            .filter(|id| registry.candidate(id).is_some()).unwrap_or("unverified")
+    } else { "none" };
+    debug_log(trace, "selection", format!("Structured action: {action_name}\nCandidate ID: {id}"));
+    if action_name == "selected" && !views.iter().any(|view| Some(view.id.as_str()) == action.as_ref().and_then(|reply| reply.candidate_id.as_deref())) {
+        debug_log(trace, "selection", "Validation: failed\nError: Unknown candidate ID.");
+        return Err("Unknown candidate ID.".into());
+    }
+    let outcome = resolve_selection(&response.message.content, registry, root).map_err(|error| {
+        debug_log(trace, "selection", format!("Validation: failed\nError: {error}"));
+        error
+    })?;
+    debug_log(trace, "selection", match &outcome {
+        SelectionOutcome::Selected(view) => format!("Validation: passed\nSelected ID: {} at {}:{}", view.id, view.path, view.start_line),
+        SelectionOutcome::Ambiguous => "Validation: passed\nAmbiguous candidates; clarification required".into(),
+        SelectionOutcome::NoMatch => "Validation: passed\nNo matching candidate".into(),
+    });
+    Ok(outcome)
+}
+
+async fn generate_candidate_replacement(provider: &impl ModelProvider, model: &str, prompt: &str, root: &std::path::Path, registry: &CandidateRegistry, candidate_id: &str, trace: Option<&Trace>) -> Result<String, String> {
+    let candidate = registry.verify_current(root, candidate_id)?;
+    let schema = replacement_schema();
+    let messages = [
+        ChatMessage { role: "system".into(), content: "Generate only the complete plain-text replacement for the selected visible h1 content. Do not return HTML, markdown, a path, old text, a source range, a summary, or a proposal. Do not preserve or recreate nested markup. Return exactly one JSON object with the single field replacement.".into() },
+        ChatMessage { role: "user".into(), content: format!("Original request: {prompt}\n\nSelected h1 inner source:\n{}", candidate.original()) },
+    ];
+    debug_log(trace, "generation", format!("Candidate replacement call started\nSchema supplied: {schema}"));
+    let response = chat_turn(provider, model, &messages, schema, PROTOCOL_TEMPERATURE, "CANDIDATE REPLACEMENT", false, trace).await?;
+    if response.done_reason.as_deref() == Some("length") { return Err("Candidate replacement response was malformed.".into()); }
+    let reply: ReplacementReply = serde_json::from_str(response.message.content.trim())
+        .map_err(|_| "Candidate replacement response was malformed.".to_owned())?;
+    if reply.replacement.trim().is_empty() { return Err("Candidate replacement must not be empty.".into()); }
+    debug_log(trace, "generation", "Candidate replacement response validated");
+    Ok(reply.replacement)
+}
+
+async fn run_candidate_heading_edit(provider: &impl ModelProvider, model: String, prompt: &str, root: &std::path::Path, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<ChatResponse, String> {
+    if let Some(app) = app { let _ = app.emit("repository-inspection-start", ()); }
+    let mut registry = CandidateRegistry::new();
+    let count = repository::discover_html_candidates(root, &mut registry)?;
+    let activity_item = Activity { label: format!("Discovered {count} verified HTML targets") };
+    if let Some(app) = app { let _ = app.emit("repository-activity", &activity_item); }
+    let activity = vec![activity_item];
+    let selected = match select_candidate(provider, &model, prompt, root, &registry, Some(CandidateRole::HeadingOne), trace).await? {
+        SelectionOutcome::Selected(view) => view,
+        SelectionOutcome::Ambiguous => return Ok(ChatResponse { model, content: "I found multiple plausible visible headings. Please clarify which heading you mean.".into(), activity, proposal: None }),
+        SelectionOutcome::NoMatch => return Ok(ChatResponse { model, content: "I found no verified visible h1 matching that request.".into(), activity, proposal: None }),
+    };
+    if selected.role != CandidateRole::HeadingOne { return Err("Selected candidate is not a visible h1.".into()); }
+    let replacement = generate_candidate_replacement(provider, &model, prompt, root, &registry, &selected.id, trace).await?;
+    if let Some(app) = app { let _ = app.emit("proposal-validation-start", ()); }
+    let proposal = repository::validate_candidate_proposal(
+        root, &registry, &selected.id, format!("Update the visible h1 heading in {}.", selected.path), replacement,
+    )?;
+    if let Some(pending) = pending {
+        *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone());
+    }
+    debug_log(trace, "tool", "Candidate proposal validation: passed\nPending change creation: passed");
+    Ok(ChatResponse { model, content: "Done — have a wee look in Changes 👀".into(), activity, proposal: Some(proposal) })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RequestPlan { scope: RequestScope, intent: RequestIntent }
@@ -285,21 +481,59 @@ fn provider_error(provider: &impl ModelProvider, ollama: &'static str, remote: &
     if provider.metadata().id == OLLAMA_PROVIDER_ID { ollama } else { remote }.to_owned()
 }
 
-async fn chat_turn(provider: &impl ModelProvider, model: &str, messages: &[ChatMessage], format: Value, temperature: f32, stage: &str, trace: Option<&Trace>) -> Result<ChatPayloadResponse, String> {
+async fn chat_turn(provider: &impl ModelProvider, model: &str, messages: &[ChatMessage], format: Value, temperature: f32, stage: &str, retry: bool, trace: Option<&Trace>) -> Result<ChatPayloadResponse, String> {
     let turn = trace_turn(trace);
-    debug_log(trace, "protocol", format!("Turn {turn} — {stage}\nTemperature: {temperature}\nStructured format supplied: yes\nMessage count: {}\nMessage roles: {}\nSchema/format: {}", messages.len(), messages.iter().map(|message| message.role.as_str()).collect::<Vec<_>>().join(", "), format));
-    if trace.is_some() {
-        for (index, message) in messages.iter().enumerate() {
-            debug_log(trace, "agent", format!("Message {} ({})\n--- MESSAGE START ---\n{}\n--- MESSAGE END ---", index + 1, message.role, message.content));
-        }
-    }
+    let system_bytes = messages.iter().filter(|message| message.role == "system").map(|message| message.content.len()).sum::<usize>();
+    let user_bytes = messages.iter().filter(|message| message.role == "user").map(|message| message.content.len()).sum::<usize>();
+    let assistant_bytes = messages.iter().filter(|message| message.role == "assistant").map(|message| message.content.len()).sum::<usize>();
+    let schema_text = format.to_string();
+    let schema_bytes = schema_text.len();
+    let context_bytes = system_bytes + user_bytes + assistant_bytes + schema_bytes;
+    let estimated_input = messages.iter().map(|message| estimated_tokens(&message.content)).sum::<u64>() + estimated_tokens(&schema_text);
+    debug_log(trace, "protocol", format!("Turn {turn} — {stage}\nTemperature: {temperature}\nStructured format supplied: yes\nMessage count: {}\nMessage roles: {}\nRequest context: {context_bytes} bytes\nContext components: system={system_bytes} bytes, user={user_bytes} bytes, assistant={assistant_bytes} bytes, schema={schema_bytes} bytes", messages.len(), messages.iter().map(|message| message.role.as_str()).collect::<Vec<_>>().join(", ")));
     let started = Instant::now();
     let provider_id = provider.metadata().id;
-    let response_label = provider_id.to_ascii_uppercase();
-    debug_log(trace, provider_id, format!("Turn {turn} request started"));
-    let result = provider.infer(InferenceRequest { model, messages, format, temperature }).await.map_err(|error| error.to_string())?;
-    debug_log(trace, provider_id, format!("Turn {turn} response received in {}ms\n--- RAW {response_label} RESPONSE START ---\n{}\n--- RAW {response_label} RESPONSE END ---\nMetadata: model={}, done={}, done_reason={:?}", started.elapsed().as_millis(), result.message.content, result.model, result.done, result.done_reason));
-    Ok(result)
+    debug_log(trace, provider_id, format!("Turn {turn} request started\nPhase: {stage}\nProvider: {provider_id}\nRequested model: {model}\nRetry: {retry}"));
+    let result = provider.infer(InferenceRequest { model, messages, format, temperature }).await;
+    let duration_ms = started.elapsed().as_millis();
+    match result {
+        Ok(result) => {
+            let estimated_output = estimated_tokens(&result.message.content);
+            let (input_tokens, output_tokens, usage_source, estimated_input_part, estimated_output_part, missing_usage) = match result.usage {
+                Some(usage) => (usage.input_tokens, usage.output_tokens, "provider", 0, 0, false),
+                None => (estimated_input, estimated_output, "estimate (~4 characters/token)", estimated_input, estimated_output, true),
+            };
+            if let Some(trace) = trace {
+                if let Ok(mut buffer) = trace.lock() {
+                    buffer.usage.calls += 1;
+                    buffer.usage.input_tokens += input_tokens;
+                    buffer.usage.output_tokens += output_tokens;
+                    buffer.usage.estimated_input_tokens += estimated_input_part;
+                    buffer.usage.estimated_output_tokens += estimated_output_part;
+                    buffer.usage.missing_usage_calls += usize::from(missing_usage);
+                    buffer.usage.duration_ms += duration_ms;
+                    buffer.usage.retries += usize::from(retry);
+                }
+            }
+            debug_log(trace, "usage", format!("Turn {turn} usage\nPhase: {stage}\nProvider/model: {provider_id}/{}\nInput tokens: {input_tokens} ({usage_source})\nOutput tokens: {output_tokens} ({usage_source})\nRequest context: {context_bytes} bytes\nContext components: system={system_bytes}, user={user_bytes}, assistant={assistant_bytes}, schema={schema_bytes} bytes\nOutput size: {} bytes\nDuration: {duration_ms}ms\nRetry: {retry}", result.model, result.message.content.len()));
+            debug_log(trace, provider_id, format!("Turn {turn} response received in {duration_ms}ms\nMetadata: model={}, done={}, done_reason={:?}\nResponse content: omitted", result.model, result.done, result.done_reason));
+            Ok(result)
+        }
+        Err(error) => {
+            if let Some(trace) = trace {
+                if let Ok(mut buffer) = trace.lock() {
+                    buffer.usage.calls += 1;
+                    buffer.usage.input_tokens += estimated_input;
+                    buffer.usage.estimated_input_tokens += estimated_input;
+                    buffer.usage.missing_usage_calls += 1;
+                    buffer.usage.duration_ms += duration_ms;
+                    buffer.usage.retries += usize::from(retry);
+                }
+            }
+            debug_log(trace, "usage", format!("Turn {turn} failed usage\nPhase: {stage}\nProvider/model: {provider_id}/{model}\nInput tokens: {estimated_input} (estimate; provider usage unavailable)\nOutput tokens: unavailable\nRequest context: {context_bytes} bytes\nDuration: {duration_ms}ms\nRetry: {retry}\nProvider error kind: {:?}", error.kind));
+            Err(error.to_string())
+        }
+    }
 }
 
 async fn agent_turn(provider: &impl ModelProvider, model: &str, exchange: &mut Vec<ChatMessage>, project_open: bool, edit_intent: bool, has_read_evidence: bool, answer_allowed: bool, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<(ChatPayloadResponse, AgentAction), String> {
@@ -307,7 +541,7 @@ async fn agent_turn(provider: &impl ModelProvider, model: &str, exchange: &mut V
     let mut last_failure = None;
     for attempt in 0..=MAX_REPAIRS {
         let stage = if attempt == 0 { "STRUCTURED".to_owned() } else { format!("REPAIR {attempt}/{MAX_REPAIRS}") };
-        let result = chat_turn(provider, model, exchange, agent_schema(project_open, edit_intent, has_read_evidence, answer_allowed), temperature, &stage, trace).await?;
+        let result = chat_turn(provider, model, exchange, agent_schema(project_open, edit_intent, has_read_evidence, answer_allowed), temperature, &stage, attempt > 0, trace).await?;
         let parsed = if result.done_reason.as_deref() == Some("length") { Err("response exceeded the model output limit") }
             else { parse_action(&result.message.content) };
         match parsed {
@@ -325,6 +559,7 @@ async fn agent_turn(provider: &impl ModelProvider, model: &str, exchange: &mut V
                 if attempt == MAX_REPAIRS { break; }
                 if let Some(app) = app { let _ = app.emit("repository-retry", ()); }
                 let repair = repair_instruction(reason, edit_intent, has_read_evidence);
+                record_repair_attempt(trace);
                 debug_log(trace, "repair", format!("Attempt {}/{}\nOriginal failure: {reason}\n--- REPAIR INSTRUCTION START ---\n{repair}\n--- REPAIR INSTRUCTION END ---", attempt + 1, MAX_REPAIRS));
                 exchange.push(ChatMessage { role: "user".into(), content: repair });
             }
@@ -370,9 +605,11 @@ async fn requires_inspection(provider: &impl ModelProvider, model: &str, prompt:
         ChatMessage { role: "user".into(), content: prompt.into() },
     ];
     for attempt in 0..=MAX_REPAIRS {
-        let result = chat_turn(provider, model, &messages, scope_schema(), PROTOCOL_TEMPERATURE, "SCOPE CLASSIFICATION", trace).await?;
+        let stage = if attempt == 0 { "SCOPE CLASSIFICATION".into() } else { format!("SCOPE CLASSIFICATION REPAIR {attempt}/{MAX_REPAIRS}") };
+        let result = chat_turn(provider, model, &messages, scope_schema(), PROTOCOL_TEMPERATURE, &stage, attempt > 0, trace).await?;
         if let Some(needed) = parse_scope(&result.message.content) { return Ok(needed); }
         if attempt == MAX_REPAIRS { break; }
+        record_repair_attempt(trace);
         messages.push(ChatMessage { role: "user".into(), content: "Return exactly one JSON object: {\"scope\":\"repository\"} or {\"scope\":\"general\"}.".into() });
     }
     Ok(true)
@@ -394,11 +631,13 @@ async fn final_turn(provider: &impl ModelProvider, model: &str, prompt: &str, pr
     ];
     for attempt in 0..=MAX_REPAIRS {
         debug_log(trace, "final", "Grounded personality answer started; personality included: yes");
-        let result = chat_turn(provider, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE, "GROUNDED FINAL ANSWER", trace).await?;
+        let stage = if attempt == 0 { "GROUNDED FINAL ANSWER".into() } else { format!("GROUNDED FINAL ANSWER REPAIR {attempt}/{MAX_REPAIRS}") };
+        let result = chat_turn(provider, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE, &stage, attempt > 0, trace).await?;
         if result.done_reason.as_deref() != Some("length") {
             if let Ok(AgentAction::Answer(answer)) = parse_action(&result.message.content) { debug_log(trace, "final", "Grounded personality answer accepted"); return Ok(answer); }
         }
         if attempt == MAX_REPAIRS { break; }
+        record_repair_attempt(trace);
         exchange.last_mut().unwrap().content.push_str("\n\nYour previous response was invalid or too long. Answer the ORIGINAL REQUEST above in at most 90 words. For a review, give three short numbered improvements with actual affected files and reasons. Return only the JSON answer object.");
     }
     Err(provider_error(provider,
@@ -413,11 +652,13 @@ async fn conversational_turn(provider: &impl ModelProvider, model: &str, prompt:
     ];
     for attempt in 0..=MAX_REPAIRS {
         debug_log(trace, "final", "Personality rewrite started; personality included: yes");
-        let result = chat_turn(provider, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE, "PERSONALITY REWRITE", trace).await?;
+        let stage = if attempt == 0 { "PERSONALITY REWRITE".into() } else { format!("PERSONALITY REWRITE REPAIR {attempt}/{MAX_REPAIRS}") };
+        let result = chat_turn(provider, model, &exchange, answer_schema(), CONVERSATIONAL_TEMPERATURE, &stage, attempt > 0, trace).await?;
         if result.done_reason.as_deref() != Some("length") {
             if let Ok(AgentAction::Answer(answer)) = parse_action(&result.message.content) { debug_log(trace, "final", "Personality rewrite accepted"); return Ok(answer); }
         }
         if attempt == MAX_REPAIRS { break; }
+        record_repair_attempt(trace);
         exchange.last_mut().unwrap().content.push_str("\n\nReturn one valid JSON answer object in at most 80 words.");
     }
     Err(provider_error(provider,
@@ -450,11 +691,12 @@ pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project
     };
     if let Some(trace) = trace.as_ref() {
         let started_at = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0);
-        debug_log(Some(trace), "agent", format!("==================================================\nAIIDE AGENT DEBUG TRACE\nTrace version: 1\nRequest: #{request}\nStarted at Unix ms: {started_at}\nModel: {model}\nProject: {}\nCore agent instructions: included on agent turns\nDefault personality: included only on final conversational turns\n==================================================", root.as_ref().and_then(|path| path.file_name()).map(|name| name.to_string_lossy()).unwrap_or_else(|| "none".into())));
+        debug_log(Some(trace), "agent", format!("==================================================\nAIIDE AGENT DEBUG TRACE\nTrace version: 2\nRequest: #{request}\nStarted at Unix ms: {started_at}\nModel: {model}\nProject open: {}\nPrompt and response content: omitted\nCore agent instructions: included on agent turns\nDefault personality: included only on final conversational turns\n==================================================", root.is_some()));
     }
     let result = run_agent(OLLAMA_PROVIDER_ID, model, messages, root, Some(&pending), Some(&app), trace.as_ref()).await;
     if let Some(trace) = trace {
         if let Err(error) = &result { debug_log(Some(&trace), "final", format!("FAILED\n{error}")); }
+        usage_summary(&trace);
         debug_log(Some(&trace), "final", format!("Result: {}\nTotal duration: {}ms\n==================================================", if result.is_ok() { "SUCCESS" } else { "FAILED" }, started.elapsed().as_millis()));
         let report = trace.lock().map(|buffer| buffer.lines.join("\n\n")).unwrap_or_else(|_| "Trace unavailable".into());
         let mut state = debug.0.lock().map_err(|_| "Debug state unavailable")?;
@@ -539,6 +781,7 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
                 Ok(proposal) => proposal,
                 Err(error) if error == repository::AMBIGUOUS_OLD_TEXT_ERROR && proposal_repairs < MAX_REPAIRS => {
                     proposal_repairs += 1;
+                    record_repair_attempt(debug_trace);
                     debug_log(debug_trace, "repair", format!("Ambiguous proposal anchor rejected\nAttempt {proposal_repairs}/{MAX_REPAIRS}\nAnchor shape: {shape}"));
                     exchange.push(result.message);
                     exchange.push(ChatMessage { role: "user".into(), content: ambiguous_anchor_guidance().into() });
@@ -615,7 +858,7 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
             if let Some(app) = app { let _ = app.emit("repository-inspection-start", ()); }
         }
         let tool_started = Instant::now();
-        debug_log(debug_trace, "tool", format!("{} requested\nPath: {}\nQuery: {}", request.tool, request.path, request.query));
+        debug_log(debug_trace, "tool", format!("{} requested\nPath supplied: {} ({} bytes)\nQuery supplied: {} ({} bytes)\nRequest content: omitted", request.tool, !request.path.is_empty(), request.path.len(), !request.query.is_empty(), request.query.len()));
         let (output, event, reused) = execute_cached(root.as_deref().unwrap(), &request, &mut tool_cache);
         let remaining = repository::MAX_CONTEXT_BYTES.saturating_sub(context_bytes);
         if remaining == 0 { break; }
@@ -638,7 +881,7 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
             evidence.push((format!("{} {}", request.tool, request.path), output.clone()));
             unresolved_failure = false;
         } else { unresolved_failure = true; }
-        debug_log(debug_trace, "tool", format!("{}\nValidation/execution: {}\nCache: {}\nReturned: {} bytes\nDuration: {}ms\nNext stage: agent turn", request.tool, if output.starts_with("Error:") { &output } else { "passed" }, if reused { "reused successful result" } else { "executed" }, output.len(), tool_started.elapsed().as_millis()));
+        debug_log(debug_trace, "tool", format!("{}\nValidation/execution: {}\nCache: {}\nReturned: {} bytes (content omitted)\nDuration: {}ms\nNext stage: agent turn", request.tool, if output.starts_with("Error:") { "failed" } else { "passed" }, if reused { "reused successful result" } else { "executed" }, output.len(), tool_started.elapsed().as_millis()));
         if let Some(app) = app { let _ = app.emit("repository-activity", &event); }
         activity.push(event);
         exchange.push(result.message);
@@ -660,11 +903,13 @@ pub(crate) struct BenchmarkAgentOutput {
     pub activity: Vec<String>,
     pub proposal: Option<PendingProposal>,
     pub trace: String,
+    pub usage: ModelUsage,
 }
 
 pub(crate) struct BenchmarkAgentFailure {
     pub error: String,
     pub trace: String,
+    pub usage: ModelUsage,
 }
 
 pub(crate) async fn run_benchmark_agent(provider: &str, model: &str, root: std::path::PathBuf, prompt: &str) -> Result<BenchmarkAgentOutput, BenchmarkAgentFailure> {
@@ -674,20 +919,22 @@ pub(crate) async fn run_benchmark_agent(provider: &str, model: &str, root: std::
         vec![ChatMessage { role: "user".into(), content: prompt.to_owned() }],
         Some(root), None, None, Some(&trace),
     ).await;
-    let report = trace.lock().map(|buffer| buffer.lines.join("\n\n")).unwrap_or_default();
-    let response = response.map_err(|error| BenchmarkAgentFailure { error, trace: report.clone() })?;
+    usage_summary(&trace);
+    let (report, usage) = trace.lock().map(|buffer| (buffer.lines.join("\n\n"), buffer.usage)).unwrap_or_default();
+    let response = response.map_err(|error| BenchmarkAgentFailure { error, trace: report.clone(), usage })?;
     Ok(BenchmarkAgentOutput {
         content: response.content,
         activity: response.activity.into_iter().map(|item| item.label).collect(),
         proposal: response.proposal,
         trace: report,
+        usage,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_provider::{ProviderFailure, ProviderLocality, ProviderMetadata};
+    use crate::model_provider::{ProviderFailure, ProviderLocality, ProviderMetadata, TokenUsage};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -707,6 +954,7 @@ mod tests {
                     message: ChatMessage { role: "assistant".into(), content: (*content).into() },
                     done: true,
                     done_reason: Some("stop".into()),
+                    usage: None,
                 }).collect()),
                 formats: Mutex::new(Vec::new()),
                 inference_calls: AtomicUsize::new(0),
@@ -782,20 +1030,93 @@ mod tests {
         drop(state);
 
         let trace = Arc::new(Mutex::new(TraceBuffer::default()));
-        debug_log(Some(&trace), "ollama", "--- RAW OLLAMA RESPONSE START ---\nplain prose\n--- RAW OLLAMA RESPONSE END ---");
+        debug_log(Some(&trace), "ollama", "Response metadata recorded; content omitted");
         debug_log(Some(&trace), "protocol", "Parse or semantic validation: FAILED — expected value");
         debug_log(Some(&trace), "repair", "Attempt 1/2");
         debug_log(Some(&trace), "final", "Personality rewrite started");
         let report = trace.lock().unwrap().lines.join("\n");
-        assert!(report.find("plain prose").unwrap() < report.find("FAILED").unwrap());
+        assert!(report.find("Response metadata").unwrap() < report.find("FAILED").unwrap());
         assert!(report.find("FAILED").unwrap() < report.find("Attempt 1/2").unwrap());
         assert!(report.find("Attempt 1/2").unwrap() < report.find("Personality rewrite").unwrap());
     }
 
     #[test]
     fn debug_off_retains_nothing() {
-        debug_log(None, "ollama", "raw response");
+        debug_log(None, "ollama", "response metadata");
         assert_eq!(trace_turn(None), 0);
+    }
+
+    #[test]
+    fn diagnostics_account_provider_usage_without_recording_content() {
+        let provider = StubProvider::new(&["test-model"], &[r#"{"action":"answer","answer":"private response"}"#]);
+        provider.responses.lock().unwrap().front_mut().unwrap().usage = Some(TokenUsage { input_tokens: 140, output_tokens: 18 });
+        let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let messages = [ChatMessage { role: "user".into(), content: "private prompt".into() }];
+        tauri::async_runtime::block_on(chat_turn(
+            &provider, "test-model", &messages, answer_schema(), PROTOCOL_TEMPERATURE, "TEST", false, Some(&trace),
+        )).unwrap();
+
+        let buffer = trace.lock().unwrap();
+        assert_eq!(buffer.usage.calls, 1);
+        assert_eq!(buffer.usage.input_tokens, 140);
+        assert_eq!(buffer.usage.output_tokens, 18);
+        assert_eq!(buffer.usage.missing_usage_calls, 0);
+        let report = buffer.lines.join("\n");
+        assert!(report.contains("Input tokens: 140 (provider)"));
+        assert!(!report.contains("private prompt"));
+        assert!(!report.contains("private response"));
+    }
+
+    #[test]
+    fn diagnostics_estimate_missing_usage_and_label_it_clearly() {
+        let provider = StubProvider::new(&["test-model"], &[r#"{"action":"answer","answer":"ok"}"#]);
+        let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let messages = [ChatMessage { role: "user".into(), content: "short request".into() }];
+        tauri::async_runtime::block_on(chat_turn(
+            &provider, "test-model", &messages, answer_schema(), PROTOCOL_TEMPERATURE, "TEST", false, Some(&trace),
+        )).unwrap();
+
+        let buffer = trace.lock().unwrap();
+        assert_eq!(buffer.usage.calls, 1);
+        assert_eq!(buffer.usage.missing_usage_calls, 1);
+        assert!(buffer.usage.estimated_input_tokens > 0);
+        assert!(buffer.usage.estimated_output_tokens > 0);
+        assert!(buffer.lines.join("\n").contains("estimate (~4 characters/token)"));
+    }
+
+    #[test]
+    fn diagnostics_aggregate_calls_retries_and_repairs_per_request() {
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"answer","answer":"first"}"#,
+            r#"{"action":"answer","answer":"second"}"#,
+        ]);
+        {
+            let mut responses = provider.responses.lock().unwrap();
+            responses[0].usage = Some(TokenUsage { input_tokens: 50, output_tokens: 5 });
+            responses[1].usage = Some(TokenUsage { input_tokens: 60, output_tokens: 6 });
+        }
+        let trace = Arc::new(Mutex::new(TraceBuffer::default()));
+        let messages = [ChatMessage { role: "user".into(), content: "request".into() }];
+        tauri::async_runtime::block_on(chat_turn(
+            &provider, "test-model", &messages, answer_schema(), PROTOCOL_TEMPERATURE, "FIRST", false, Some(&trace),
+        )).unwrap();
+        record_repair_attempt(Some(&trace));
+        tauri::async_runtime::block_on(chat_turn(
+            &provider, "test-model", &messages, answer_schema(), PROTOCOL_TEMPERATURE, "REPAIR", true, Some(&trace),
+        )).unwrap();
+        usage_summary(&trace);
+
+        let buffer = trace.lock().unwrap();
+        assert_eq!(buffer.usage.calls, 2);
+        assert_eq!(buffer.usage.input_tokens, 110);
+        assert_eq!(buffer.usage.output_tokens, 11);
+        assert_eq!(buffer.usage.retries, 1);
+        assert_eq!(buffer.usage.repair_attempts, 1);
+        let report = buffer.lines.join("\n");
+        assert!(report.contains("Aggregate model usage"));
+        assert!(report.contains("Calls: 2"));
+        assert!(report.contains("Retries: 1"));
+        assert!(report.contains("Repair attempts: 1"));
     }
 
     #[test]

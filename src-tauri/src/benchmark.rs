@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::ollama::{self, BenchmarkAgentFailure, BenchmarkAgentOutput};
+use crate::ollama::{self, BenchmarkAgentFailure, BenchmarkAgentOutput, ModelUsage};
 use crate::model_provider::{OLLAMA_PROVIDER_ID, OPENROUTER_PROVIDER_ID};
 
 const EXPECTED_PATH: &str = "src/index.html";
@@ -30,6 +30,7 @@ struct BenchmarkResult {
     duration_ms: u128,
     tool_calls: usize,
     repair_count: usize,
+    usage: ModelUsage,
     final_action: String,
     failure_reason: Option<String>,
 }
@@ -56,17 +57,19 @@ fn edit_mismatch(after: &str) -> &'static str {
 
 fn classify(model: &str, case: Case, elapsed: u128, outcome: Result<BenchmarkAgentOutput, BenchmarkAgentFailure>, fixture_before: &str, fixture_after: &str) -> BenchmarkResult {
     let mut result = BenchmarkResult { model: model.into(), case: case.id().into(), passed: false, duration_ms: elapsed,
-        tool_calls: 0, repair_count: 0, final_action: "error".into(), failure_reason: None };
+        tool_calls: 0, repair_count: 0, usage: ModelUsage::default(), final_action: "error".into(), failure_reason: None };
     let output = match outcome {
         Ok(output) => output,
         Err(failure) => {
             result.repair_count = repair_count(&failure.trace);
+            result.usage = failure.usage;
             result.failure_reason = Some(concise_error(&failure.error));
             return result;
         }
     };
     result.tool_calls = output.activity.len();
     result.repair_count = repair_count(&output.trace);
+    result.usage = output.usage;
     result.final_action = if output.proposal.is_some() { "propose_change" } else { "answer" }.into();
     let failure = match case {
         Case::Answer if output.proposal.is_some() => Some("unexpected proposal"),
@@ -145,7 +148,7 @@ pub fn run_cli() -> Result<(), String> {
     } else {
         for item in &results {
             let verdict = if item.passed { "PASS".to_owned() } else { format!("FAIL — {}", item.failure_reason.as_deref().unwrap_or("unknown failure")) };
-            println!("{} / {}: {} ({}ms, tools={}, repairs={}, action={})", item.model, item.case, verdict, item.duration_ms, item.tool_calls, item.repair_count, item.final_action);
+            println!("{} / {}: {} ({}ms, calls={}, inputTokens={} [estimated={}], outputTokens={} [estimated={}], tools={}, retries={}, repairs={}, action={})", item.model, item.case, verdict, item.duration_ms, item.usage.calls, item.usage.input_tokens, item.usage.estimated_input_tokens, item.usage.output_tokens, item.usage.estimated_output_tokens, item.tool_calls, item.usage.retries, item.repair_count, item.final_action);
         }
         let passed = results.iter().filter(|item| item.passed).count();
         println!("Summary: {passed}/{} passed", results.len());
@@ -159,7 +162,7 @@ mod tests {
     use crate::repository::{PendingChange, PendingProposal};
 
     fn output(activity: &[&str]) -> BenchmarkAgentOutput {
-        BenchmarkAgentOutput { content: "grounded".into(), activity: activity.iter().map(|v| (*v).into()).collect(), proposal: None, trace: "[AIIDE][repair] Attempt 1/2".into() }
+        BenchmarkAgentOutput { content: "grounded".into(), activity: activity.iter().map(|v| (*v).into()).collect(), proposal: None, trace: "[AIIDE][repair] Attempt 1/2".into(), usage: ModelUsage::default() }
     }
 
     #[test]
@@ -184,7 +187,7 @@ mod tests {
             path: EXPECTED_PATH.into(), before: before.clone(), after: before.replacen(OLD_HEADING, NEW_HEADING, 1), replacements: 1,
         }] };
         let result = classify("m", Case::Edit, 1, Ok(BenchmarkAgentOutput {
-            content: "ready".into(), activity: vec!["Read: src/index.html".into()], proposal: Some(proposal), trace: String::new(),
+            content: "ready".into(), activity: vec!["Read: src/index.html".into()], proposal: Some(proposal), trace: String::new(), usage: ModelUsage::default(),
         }), &before, &before);
         assert!(result.passed);
         assert_eq!(result.final_action, "propose_change");
@@ -199,6 +202,7 @@ mod tests {
         let result = classify("m", Case::Edit, 1, Ok(BenchmarkAgentOutput {
             content: "ready".into(), activity: vec!["Read: src/index.html".into()], proposal: Some(proposal),
             trace: "[AIIDE][protocol] Schema/format: changes\n[AIIDE][tool] Proposal validation: passed\nPending change creation: passed".into(),
+            usage: ModelUsage::default(),
         }), &before, &before);
         assert!(!result.passed);
         assert_eq!(result.final_action, "propose_change");
@@ -218,7 +222,7 @@ mod tests {
                 path: EXPECTED_PATH.into(), before: before.clone(), after: after.clone(), replacements: 1,
             }] };
             let result = classify("m", Case::Edit, 1, Ok(BenchmarkAgentOutput {
-                content: "ready".into(), activity: vec!["Read: src/index.html".into()], proposal: Some(proposal), trace: String::new(),
+                content: "ready".into(), activity: vec!["Read: src/index.html".into()], proposal: Some(proposal), trace: String::new(), usage: ModelUsage::default(),
             }), &before, &before);
             assert_eq!(result.failure_reason.as_deref(), Some(expected_reason));
             assert!(!result.failure_reason.unwrap().contains(&after));
@@ -229,7 +233,7 @@ mod tests {
     fn repair_count_includes_structural_and_proposal_retries() {
         let trace = "[AIIDE][repair] Attempt 1/2\n[AIIDE][repair] Ambiguous proposal anchor rejected\nAttempt 1/2";
         let result = classify("m", Case::Answer, 1, Ok(BenchmarkAgentOutput {
-            content: "grounded".into(), activity: vec![format!("Read: {EXPECTED_PATH}")], proposal: None, trace: trace.into(),
+            content: "grounded".into(), activity: vec![format!("Read: {EXPECTED_PATH}")], proposal: None, trace: trace.into(), usage: ModelUsage::default(),
         }), OLD_HEADING, OLD_HEADING);
         assert!(result.passed);
         assert_eq!(result.repair_count, 2);
@@ -240,6 +244,7 @@ mod tests {
         let failure = BenchmarkAgentFailure {
             error: "The local model could not produce a valid structured response after two retries.".into(),
             trace: "[AIIDE][repair] Attempt 1/2\n[AIIDE][repair] Attempt 2/2".into(),
+            usage: ModelUsage::default(),
         };
         let result = classify("m", Case::Edit, 1, Err(failure), OLD_HEADING, OLD_HEADING);
         assert!(!result.passed);
