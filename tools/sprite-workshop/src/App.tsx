@@ -10,9 +10,11 @@ import { alignmentDragOffset, alignmentScale, calculateLayout, emptyOffsets, ref
 import type { AlignmentMode, AlignmentZoom, Pixels } from './alignment'
 import { acceptAllSuggestions, acceptSuggestion, alphaSuggestions, eligibleSuggestionCount, gridSuggestions, rejectSuggestion } from './detection'
 import type { GridOptions } from './detection'
-import { removeFrame, restoreFrame } from './frameActions'
+import { removeFrame, restoreFrame, slotsFromFrameOrder } from './frameActions'
 import type { DeletedFrame } from './frameActions'
 import { DetectionPanel } from './DetectionPanel'
+import { deserializePortableProject, loadLatestProject, PROJECT_SCHEMA_VERSION, projectFileName, restoreSource, saveLatestProject, saveWithStatus, serializePortableProject } from './project'
+import type { ProjectData, SourceRecord, StoredProject } from './project'
 
 type Drag =
   | { kind: 'draw'; start: Point; id: string; name: string }
@@ -47,6 +49,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<WorkflowTab>('extract')
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth)
   const [source, setSource] = useState<SourceImage | null>(null)
+  const [sourceRecord, setSourceRecord] = useState<SourceRecord | null>(null)
   const sourceRef = useRef<SourceImage | null>(null)
   const [regions, setRegions] = useState<Region[]>([])
   const [pixels, setPixels] = useState<Pixels | null>(null)
@@ -91,7 +94,10 @@ export default function App() {
   const [dragOver, setDragOver] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [saveStatus, setSaveStatus] = useState<'loading' | 'unsaved' | 'saving' | 'saved' | 'failed'>('loading')
+  const [saveError, setSaveError] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+  const projectFileRef = useRef<HTMLInputElement>(null)
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
   const stageRef = useRef<HTMLDivElement>(null)
   const alignmentPreviewRef = useRef<HTMLDivElement>(null)
@@ -100,6 +106,12 @@ export default function App() {
   const alignmentDrag = useRef<{ kind: 'move' | 'pan'; x: number; y: number; offset: Point; slot: number; scale: number } | null>(null)
   const nextNumber = useRef(1)
   const loadCounter = useRef(0)
+  const hydrated = useRef(false)
+  const restoreStarted = useRef(false)
+  const saveTimer = useRef<number | null>(null)
+  const pendingSave = useRef<StoredProject | null>(null)
+  const saveRevision = useRef(0)
+  const savePromise = useRef<Promise<void>>(Promise.resolve())
   const selected = regions.find(region => region.id === selectedId) ?? null
   const suggestion = suggestions.find(region => region.id === selectedSuggestion) ?? null
   const imageSize = source ? { width: source.width, height: source.height } : null
@@ -114,6 +126,52 @@ export default function App() {
   const activeSlotClipped = Boolean(activePlacement && (activePlacement.x < 0 || activePlacement.y < 0 || activePlacement.x + activePlacement.source.width > layout.width || activePlacement.y + activePlacement.source.height > layout.height))
   const rightWidth = Math.min(workshopLayout.rightWidth, Math.max(320, viewportWidth - 480))
   const workspaceStyle = { '--right-width': `${rightWidth}px` } as CSSProperties
+  const projectData = useMemo<ProjectData>(() => ({
+    schemaVersion: PROJECT_SCHEMA_VERSION, regions, selectedId, slots, activeSlot, fps, animationName, alignmentMode, offsets, padding, minWidth, minHeight,
+    onion, onionReference, fixedReferenceSlot, centreGuide, baselineGuide, pixelGrid, baselineOffset, detectionMode, grid, joinGap, minPixels,
+  }), [regions, selectedId, slots, activeSlot, fps, animationName, alignmentMode, offsets, padding, minWidth, minHeight, onion, onionReference, fixedReferenceSlot, centreGuide, baselineGuide, pixelGrid, baselineOffset, detectionMode, grid, joinGap, minPixels])
+
+  function applyProject(project: ProjectData) {
+    setRegions(project.regions); setSelectedId(project.selectedId); setSlots(project.slots); setActiveSlot(project.activeSlot); setFps(project.fps); setAnimationName(project.animationName)
+    setAlignmentMode(project.alignmentMode); setOffsets(project.offsets); setPadding(project.padding); setMinWidth(project.minWidth); setMinHeight(project.minHeight)
+    setOnion(project.onion); setOnionReference(project.onionReference); setFixedReferenceSlot(project.fixedReferenceSlot); setCentreGuide(project.centreGuide); setBaselineGuide(project.baselineGuide)
+    setPixelGrid(project.pixelGrid); setBaselineOffset(project.baselineOffset); setDetectionMode(project.detectionMode); setGrid(project.grid); setJoinGap(project.joinGap); setMinPixels(project.minPixels)
+    setSuggestions([]); setSelectedSuggestion(null); setDeleted(null); setPlaying(false); setExportError(null)
+    nextNumber.current = project.regions.length + 1
+  }
+
+  async function applyStoredProject(record: StoredProject) {
+    const restored = await restoreSource(record.source)
+    sourceRef.current?.bitmap.close(); sourceRef.current = restored.source
+    setSource(restored.source); setPixels(restored.pixels); setSourceRecord({ blob: restored.blob, ...restored.metadata }); applyProject(record.project)
+    window.requestAnimationFrame(() => fit(restored.source))
+  }
+
+  function makeRecord(data = projectData): StoredProject | null {
+    return sourceRecord ? { id: 'latest', schemaVersion: PROJECT_SCHEMA_VERSION, savedAt: Date.now(), project: data, source: sourceRecord } : null
+  }
+
+  function commitSave(record: StoredProject, revision: number): Promise<void> {
+    setSaveError(null)
+    const task = saveWithStatus(() => saveLatestProject(record), value => {
+      if (saveRevision.current === revision) setSaveStatus(value)
+    }).then(() => {
+      if (saveRevision.current === revision) pendingSave.current = null
+    }).catch(cause => {
+      if (saveRevision.current === revision) setSaveError(`${cause instanceof Error ? cause.message : 'Local save failed.'} Keep this tab open and export a project file as a backup.`)
+      throw cause
+    })
+    savePromise.current = task.catch(() => undefined)
+    return task
+  }
+
+  async function flushPendingSave(): Promise<boolean> {
+    if (saveTimer.current !== null) { window.clearTimeout(saveTimer.current); saveTimer.current = null }
+    const record = pendingSave.current
+    if (!record) { await savePromise.current; return saveStatus !== 'failed' }
+    const revision = saveRevision.current
+    try { await commitSave(record, revision); return true } catch { return false }
+  }
 
   function selectTab(tab: WorkflowTab) {
     setAlignmentExpanded(false)
@@ -144,6 +202,36 @@ export default function App() {
       onPointerUp={event => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }}
       onKeyDown={event => { const direction = event.key === 'ArrowLeft' ? 1 : event.key === 'ArrowRight' ? -1 : 0; if (!direction && event.key !== 'Home' && event.key !== 'End') return; event.preventDefault(); resizeSidebar(event.key === 'Home' ? 320 : event.key === 'End' ? 560 : width + direction * (event.shiftKey ? 25 : 10)) }} />
   }
+
+  useEffect(() => {
+    if (restoreStarted.current) return
+    restoreStarted.current = true
+    void loadLatestProject().then(async record => {
+      if (record) { await applyStoredProject(record); setSaveStatus('saved'); setNotice('Restored the most recent local project.') }
+      else setSaveStatus('unsaved')
+    }).catch(cause => { setSaveStatus('failed'); setSaveError(`${cause instanceof Error ? cause.message : 'Could not open local project storage.'} You can still work and export a project backup.`) }).finally(() => { hydrated.current = true })
+  // Startup recovery intentionally runs once; subsequent project loads are explicit actions.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (!hydrated.current || !sourceRecord) return
+    const record: StoredProject = { id: 'latest', schemaVersion: PROJECT_SCHEMA_VERSION, savedAt: Date.now(), project: projectData, source: sourceRecord }
+    const revision = ++saveRevision.current
+    pendingSave.current = record
+    setSaveStatus('unsaved'); setSaveError(null)
+    if (saveTimer.current !== null) window.clearTimeout(saveTimer.current)
+    saveTimer.current = window.setTimeout(() => { saveTimer.current = null; void commitSave(record, revision).catch(() => undefined) }, 600)
+  }, [projectData, sourceRecord])
+
+  useEffect(() => {
+    const flushWhenHidden = () => { if (document.visibilityState === 'hidden') void flushPendingSave() }
+    const flushOnPageHide = () => { void flushPendingSave() }
+    document.addEventListener('visibilitychange', flushWhenHidden); window.addEventListener('pagehide', flushOnPageHide)
+    return () => { document.removeEventListener('visibilitychange', flushWhenHidden); window.removeEventListener('pagehide', flushOnPageHide); if (saveTimer.current !== null) window.clearTimeout(saveTimer.current) }
+  // The listeners read the latest pending-save refs and must only be registered once.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     try { window.localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(workshopLayout)) } catch { /* Layout remains usable without storage. */ }
@@ -202,6 +290,7 @@ export default function App() {
 
   async function importFile(file?: File) {
     if (!file) return
+    if (source && ['unsaved', 'saving', 'failed'].includes(saveStatus) && !window.confirm('Discard unsaved changes and import a different source PNG?')) return
     const request = ++loadCounter.current
     setError(null); setNotice(null)
     try {
@@ -217,7 +306,7 @@ export default function App() {
       catch { loaded.bitmap.close(); throw new Error('Could not read PNG pixels for local alpha analysis.') }
       sourceRef.current?.bitmap.close()
       sourceRef.current = loaded
-      setSource(loaded); setPixels({ data: imageData.data, width: loaded.width, height: loaded.height }); setRegions([]); setSelectedId(null); setSlots([...EMPTY_SLOTS]); setOffsets(emptyOffsets()); setSuggestions([]); setSelectedSuggestion(null); setDeleted(null); setActiveSlot(0); setPlaying(false); nextNumber.current = 1
+      setSource(loaded); setSourceRecord({ blob: file, name: file.name, type: 'image/png', size: file.size, lastModified: file.lastModified }); setPixels({ data: imageData.data, width: loaded.width, height: loaded.height }); setRegions([]); setSelectedId(null); setSlots([...EMPTY_SLOTS]); setOffsets(emptyOffsets()); setSuggestions([]); setSelectedSuggestion(null); setDeleted(null); setActiveSlot(0); setPlaying(false); nextNumber.current = 1
       setAnimationName(loaded.name.replace(/\.png$/i, '') || 'animation'); setExportError(null)
       window.requestAnimationFrame(() => fit(loaded))
     } catch (cause) { if (request === loadCounter.current) setError(cause instanceof Error ? cause.message : 'Could not load the image.') }
@@ -284,6 +373,76 @@ export default function App() {
     const width = Math.min(32, source.width), height = Math.min(32, source.height)
     const region: Region = { id: crypto.randomUUID(), name: `Frame ${nextNumber.current++}`, x: Math.floor((source.width - width) / 2), y: Math.floor((source.height - height) / 2), width, height }
     setRegions(previous => [...previous, region]); setSelectedId(region.id)
+  }
+
+  function selectAdjacentFrame(direction: -1 | 1) {
+    if (!regions.length) return
+    const current = regions.findIndex(region => region.id === selectedId)
+    const index = current < 0 ? 0 : (current + direction + regions.length) % regions.length
+    setSelectedId(regions[index].id)
+  }
+
+  function fitSelected() {
+    if (!selected || !stageRef.current) return
+    const stage = stageRef.current
+    const next = clamp(Math.min((stage.clientWidth - 80) / selected.width, (stage.clientHeight - 80) / selected.height), 0.25, 32)
+    setZoom(next); setPan({ x: (stage.clientWidth - selected.width * next) / 2 - selected.x * next, y: (stage.clientHeight - selected.height * next) / 2 - selected.y * next })
+  }
+
+  function fillSlotsFromFrames() {
+    const result = slotsFromFrameOrder(regions, slots)
+    if (result.replacesAssignments && !window.confirm('Replace the existing animation slot assignments with the current frame-list order?')) return
+    setSlots(result.slots); setOffsets(emptyOffsets()); setActiveSlot(0)
+    setNotice(`Filled ${Math.min(regions.length, 8)} animation slot${Math.min(regions.length, 8) === 1 ? '' : 's'} from the frame list.`)
+  }
+
+  function resetProject() {
+    sourceRef.current?.bitmap.close(); sourceRef.current = null; setSource(null); setSourceRecord(null); setPixels(null); setRegions([]); setSelectedId(null); setSlots([...EMPTY_SLOTS]); setOffsets(emptyOffsets())
+    setSuggestions([]); setSelectedSuggestion(null); setDeleted(null); setActiveSlot(0); setPlaying(false); setFps(8); setAnimationName('animation'); setAlignmentMode('bottom'); setPadding(8); setMinWidth(0); setMinHeight(0)
+    setOnion(false); setOnionReference('previous'); setFixedReferenceSlot(0); setCentreGuide(true); setBaselineGuide(true); setPixelGrid(false); setBaselineOffset(0); setAlignmentZoom('fit'); setAlignmentPan({ x: 0, y: 0 })
+    setDetectionMode('grid'); setGrid({ rows: 5, columns: 8, gapX: 8, gapY: 8, left: 0, right: 0, top: 0, bottom: 0 }); setJoinGap(12); setMinPixels(8); setZoom(1); setPan({ x: 0, y: 0 }); setMode('select'); setActiveTab('extract')
+    setError(null); setNotice('Started a new project.'); setSaveError(null); setSaveStatus('unsaved'); nextNumber.current = 1
+  }
+
+  function newProject() {
+    if (['unsaved', 'saving', 'failed'].includes(saveStatus) && source && !window.confirm('Discard unsaved changes and start a new project?')) return
+    if (saveTimer.current !== null) { window.clearTimeout(saveTimer.current); saveTimer.current = null }
+    pendingSave.current = null; saveRevision.current += 1; resetProject()
+  }
+
+  async function reopenRecentProject() {
+    if (['unsaved', 'saving', 'failed'].includes(saveStatus) && source && !window.confirm('Discard unsaved changes and reopen the most recent saved project?')) return
+    setError(null)
+    try {
+      const record = await loadLatestProject()
+      if (!record) { setNotice('No locally saved project is available yet.'); return }
+      await applyStoredProject(record); setSaveStatus('saved'); setSaveError(null); setNotice('Reopened the most recent local project.')
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not reopen the local project.') }
+  }
+
+  async function exportProjectFile() {
+    const record = makeRecord()
+    if (!record) { setError('Import a source PNG before exporting a project.'); return }
+    await flushPendingSave()
+    try {
+      const text = await serializePortableProject(record)
+      const url = URL.createObjectURL(new Blob([text], { type: 'application/json' })); const anchor = document.createElement('a')
+      anchor.href = url; anchor.download = projectFileName(animationName); document.body.append(anchor)
+      try { anchor.click() } finally { anchor.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 30_000) }
+      setNotice('Exported a self-contained project file.')
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Project export failed.') }
+  }
+
+  async function importProjectFile(file?: File) {
+    if (!file) return
+    setError(null)
+    try {
+      const record = deserializePortableProject(await file.text())
+      await applyStoredProject(record)
+      const revision = ++saveRevision.current; pendingSave.current = record
+      await commitSave(record, revision)
+      setNotice('Imported and saved the project locally.')
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Project import failed. The current session was not changed.') }
   }
 
   function editNumber(key: 'x' | 'y' | 'width' | 'height', raw: string) {
@@ -389,10 +548,10 @@ export default function App() {
   return <div className="workshop">
     <header className="topbar">
       <div className="brand"><span className="brand-icon" aria-hidden="true">▦</span><span><strong>SPRITE WORKSHOP</strong><small>AiiDE / developer utility</small></span></div>
-      <div className="header-actions"><span className="local-badge"><i /> LOCAL ONLY</span><input ref={fileRef} type="file" accept="image/png,.png" className="visually-hidden" aria-label="Import PNG" onChange={event => { void importFile(event.target.files?.[0]); event.target.value = '' }} /><button className="primary" onClick={() => fileRef.current?.click()}>Import PNG</button></div>
+      <div className="header-actions"><span className={`save-status ${saveStatus}`} role="status" aria-live="polite" title={saveError ?? undefined}>{saveStatus === 'loading' ? 'Opening local project…' : saveStatus === 'unsaved' ? 'Unsaved changes' : saveStatus === 'saving' ? 'Saving…' : saveStatus === 'saved' ? 'Saved locally' : 'Save failed'}</span><span className="local-badge"><i /> LOCAL ONLY</span><input ref={fileRef} type="file" accept="image/png,.png" className="visually-hidden" aria-label="Import PNG" onChange={event => { void importFile(event.target.files?.[0]); event.target.value = '' }} /><input ref={projectFileRef} type="file" accept=".json,.spriteworkshop.json,application/json" className="visually-hidden" aria-label="Import project file" onChange={event => { void importProjectFile(event.target.files?.[0]); event.target.value = '' }} /><button className="small" onClick={newProject}>New</button><button className="small" onClick={() => void reopenRecentProject()}>Reopen recent</button><button className="small" disabled={!source} onClick={() => void exportProjectFile()}>Export project</button><button className="small" onClick={() => projectFileRef.current?.click()}>Import project</button><button className="primary" onClick={() => fileRef.current?.click()}>Import PNG</button></div>
     </header>
     <div className="intro"><div><span className="eyebrow">FRAME EXTRACTION WORKSPACE</span><h1>Shape each frame by hand.</h1><p>Map regions, align an eight-frame loop, and export a transparent sprite sheet with metadata.</p></div><div className="source-meta"><span>SOURCE</span><strong>{source?.name ?? 'No image loaded'}</strong><small>{source ? `${source.width} × ${source.height} px · PNG` : 'Drop a PNG onto the canvas to begin'}</small></div></div>
-    {(error || notice || deleted) && <div className={error ? 'message error' : 'message'} role={error ? 'alert' : 'status'}>{error ?? notice}{deleted && <button className="undo-button" onClick={undoDelete}>Undo deletion of {deleted.region.name}</button>}<button aria-label="Dismiss message" onClick={() => { setError(null); setNotice(null); setDeleted(null) }}>×</button></div>}
+    {(error || notice || deleted || saveError) && <div className={(error || saveError) ? 'message error' : 'message'} role={(error || saveError) ? 'alert' : 'status'}>{error ?? saveError ?? notice}{deleted && <button className="undo-button" onClick={undoDelete}>Undo deletion of {deleted.region.name}</button>}<button aria-label="Dismiss message" onClick={() => { setError(null); setNotice(null); setDeleted(null); setSaveError(null) }}>×</button></div>}
     <nav className="workflow-tabs" role="tablist" aria-label="Sprite workflow">{WORKFLOW_TABS.map((tab, index) => <button key={tab.id} ref={element => { tabRefs.current[index] = element }} id={`workflow-tab-${tab.id}`} role="tab" aria-selected={activeTab === tab.id} aria-controls={`workflow-panel-${tab.id}`} tabIndex={activeTab === tab.id ? 0 : -1} onClick={() => selectTab(tab.id)} onKeyDown={event => handleTabKeyDown(event, index)}>{tab.label}</button>)}</nav>
     <main className={activeTab === 'animate' ? 'workspace animate-workspace' : 'workspace'} style={workspaceStyle}>
       <aside id="workflow-panel-extract" className="panel frames-panel" role="tabpanel" aria-labelledby="workflow-tab-extract" hidden={activeTab !== 'extract'}><div className="section-heading"><div><span className="eyebrow">REGIONS</span><h2>Frame library <em>{regions.length}</em></h2></div><button className="small" disabled={!source} onClick={addFrame}>+ Add</button></div>
@@ -408,15 +567,16 @@ export default function App() {
       </section>
       {resizeHandle()}
       <aside className="panel detail-panel" aria-label="Workflow tools">
-        <div id="workflow-panel-inspect" className="workflow-panel" role="tabpanel" aria-labelledby="workflow-tab-inspect" hidden={activeTab !== 'inspect'}><section className="inspect-suggestions"><span className="eyebrow">SUGGESTED REGIONS</span><h2>Add detected frames</h2><p>{suggestions.length ? `${suggestions.length} suggestions are ready; ${eligibleSuggestions} can be added without changing existing regions.` : 'Generate and review frame suggestions from Extract.'}</p><button className="primary" disabled={eligibleSuggestions === 0} onClick={acceptAll}>Add all suggested frames{eligibleSuggestions > 0 ? ` (${eligibleSuggestions})` : ''}</button></section>{selected && source ? <div className="details">
+        <div id="workflow-panel-inspect" className="workflow-panel" role="tabpanel" aria-labelledby="workflow-tab-inspect" hidden={activeTab !== 'inspect'}><section className="inspect-suggestions"><span className="eyebrow">ORGANISE</span><h2>Frame order and assignments</h2><p>Slots 1–8 follow the current frame-list order. Existing assignments are confirmed before replacement.</p><button className="primary" disabled={!regions.length} onClick={fillSlotsFromFrames}>Fill slots from frame list</button><div className="inspect-frame-strip" aria-label="Frame thumbnails">{regions.map((region, index) => <button key={region.id} className={selectedId === region.id ? 'active' : ''} aria-label={`Select ${region.name}`} aria-pressed={selectedId === region.id} onClick={() => setSelectedId(region.id)}>{source && <Thumbnail image={source.bitmap} region={region} />}<span>{index + 1}</span></button>)}</div></section>{selected && source ? <div className="details">
           <div className="section-heading"><div><span className="eyebrow">SELECTED FRAME</span><h2>Crop inspection</h2></div></div>
+          <div className="inspect-nav"><button className="small" onClick={() => selectAdjacentFrame(-1)}>← Previous</button><button className="small" onClick={fitSelected}>Fit selected frame</button><button className="small" onClick={() => selectAdjacentFrame(1)}>Next →</button></div>
           <label className="field"><span>Name</span><input value={selected.name} maxLength={48} onChange={event => updateRegion({ ...selected, name: event.target.value })} /></label>
           <div className="field-grid">{(['x', 'y', 'width', 'height'] as const).map(key => <label className="field" key={key}><span>{key === 'width' ? 'Width' : key === 'height' ? 'Height' : key.toUpperCase()}</span><input type="number" min={key === 'width' || key === 'height' ? 1 : 0} max={key === 'x' ? source.width - 1 : key === 'y' ? source.height - 1 : key === 'width' ? source.width - selected.x : source.height - selected.y} value={selected[key]} onChange={event => editNumber(key, event.target.value)} /></label>)}</div>
           <div className="preview-label">SOURCE CROP <span>{selected.width} × {selected.height} PX</span></div>
           <div className="selected-preview checker"><SpriteCanvas image={source.bitmap} region={selected} width={selected.width} height={selected.height} /></div>
           <div className="detail-actions"><button className="danger" onClick={() => deleteFrame(selected.id)}>Delete frame</button></div>
           <p className="help">Crop coordinates use source-image pixels. Animation placement is edited in Animate.</p>
-        </div> : <div className="panel-empty details-empty"><span>◇</span><strong>Select a frame</strong><p>Draw on the canvas or choose a frame in Extract to edit its exact coordinates.</p></div>}</div>
+        </div> : <div className="panel-empty details-empty"><span>◇</span><strong>{source ? 'No frame selected' : 'No source image'}</strong><p>{source ? 'Choose a frame thumbnail above or create one in Extract.' : 'Import a PNG or reopen a local project to inspect frames.'}</p></div>}</div>
         <div id="workflow-panel-animate" className="workflow-panel" role="tabpanel" aria-labelledby="workflow-tab-animate" hidden={activeTab !== 'animate'}>
         <section className="tool-section animate-alignment"><div className="section-heading"><div><span className="eyebrow">ALIGNMENT</span><h2>Animation alignment</h2></div></div><p className="section-help">Assign crops, then place each slot on one pixel canvas. Drag the preview or use exact offsets.</p>
           <div className="alignment-controls"><label className="field"><span>Initial anchor</span><select value={alignmentMode} onChange={event => setAlignmentMode(event.target.value as AlignmentMode)}><option value="bottom">Bottom centre</option><option value="center">Centre</option></select></label><button className="small" disabled={!assigned.some(Boolean)} onClick={() => setOffsets(emptyOffsets())}>Align all to anchor</button><div className="field-grid"><label className="field"><span>Padding</span><input type="number" min="0" max="256" value={padding} onChange={event => setPadding(clamp(Number(event.target.value) || 0, 0, 256))} /></label><label className="field"><span>Min width</span><input type="number" min="0" max="4096" value={minWidth} onChange={event => setMinWidth(clamp(Number(event.target.value) || 0, 0, 4096))} /></label><label className="field"><span>Min height</span><input type="number" min="0" max="4096" value={minHeight} onChange={event => setMinHeight(clamp(Number(event.target.value) || 0, 0, 4096))} /></label></div><p className="layout-size">Shared canvas: {layout.width} × {layout.height} px</p><label className="check-field"><input type="checkbox" checked={onion} onChange={event => setOnion(event.target.checked)} /> Onion skin</label><label className="field"><span>Compare with</span><select value={onionReference} disabled={!onion} onChange={event => setOnionReference(event.target.value as 'previous' | 'fixed')}><option value="previous">Previous slot</option><option value="fixed">Fixed slot</option></select></label>{onionReference === 'fixed' && <label className="field"><span>Reference slot</span><select value={fixedReferenceSlot} disabled={!onion} onChange={event => setFixedReferenceSlot(Number(event.target.value))}>{slots.map((id, index) => <option key={index} value={index}>{`Slot ${index + 1}${id ? ` · ${assigned[index]?.name ?? 'Frame'}` : ' · Empty'}`}</option>)}</select></label>}</div>
@@ -443,7 +603,7 @@ export default function App() {
         <section className="tool-section timeline"><div className="section-heading"><div><span className="eyebrow">8 FRAME LOOP</span><h2>Frame timeline</h2></div></div>
           <div className="play-controls"><button aria-label="Previous frame" disabled={!source} onClick={() => setActiveSlot(index => (index + 7) % 8)}>‹</button><button className="play-button" disabled={!assigned.some(Boolean) || reducedMotion} onClick={() => setPlaying(value => !value)}>{playing ? 'Pause' : 'Play'}</button><button aria-label="Next frame" disabled={!source} onClick={() => setActiveSlot(index => (index + 1) % 8)}>›</button><label>FPS <input type="number" min="1" max="24" value={fps} onChange={event => setFps(clamp(Number(event.target.value) || 1, 1, 24))} /></label></div>
           {reducedMotion && <p className="motion-note">Automatic playback is off because reduced motion is enabled. Step through frames manually.</p>}
-          <div className="slot-grid">{slots.map((id, index) => <label key={index} className={activeSlot === index ? 'slot active' : 'slot'}><span>{String(index + 1).padStart(2, '0')}</span><select aria-label={`Animation frame ${index + 1}`} value={id ?? ''} onFocus={() => setActiveSlot(index)} onChange={event => { const value = event.target.value || null; setSlots(previous => previous.map((item, itemIndex) => itemIndex === index ? value : item)); setOffsets(previous => previous.map((offset, itemIndex) => itemIndex === index ? { x: 0, y: 0 } : offset)); setActiveSlot(index) }}><option value="">Empty</option>{regions.map(region => <option key={region.id} value={region.id}>{region.name}</option>)}</select></label>)}</div><button className="fill-button" disabled={!regions.length} onClick={() => { setSlots(Array.from({ length: 8 }, (_, index) => regions[index]?.id ?? null)); setOffsets(emptyOffsets()); setActiveSlot(0) }}>Fill slots from frame list</button>
+          <div className="slot-grid">{slots.map((id, index) => <label key={index} className={activeSlot === index ? 'slot active' : 'slot'}><span>{String(index + 1).padStart(2, '0')}</span><select aria-label={`Animation frame ${index + 1}`} value={id ?? ''} onFocus={() => setActiveSlot(index)} onChange={event => { const value = event.target.value || null; setSlots(previous => previous.map((item, itemIndex) => itemIndex === index ? value : item)); setOffsets(previous => previous.map((offset, itemIndex) => itemIndex === index ? { x: 0, y: 0 } : offset)); setActiveSlot(index) }}><option value="">Empty</option>{regions.map(region => <option key={region.id} value={region.id}>{region.name}</option>)}</select></label>)}</div>
         </section>
         </div>
         <div id="workflow-panel-export" className="workflow-panel export-panel" role="tabpanel" aria-labelledby="workflow-tab-export" hidden={activeTab !== 'export'}>

@@ -5,6 +5,17 @@
 .row-delete:hover, .row-delete:focus-visible { border-color: #9a5550; background: #402321; }
 @media (hover: none) { .row-delete { opacity: 1; } }
 .undo-button { margin-left: auto; border: 1px solid #82bc8d; border-radius: 4px; background: #285137; padding: 4px 8px; color: #e6ffea; font-size: 11px; }
+.save-status { border: 1px solid #425248; border-radius: 999px; padding: 5px 9px; color: #aab7ae; font: 700 10px ui-monospace, monospace; white-space: nowrap; }
+.save-status.saving, .save-status.unsaved { border-color: #806d3e; color: #e0c77c; }
+.save-status.saved { border-color: #39704a; color: #9cdeb0; }
+.save-status.failed { border-color: #8f4e49; color: #f0a59e; }
+.inspect-frame-strip { display: flex; gap: 6px; margin-top: 12px; overflow-x: auto; padding-bottom: 4px; }
+.inspect-frame-strip button { position: relative; flex: 0 0 60px; border: 1px solid #34473a; border-radius: 6px; background: #142019; padding: 3px; color: #b9ccbd; }
+.inspect-frame-strip button.active { border-color: #8be5a4; background: #203a29; box-shadow: inset 0 0 0 1px #4c8c60; }
+.inspect-frame-strip .thumbnail { width: 50px; height: 50px; }
+.inspect-frame-strip button > span { position: absolute; right: 3px; bottom: 3px; border-radius: 3px; background: #111b14dc; padding: 1px 3px; font: 9px ui-monospace, monospace; }
+.inspect-nav { display: grid; grid-template-columns: 1fr auto 1fr; gap: 6px; margin-bottom: 14px; }
+.inspect-nav button:last-child { justify-self: stretch; }
 .detector { flex: none; max-height: 50%; overflow: auto; border-top: 1px solid #344538; }
 .detector summary { display: flex; align-items: center; justify-content: space-between; cursor: pointer; padding: 12px 15px; color: #add9b4; font-size: 12px; font-weight: 700; }
 .detector summary:hover { background: #203124; }
@@ -126,6 +137,12 @@
   .layout-actions .small { flex: 1; }
   .intro p { max-width: 40ch; }
   .source-meta { display: none; }
+}
+
+@media (max-width: 900px) {
+  .header-actions { gap: 6px; }
+  .header-actions .local-badge { display: none; }
+  .save-status { max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
 }
 
 /* Workflow tabs replace the former stack of collapsible side panels. */

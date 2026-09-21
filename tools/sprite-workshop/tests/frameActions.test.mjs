@@ -5,7 +5,7 @@ import ts from 'typescript'
 
 const source = await readFile(new URL('../src/frameActions.ts', import.meta.url), 'utf8')
 const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText
-const { removeFrame, restoreFrame } = await import(`data:text/javascript,${encodeURIComponent(code)}`)
+const { removeFrame, restoreFrame, slotsFromFrameOrder } = await import(`data:text/javascript,${encodeURIComponent(code)}`)
 
 test('deleting a frame clears all references, selects a neighbour and undo restores them', () => {
   const regions = ['a', 'b', 'c'].map(id => ({ id, name: id, x: 0, y: 0, width: 1, height: 1 }))
@@ -20,4 +20,10 @@ test('deleting a frame clears all references, selects a neighbour and undo resto
   assert.equal(restored.selectedId, 'b')
   const withNewAssignment = { ...removed.state, slots: ['a', 'c', 'c', null, null, null, null, null] }
   assert.equal(restoreFrame(withNewAssignment, removed.undo).slots[1], 'c')
+})
+
+test('fill slots follows stable frame IDs, handles short lists and identifies replacements', () => {
+  const regions = ['b', 'a'].map(id => ({ id, name: id, x: 0, y: 0, width: 1, height: 1 }))
+  assert.deepEqual(slotsFromFrameOrder(regions, Array(8).fill(null)), { slots: ['b', 'a', null, null, null, null, null, null], replacesAssignments: false })
+  assert.equal(slotsFromFrameOrder(regions, ['a', 'b', null, null, null, null, null, null]).replacesAssignments, true)
 })

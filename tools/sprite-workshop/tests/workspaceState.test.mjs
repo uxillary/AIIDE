@@ -18,3 +18,11 @@ test('Animate hides the source editor through layout while retaining the shared 
   assert.match(source, /const \[alignmentPan, setAlignmentPan\] = useState/)
   assert.match(source, /<SpriteCanvas image=\{source\.bitmap\} placement=\{layout\.placements\[activeSlot\]\}/)
 })
+
+test('slot fill is owned by Inspect and confirms before replacing assignments', () => {
+  const inspect = source.slice(source.indexOf('workflow-panel-inspect'), source.indexOf('workflow-panel-animate'))
+  const animate = source.slice(source.indexOf('workflow-panel-animate'), source.indexOf('workflow-panel-export'))
+  assert.match(inspect, /Fill slots from frame list/)
+  assert.doesNotMatch(animate, /Fill slots from frame list/)
+  assert.match(source, /replacesAssignments && !window\.confirm/)
+})
