@@ -9,6 +9,9 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{ipc::Response, Manager, State};
 
+use crate::image_runtime::{
+    managed_image_runtime_status, require_execution_gate, MANAGED_ACQUISITION_ENABLED,
+};
 use crate::project::{OpenProject, IGNORED};
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8188";
@@ -67,20 +70,78 @@ fn model_definition(id: &str) -> Option<&'static ImageModelDefinition> {
     IMAGE_MODELS.iter().find(|model| model.id == id)
 }
 
+const IMAGE_CONFIGURATION_SCHEMA: u32 = 2;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ImageEngineOwnershipMode {
+    External,
+    Managed,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ImageGenerationConfiguration {
+struct ExternalImageEngineConfiguration {
     endpoint: String,
     model_id: String,
     checkpoint: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedImageEngineConfiguration {
+    installation_id: String,
+    runtime_version: String,
+    manifest_id: String,
+    model_id: String,
+    model_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageGenerationConfiguration {
+    schema_version: u32,
+    ownership_mode: ImageEngineOwnershipMode,
+    external: ExternalImageEngineConfiguration,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed: Option<ManagedImageEngineConfiguration>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentImageGenerationConfiguration {
+    schema_version: u32,
+    ownership_mode: ImageEngineOwnershipMode,
+    external: ExternalImageEngineConfiguration,
+    managed: Option<ManagedImageEngineConfiguration>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyImageGenerationConfiguration {
+    endpoint: String,
+    model_id: String,
+    checkpoint: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PersistedImageGenerationConfiguration {
+    Current(CurrentImageGenerationConfiguration),
+    Legacy(LegacyImageGenerationConfiguration),
+}
+
 impl ImageGenerationConfiguration {
     fn defaults() -> Self {
         Self {
-            endpoint: DEFAULT_ENDPOINT.into(),
-            model_id: SDXL_BASELINE_MODEL_ID.into(),
-            checkpoint: DEFAULT_CHECKPOINT.into(),
+            schema_version: IMAGE_CONFIGURATION_SCHEMA,
+            ownership_mode: ImageEngineOwnershipMode::External,
+            external: ExternalImageEngineConfiguration {
+                endpoint: DEFAULT_ENDPOINT.into(),
+                model_id: SDXL_BASELINE_MODEL_ID.into(),
+                checkpoint: DEFAULT_CHECKPOINT.into(),
+            },
+            managed: None,
         }
     }
 }
@@ -237,6 +298,10 @@ impl From<&'static ImageModelDefinition> for ImageModelSummary {
 pub struct ImageEngineStatus {
     state: &'static str,
     ready: bool,
+    ownership_mode: &'static str,
+    managed_state: &'static str,
+    managed_acquisition_enabled: bool,
+    managed_message: Option<String>,
     endpoint: String,
     model: ImageModelSummary,
     checkpoint: String,
@@ -658,23 +723,47 @@ fn validate_checkpoint(checkpoint: &str) -> Result<(), String> {
 }
 
 fn validate_configuration(
-    configuration: ImageGenerationConfiguration,
+    mut configuration: ImageGenerationConfiguration,
 ) -> Result<ImageGenerationConfiguration, String> {
-    ComfyUiProvider::new(&configuration.endpoint, Duration::from_secs(1))?;
-    if model_definition(&configuration.model_id).is_none() {
+    if configuration.schema_version != IMAGE_CONFIGURATION_SCHEMA {
+        return Err("The saved image-generation configuration schema is not supported.".into());
+    }
+    ComfyUiProvider::new(&configuration.external.endpoint, Duration::from_secs(1))?;
+    if model_definition(&configuration.external.model_id).is_none() {
         return Err("The selected image model is not supported by this AIIDE build.".into());
     }
-    validate_checkpoint(&configuration.checkpoint)?;
+    validate_checkpoint(&configuration.external.checkpoint)?;
+    if let Some(managed) = &configuration.managed {
+        if managed.installation_id.trim().is_empty()
+            || managed.runtime_version.trim().is_empty()
+            || managed.manifest_id.trim().is_empty()
+            || model_definition(&managed.model_id).is_none()
+            || managed.model_version.trim().is_empty()
+        {
+            return Err("The saved managed image-engine selection is invalid.".into());
+        }
+    }
+    configuration.schema_version = IMAGE_CONFIGURATION_SCHEMA;
     Ok(configuration)
+}
+
+fn external_configuration(
+    configuration: &ImageGenerationConfiguration,
+) -> Result<&ExternalImageEngineConfiguration, String> {
+    if configuration.ownership_mode == ImageEngineOwnershipMode::Managed {
+        require_execution_gate()?;
+        return Err("Managed image-engine execution is not available in this build.".into());
+    }
+    Ok(&configuration.external)
 }
 
 fn environment_configuration() -> Result<ImageGenerationConfiguration, String> {
     let mut configuration = ImageGenerationConfiguration::defaults();
     if let Ok(endpoint) = std::env::var("AIIDE_COMFYUI_ENDPOINT") {
-        configuration.endpoint = endpoint;
+        configuration.external.endpoint = endpoint;
     }
     if let Ok(checkpoint) = std::env::var("AIIDE_COMFYUI_CHECKPOINT") {
-        configuration.checkpoint = checkpoint;
+        configuration.external.checkpoint = checkpoint;
     }
     validate_configuration(configuration)
 }
@@ -685,8 +774,26 @@ fn load_configuration(path: &Path) -> Result<ImageGenerationConfiguration, Strin
     }
     let text = fs::read_to_string(path)
         .map_err(|_| "Could not read the saved image-generation configuration.".to_owned())?;
-    let configuration: ImageGenerationConfiguration = serde_json::from_str(&text)
+    let persisted: PersistedImageGenerationConfiguration = serde_json::from_str(&text)
         .map_err(|_| "The saved image-generation configuration is malformed.".to_owned())?;
+    let configuration = match persisted {
+        PersistedImageGenerationConfiguration::Current(current) => ImageGenerationConfiguration {
+            schema_version: current.schema_version,
+            ownership_mode: current.ownership_mode,
+            external: current.external,
+            managed: current.managed,
+        },
+        PersistedImageGenerationConfiguration::Legacy(legacy) => ImageGenerationConfiguration {
+            schema_version: IMAGE_CONFIGURATION_SCHEMA,
+            ownership_mode: ImageEngineOwnershipMode::External,
+            external: ExternalImageEngineConfiguration {
+                endpoint: legacy.endpoint,
+                model_id: legacy.model_id,
+                checkpoint: legacy.checkpoint,
+            },
+            managed: None,
+        },
+    };
     validate_configuration(configuration)
 }
 
@@ -698,11 +805,18 @@ fn persist_configuration(
     let model = model_definition(&model_id)
         .ok_or("The selected image model is not supported by this AIIDE build.")?;
     let provider = ComfyUiProvider::new(endpoint.trim(), Duration::from_secs(1))?;
-    let configuration = validate_configuration(ImageGenerationConfiguration {
+    let mut configuration = if path.exists() {
+        load_configuration(path)?
+    } else {
+        ImageGenerationConfiguration::defaults()
+    };
+    configuration.ownership_mode = ImageEngineOwnershipMode::External;
+    configuration.external = ExternalImageEngineConfiguration {
         endpoint: provider.endpoint.as_str().trim_end_matches('/').to_owned(),
         model_id,
         checkpoint: model.checkpoint.into(),
-    })?;
+    };
+    let configuration = validate_configuration(configuration)?;
     let parent = path
         .parent()
         .ok_or("Could not locate the application configuration directory.")?;
@@ -769,7 +883,7 @@ fn hardware_diagnostics(system_stats: &Value) -> (&'static str, Option<String>) 
 }
 
 fn probe_failure_status(
-    configuration: &ImageGenerationConfiguration,
+    configuration: &ExternalImageEngineConfiguration,
     model: &'static ImageModelDefinition,
     local_busy: bool,
     failure: ReadinessProbeError,
@@ -781,6 +895,10 @@ fn probe_failure_status(
     ImageEngineStatus {
         state,
         ready: false,
+        ownership_mode: "external",
+        managed_state: "disabled",
+        managed_acquisition_enabled: MANAGED_ACQUISITION_ENABLED,
+        managed_message: Some(managed_image_runtime_status().message.to_owned()),
         endpoint: configuration.endpoint.clone(),
         model: model.into(),
         checkpoint: configuration.checkpoint.clone(),
@@ -801,7 +919,7 @@ fn malformed_probe(message: &str) -> ReadinessProbeError {
 
 async fn readiness_with_provider(
     provider: &impl ImageReadinessProvider,
-    configuration: &ImageGenerationConfiguration,
+    configuration: &ExternalImageEngineConfiguration,
     local_busy: bool,
 ) -> ImageEngineStatus {
     let model = model_definition(&configuration.model_id)
@@ -866,6 +984,10 @@ async fn readiness_with_provider(
         return ImageEngineStatus {
             state: "missing_nodes",
             ready: false,
+            ownership_mode: "external",
+            managed_state: "disabled",
+            managed_acquisition_enabled: MANAGED_ACQUISITION_ENABLED,
+            managed_message: Some(managed_image_runtime_status().message.to_owned()),
             endpoint: configuration.endpoint.clone(),
             model: model.into(),
             checkpoint: configuration.checkpoint.clone(),
@@ -903,6 +1025,10 @@ async fn readiness_with_provider(
         return ImageEngineStatus {
             state: "missing_checkpoint",
             ready: false,
+            ownership_mode: "external",
+            managed_state: "disabled",
+            managed_acquisition_enabled: MANAGED_ACQUISITION_ENABLED,
+            managed_message: Some(managed_image_runtime_status().message.to_owned()),
             endpoint: configuration.endpoint.clone(),
             model: model.into(),
             checkpoint: configuration.checkpoint.clone(),
@@ -919,6 +1045,10 @@ async fn readiness_with_provider(
     ImageEngineStatus {
         state: if busy { "busy" } else { "ready" },
         ready: true,
+        ownership_mode: "external",
+        managed_state: "disabled",
+        managed_acquisition_enabled: MANAGED_ACQUISITION_ENABLED,
+        managed_message: Some(managed_image_runtime_status().message.to_owned()),
         endpoint: configuration.endpoint.clone(),
         model: model.into(),
         checkpoint: configuration.checkpoint.clone(),
@@ -934,6 +1064,37 @@ async fn readiness_with_provider(
         } else {
             None
         },
+    }
+}
+
+fn managed_disabled_status(configuration: &ImageGenerationConfiguration) -> ImageEngineStatus {
+    let model_id = configuration
+        .managed
+        .as_ref()
+        .map(|managed| managed.model_id.as_str())
+        .unwrap_or(configuration.external.model_id.as_str());
+    let model = model_definition(model_id).unwrap_or_else(|| {
+        model_definition(SDXL_BASELINE_MODEL_ID).expect("baseline image model must exist")
+    });
+    let managed = managed_image_runtime_status();
+    ImageEngineStatus {
+        state: "managed_not_installed",
+        ready: false,
+        ownership_mode: "managed",
+        managed_state: managed.state,
+        managed_acquisition_enabled: managed.acquisition_enabled,
+        managed_message: Some(managed.message.into()),
+        endpoint: String::new(),
+        model: model.into(),
+        checkpoint: model.checkpoint.into(),
+        busy: false,
+        engine_status: "unavailable",
+        model_status: "unknown",
+        hardware_status: "unavailable",
+        missing_nodes: vec![],
+        missing_files: vec![],
+        hardware_message: None,
+        error: Some(managed.message.into()),
     }
 }
 
@@ -1273,8 +1434,12 @@ pub async fn image_generation_status(
         .ok()
         .and_then(|inner| inner.current.as_ref().map(|job| job.phase.active()))
         .unwrap_or(false);
-    let provider = ComfyUiProvider::new(&configuration.endpoint, Duration::from_secs(4))?;
-    Ok(readiness_with_provider(&provider, &configuration, local_busy).await)
+    if configuration.ownership_mode == ImageEngineOwnershipMode::Managed {
+        return Ok(managed_disabled_status(&configuration));
+    }
+    let external = external_configuration(&configuration)?;
+    let provider = ComfyUiProvider::new(&external.endpoint, Duration::from_secs(4))?;
+    Ok(readiness_with_provider(&provider, external, local_busy).await)
 }
 
 #[tauri::command]
@@ -1297,8 +1462,9 @@ pub async fn configure_image_generation(
         );
     }
     let configuration = persist_configuration(&configuration_path(&app)?, endpoint, model_id)?;
-    let provider = ComfyUiProvider::new(&configuration.endpoint, Duration::from_secs(4))?;
-    Ok(readiness_with_provider(&provider, &configuration, false).await)
+    let external = external_configuration(&configuration)?;
+    let provider = ComfyUiProvider::new(&external.endpoint, Duration::from_secs(4))?;
+    Ok(readiness_with_provider(&provider, external, false).await)
 }
 
 #[tauri::command]
@@ -1308,10 +1474,11 @@ pub async fn start_image_generation(
     app: tauri::AppHandle,
 ) -> Result<ImageJob, String> {
     let configuration = selected_configuration(&app)?;
-    let model = model_definition(&configuration.model_id)
+    let external = external_configuration(&configuration)?;
+    let model = model_definition(&external.model_id)
         .ok_or("The selected image model is not supported by this AIIDE build.")?;
-    let provider = ComfyUiProvider::new(&configuration.endpoint, Duration::from_secs(20))?;
-    let readiness = readiness_with_provider(&provider, &configuration, false).await;
+    let provider = ComfyUiProvider::new(&external.endpoint, Duration::from_secs(20))?;
+    let readiness = readiness_with_provider(&provider, external, false).await;
     if !readiness.ready {
         return Err(readiness
             .error
@@ -1322,8 +1489,7 @@ pub async fn start_image_generation(
             "ComfyUI is busy with another generation. Retry when its queue is clear.".into(),
         );
     }
-    let result =
-        start_with_provider(&provider, &state, prompt, model, &configuration.checkpoint).await;
+    let result = start_with_provider(&provider, &state, prompt, model, &external.checkpoint).await;
     if let Ok(job) = &result {
         eprintln!("[AIIDE][image] submitted {}", job.job_id);
     }
@@ -1337,7 +1503,8 @@ pub async fn get_image_generation(
     app: tauri::AppHandle,
 ) -> Result<ImageJob, String> {
     let configuration = selected_configuration(&app)?;
-    let provider = ComfyUiProvider::new(&configuration.endpoint, Duration::from_secs(30))?;
+    let external = external_configuration(&configuration)?;
+    let provider = ComfyUiProvider::new(&external.endpoint, Duration::from_secs(30))?;
     refresh_with_provider(&provider, &state, &job_id).await
 }
 
@@ -1348,7 +1515,8 @@ pub async fn cancel_image_generation(
     app: tauri::AppHandle,
 ) -> Result<ImageJob, String> {
     let configuration = selected_configuration(&app)?;
-    let provider = ComfyUiProvider::new(&configuration.endpoint, Duration::from_secs(10))?;
+    let external = external_configuration(&configuration)?;
+    let provider = ComfyUiProvider::new(&external.endpoint, Duration::from_secs(10))?;
     let result = cancel_with_provider(&provider, &state, &job_id).await;
     if let Ok(job) = &result {
         eprintln!(
@@ -1672,8 +1840,8 @@ mod tests {
         }
     }
 
-    fn configuration() -> ImageGenerationConfiguration {
-        ImageGenerationConfiguration::defaults()
+    fn configuration() -> ExternalImageEngineConfiguration {
+        ImageGenerationConfiguration::defaults().external
     }
 
     fn system_stats() -> Value {
@@ -1868,10 +2036,70 @@ mod tests {
             DEFAULT_MODEL_ID.into(),
         )
         .unwrap();
-        assert_eq!(saved.endpoint, "http://localhost:9000");
+        assert_eq!(saved.external.endpoint, "http://localhost:9000");
+        assert_eq!(saved.ownership_mode, ImageEngineOwnershipMode::External);
         assert_eq!(load_configuration(&path).unwrap(), saved);
         assert!(path.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_configuration_migrates_to_explicit_external_ownership() {
+        let root = fixture("legacy-configuration");
+        let path = root.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"{"endpoint":"http://localhost:8123","modelId":"sdxl-1.0-base","checkpoint":"sd_xl_base_1.0.safetensors"}"#,
+        )
+        .unwrap();
+        let migrated = load_configuration(&path).unwrap();
+        assert_eq!(migrated.schema_version, IMAGE_CONFIGURATION_SCHEMA);
+        assert_eq!(migrated.ownership_mode, ImageEngineOwnershipMode::External);
+        assert_eq!(migrated.external.endpoint, "http://localhost:8123");
+        assert!(migrated.managed.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selecting_external_preserves_saved_managed_identity() {
+        let root = fixture("ownership-preservation");
+        let path = root.join(CONFIG_FILE);
+        let mut configuration = ImageGenerationConfiguration::defaults();
+        configuration.ownership_mode = ImageEngineOwnershipMode::Managed;
+        configuration.managed = Some(ManagedImageEngineConfiguration {
+            installation_id: "install-1".into(),
+            runtime_version: "0.36.0".into(),
+            manifest_id: "comfyui-windows-nvidia-v0.36.0-c1.6".into(),
+            model_id: SDXL_BASELINE_MODEL_ID.into(),
+            model_version: "acceptance-fixture".into(),
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&configuration).unwrap()).unwrap();
+        let saved = persist_configuration(
+            &path,
+            "http://localhost:9000".into(),
+            SDXL_BASELINE_MODEL_ID.into(),
+        )
+        .unwrap();
+        assert_eq!(saved.ownership_mode, ImageEngineOwnershipMode::External);
+        assert_eq!(
+            saved
+                .managed
+                .as_ref()
+                .map(|managed| managed.installation_id.as_str()),
+            Some("install-1")
+        );
+        assert_eq!(saved.external.endpoint, "http://localhost:9000");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_selection_never_falls_back_to_external_process_ownership() {
+        let mut configuration = ImageGenerationConfiguration::defaults();
+        configuration.ownership_mode = ImageEngineOwnershipMode::Managed;
+        assert!(external_configuration(&configuration)
+            .unwrap_err()
+            .contains("disabled"));
+        assert_eq!(configuration.external.endpoint, DEFAULT_ENDPOINT);
     }
 
     #[test]

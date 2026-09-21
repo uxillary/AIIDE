@@ -1,6 +1,6 @@
 # M08A local image generation and managed-engine direction
 
-Status: Phase 2 baseline **IMPLEMENTED** on `image-generation`; managed ComfyUI direction **PLANNED** and approved. Real GPU acceptance, production-model selection, and managed-runtime implementation remain pending.
+Status: Phase 2 baseline **IMPLEMENTED** on `image-generation`; managed-runtime security/ownership foundations are **IMPLEMENTED BUT DISABLED**. Acquisition, execution, repair/removal, release trust, legal approval, real GPU acceptance, and production-model selection remain pending.
 
 ## Implemented prototype baseline
 
@@ -534,6 +534,21 @@ Stage C1.6 supplies evidence only. It does not authorize C2.
 5. Start with ComfyUI's current default dynamic VRAM behavior. Use a pinned-version-specific low-memory recovery option only if live testing shows it is needed; current ComfyUI documents `--lowvram` as having no effect when dynamic VRAM is active.
 
 The current implementation will not install ComfyUI, download weights, alter the service, or start/stop it. Those capabilities belong to the later approved managed-runtime direction and are not part of current GPU acceptance.
+
+### First-image acceptance checklist
+
+On the RTX 3070 Ti 8 GB target, record Windows/NVIDIA driver, ComfyUI/Python/PyTorch/CUDA versions and the exact checkpoint hash before testing. Then:
+
+1. Open Image mode and confirm engine, required-node, checkpoint and hardware readiness separately.
+2. Generate one 1024×1024 image with the fixed SDXL workflow; record wall time and peak dedicated/shared GPU memory, and confirm the preview is a valid PNG.
+3. Reject one result and verify no project file remains; generate again, save it to a project-relative path, and verify collision-safe naming.
+4. Use **Regenerate**, then test prompt-specific cancellation once while queued and once while running. Confirm an unsupported running cancellation never uses ComfyUI's global interrupt.
+5. Put another job in ComfyUI's queue and confirm AIIDE reports busy without inventing progress.
+6. Disconnect the engine during polling, restore it, and confirm the job can be checked again without a false terminal success.
+7. Reproduce or safely simulate a ComfyUI CUDA out-of-memory response and confirm AIIDE reports it without automatic retry; use default dynamic VRAM behaviour for the baseline.
+8. After Reject, Save, project change and application exit, verify AIIDE-owned temporary PNGs are removed. Record any remaining ComfyUI-owned `PreviewImage` temporary file separately.
+
+Mocks do not satisfy this checklist. Managed acquisition/execution must remain disabled throughout the external-engine acceptance run.
 
 ## Phase 2 implementation files
 

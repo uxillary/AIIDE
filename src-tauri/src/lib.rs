@@ -5,6 +5,7 @@ mod model_profiles;
 mod model_provider;
 mod benchmark;
 mod image_generation;
+mod image_runtime;
 mod git;
 
 pub fn run_benchmark_cli() -> Result<(), String> {
@@ -46,6 +47,7 @@ pub fn run() {
             image_generation::cancel_image_generation,
             image_generation::reject_generated_image,
             image_generation::save_generated_image,
+            image_runtime::managed_image_runtime_status,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start AIIDE");

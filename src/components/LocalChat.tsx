@@ -45,9 +45,25 @@ function imageActive(job: ImageJob) {
   return job.status === 'submitting' || job.status === 'queued' || job.status === 'generating'
 }
 
+function imageConnectionLabel(status: ImageEngineStatus | null, checking: boolean) {
+  if (checking) return 'Checking…'
+  switch (status?.state) {
+    case 'ready': return 'Ready'
+    case 'busy': return 'Busy'
+    case 'managed_not_installed': return 'Not installed'
+    case 'managed_installed': return 'Installed'
+    case 'starting': return 'Starting'
+    case 'failed': return 'Failed'
+    case 'incompatible': return 'Incompatible'
+    default: return status?.engineStatus === 'reachable' ? 'Reachable' : 'Offline'
+  }
+}
+
 function unavailableImageStatus(message: string): ImageEngineStatus {
   return {
     state: 'unavailable', ready: false, endpoint: 'http://127.0.0.1:8188', model: FALLBACK_IMAGE_MODEL,
+    ownershipMode: 'external', managedState: 'disabled', managedAcquisitionEnabled: false,
+    managedMessage: 'Managed ComfyUI acquisition and execution are disabled pending approval.',
     checkpoint: FALLBACK_IMAGE_MODEL.checkpoint, busy: false, engineStatus: 'unavailable', modelStatus: 'unknown',
     hardwareStatus: 'unavailable', missingNodes: [], missingFiles: [], hardwareMessage: null, error: message,
   }
@@ -333,7 +349,7 @@ export function LocalChat({ projectOpen, projectPath, projectBusy, onOpenProject
         <div className="provider-state"><span className={`connection-dot ${connected ? 'connected' : ''}`} /><span>{ollamaProvider.name}</span><span className="connection-state">{checking ? 'Checking…' : connected ? 'Connected' : status?.state === 'error' ? 'Error' : 'Offline'}</span></div>
         <div className="workspace-controls"><label htmlFor="model">Model</label><select id="model" className="model-select" value={selectedModel} disabled={!chatReady || loading} onChange={event => { setSelectedModel(event.target.value); localStorage.setItem(MODEL_KEY, event.target.value) }}><option value="">{connected && status.models.length ? 'Select model' : 'No models'}</option>{status?.models.map(model => <option key={model.id} value={model.id}>{model.name} — {model.profile.label}</option>)}</select><button className="small-button" aria-pressed={debug} disabled={loading} onClick={() => void toggleDebug()}><span aria-hidden="true">›_</span> Debug {debug ? 'on' : 'off'}</button><button className="icon-button" aria-label="Retry Ollama connection" title="Retry connection" onClick={() => void refresh()} disabled={checking || loading}>↻</button></div>
       </> : <>
-        <div className="provider-state"><span className={`connection-dot ${imageEngine?.engineStatus === 'reachable' || imageEngine?.engineStatus === 'busy' ? 'connected' : ''}`} /><span>{comfyUiProvider.name}</span><span className="connection-state">{checkingImage ? 'Checking…' : imageEngine?.state === 'ready' ? 'Ready' : imageEngine?.state === 'busy' ? 'Busy' : imageEngine?.engineStatus === 'reachable' ? 'Reachable' : imageEngine?.state === 'incompatible' ? 'Incompatible' : 'Offline'}</span></div>
+        <div className="provider-state"><span className={`connection-dot ${imageEngine?.engineStatus === 'reachable' || imageEngine?.engineStatus === 'busy' ? 'connected' : ''}`} /><span>{comfyUiProvider.name}</span><span className="connection-state">{imageConnectionLabel(imageEngine, checkingImage)}</span></div>
         <div className="workspace-controls"><span className="image-model-label">{imageEngine?.model.displayName ?? 'SDXL 1.0 Base'} · {imageEngine?.checkpoint ?? 'sd_xl_base_1.0.safetensors'}</span>{imageNeedsAttention && imageSetupDismissed && <button className="small-button" onClick={() => setImageSetupDismissed(false)}>Configure</button>}<button className="icon-button" aria-label="Retry ComfyUI readiness" title="Retry readiness" onClick={() => void refreshImage()} disabled={checkingImage || imageSubmitting}>↻</button></div>
       </>}
     </div>

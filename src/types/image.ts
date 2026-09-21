@@ -27,13 +27,17 @@ export interface ImageModelSummary {
 }
 
 export interface ImageEngineStatus {
-  state: 'unavailable' | 'incompatible' | 'missing_nodes' | 'missing_checkpoint' | 'ready' | 'busy'
+  state: 'unavailable' | 'incompatible' | 'missing_nodes' | 'missing_checkpoint' | 'managed_not_installed' | 'managed_installed' | 'starting' | 'ready' | 'busy' | 'failed'
   ready: boolean
+  ownershipMode: 'external' | 'managed'
+  managedState: 'disabled' | 'not_installed' | 'installed' | 'starting' | 'ready' | 'failed' | 'incompatible'
+  managedAcquisitionEnabled: boolean
+  managedMessage: string | null
   endpoint: string
   model: ImageModelSummary
   checkpoint: string
   busy: boolean
-  engineStatus: 'unavailable' | 'reachable' | 'incompatible' | 'busy'
+  engineStatus: 'unavailable' | 'reachable' | 'incompatible' | 'starting' | 'busy'
   modelStatus: 'unknown' | 'missing_nodes' | 'missing_checkpoint' | 'ready'
   hardwareStatus: 'unavailable' | 'potentially_insufficient' | 'sufficient'
   missingNodes: string[]
