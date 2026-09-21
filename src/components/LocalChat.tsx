@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { save } from '@tauri-apps/plugin-dialog'
-import { Elma, type ElmaState } from './Elma'
+import { ElmaPresence, type ElmaPresentation } from './Elma'
 import { ImageResultCard } from './ImageResultCard'
 import { ImageSetupCard } from './ImageSetupCard'
 import { getAgentDebugStatus, getLatestAgentTrace, ollamaProvider, setAgentDebug } from '../services/ai/ollama'
@@ -75,7 +75,7 @@ function unavailableImageStatus(message: string): ImageEngineStatus {
   }
 }
 
-export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal, changeState }: { projectOpen: boolean; projectBusy: boolean; onOpenProject: () => void; onProposal: (proposal: PendingProposal) => void; changeState: 'working' | 'success' | 'error' | null }) {
+export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal, onChangePreparation, onElmaPresentationChange, primaryElma }: { projectOpen: boolean; projectBusy: boolean; onOpenProject: () => void; onProposal: (proposal: PendingProposal) => void; onChangePreparation: (active: boolean) => void; onElmaPresentationChange: (presentation: ElmaPresentation) => void; primaryElma: ({ presentation: ElmaPresentation; animation?: Parameters<typeof ElmaPresence>[0]['animation']; onAnimationComplete?: () => void }) | null }) {
   const [mode, setMode] = useState<'chat' | 'image'>(() => localStorage.getItem(MODE_KEY) === 'image' ? 'image' : 'chat')
   const [status, setStatus] = useState<ProviderStatus | null>(null)
   const [imageEngine, setImageEngine] = useState<ImageEngineStatus | null>(null)
@@ -92,7 +92,7 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
   const [activeSteps, setActiveSteps] = useState<string[]>([])
   const [retrying, setRetrying] = useState(false)
   const [inspecting, setInspecting] = useState(false)
-  const [terminalState, setTerminalState] = useState<'success' | 'error' | null>(null)
+  const [terminalState, setTerminalState] = useState<'success' | 'error' | 'image-complete' | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [debug, setDebug] = useState(false)
   const [hasTrace, setHasTrace] = useState(false)
@@ -129,11 +129,11 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
     if (next === 'image' && imageEngine && !imageEngine.ready) setImageSetupDismissed(false)
   }
 
-  function showTerminalState(state: 'success' | 'error', duration: number) {
+  const showTerminalState = useCallback((state: 'success' | 'error' | 'image-complete', duration: number) => {
     if (terminalTimerRef.current) clearTimeout(terminalTimerRef.current)
     setTerminalState(state)
     terminalTimerRef.current = setTimeout(() => setTerminalState(null), duration)
-  }
+  }, [])
 
   const refresh = useCallback(async () => {
     if (checkingRef.current) return
@@ -182,7 +182,7 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
     } finally { setConfiguringImage(false) }
   }
 
-  function updateImageJob(next: ImageJob) {
+  const updateImageJob = useCallback((next: ImageJob) => {
     setMessages(current => current.map(message => message.imageJob?.jobId === next.jobId ? { ...message, imageJob: next } : message))
     setImageEngine(current => current ? {
       ...current,
@@ -192,7 +192,9 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
       engineStatus: imageActive(next) ? 'busy' : 'reachable',
       error: null,
     } : current)
-  }
+    if (next.status === 'ready') showTerminalState('image-complete', SUCCESS_DISPLAY_MS)
+    if (next.status === 'failed') showTerminalState('error', ERROR_DISPLAY_MS)
+  }, [showTerminalState])
 
   function appendImageJob(job: ImageJob) {
     setImageEngine(current => current ? { ...current, busy: true, state: 'busy', engineStatus: 'busy' } : current)
@@ -237,7 +239,7 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
     inspectionTimerRef.current = setTimeout(() => setInspecting(false), INSPECTION_DISPLAY_MS)
   }); return () => { void subscription.then(unlisten => unlisten()) } }, [])
   useEffect(() => { const subscription = listen('repository-retry', () => { setInspecting(false); setRetrying(true) }); return () => { void subscription.then(unlisten => unlisten()) } }, [])
-  useEffect(() => { const subscription = listen('proposal-validation-start', () => { setInspecting(false); setRetrying(true) }); return () => { void subscription.then(unlisten => unlisten()) } }, [])
+  useEffect(() => { const subscription = listen('proposal-validation-start', () => { setInspecting(false); setRetrying(true); onChangePreparation(true) }); return () => { void subscription.then(unlisten => unlisten()) } }, [onChangePreparation])
   useEffect(() => () => {
     if (inspectionTimerRef.current) clearTimeout(inspectionTimerRef.current)
     if (terminalTimerRef.current) clearTimeout(terminalTimerRef.current)
@@ -258,13 +260,14 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
           if (!stopped) {
             const message = messageOf(cause)
             setError(message)
+            showTerminalState('error', ERROR_DISPLAY_MS)
             setImageEngine(current => current ? { ...current, state: 'unavailable', ready: false, engineStatus: 'unavailable', error: message } : current)
           }
         }).finally(() => { inFlight = false })
     }
     const timer = setInterval(poll, IMAGE_POLL_MS)
     return () => { stopped = true; clearInterval(timer) }
-  }, [activeImage])
+  }, [activeImage, showTerminalState, updateImageJob])
 
   const previewPending = messages.find(message => message.imageJob?.status === 'ready' && message.imageJob.previewAvailable && !previewUrls[message.imageJob.jobId])?.imageJob
   useEffect(() => {
@@ -292,6 +295,7 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
     setRetrying(false)
     setInspecting(false)
     setTerminalState(null)
+    onChangePreparation(false)
     if (inspectionTimerRef.current) clearTimeout(inspectionTimerRef.current)
     if (terminalTimerRef.current) clearTimeout(terminalTimerRef.current)
     setError(null)
@@ -309,7 +313,7 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
       await refresh()
     } finally {
       if (debug) { try { const state = await getAgentDebugStatus(); setHasTrace(state.hasTrace); setDebugTrace(null) } catch { setHasTrace(false) } }
-      chatSubmitRef.current = false; setLoading(false); setInspecting(false); setRetrying(false)
+      chatSubmitRef.current = false; setLoading(false); setInspecting(false); setRetrying(false); onChangePreparation(false)
     }
   }
 
@@ -330,6 +334,7 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
       setMessages(current => current.filter(message => message.conversationId !== conversationId))
       restoreDraft('image', content)
       setError(messageOf(cause))
+      showTerminalState('error', ERROR_DISPLAY_MS)
     } finally { setImageSubmitting(false) }
   }
 
@@ -358,13 +363,13 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
   async function regenerateImage(job: ImageJob) {
     if (imageSubmitRef.current || activeImage) return
     imageSubmitRef.current = true
-    setImageActionJob(job.jobId); setError(null)
+    setImageActionJob(job.jobId); setImageSubmitting(true); setError(null)
     try {
       const regenerated = await comfyUiProvider.regenerate(job.jobId)
       setMessages(current => [...current, { role: 'user', content: job.prompt, channel: 'image' }])
       appendImageJob(regenerated)
-    } catch (cause) { setError(messageOf(cause)); setImageActionJob(null) }
-    finally { imageSubmitRef.current = false; setImageActionJob(null) }
+    } catch (cause) { setError(messageOf(cause)); showTerminalState('error', ERROR_DISPLAY_MS) }
+    finally { imageSubmitRef.current = false; setImageSubmitting(false); setImageActionJob(null) }
   }
 
   async function saveImage(job: ImageJob, relativePath: string) {
@@ -409,19 +414,22 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
   const imageReady = Boolean(imageEngine?.ready) && !imageEngine?.busy && !activeImage && !loading
   const imageNeedsAttention = Boolean(imageEngine && !imageEngine.ready)
   const ready = mode === 'chat' ? chatReady : imageReady
-  const working = loading || imageSubmitting || Boolean(activeImage)
-  const elmaState: ElmaState = changeState ?? terminalState ?? (working ? inspecting ? 'inspecting' : retrying ? 'working' : imageSubmitting || activeImage ? 'working' : 'thinking' : 'idle')
-  const elmaStatus = changeState === 'working' ? 'Applying the approved change…'
-    : changeState === 'success' ? 'Change applied'
-      : changeState === 'error' || terminalState === 'error' ? 'Something went wrong'
-        : terminalState === 'success' ? 'Done'
-          : imageSubmitting ? 'Submitting image workflow…'
-            : activeImage ? activeImage.statusLabel
-              : loading && inspecting ? 'Checking files…'
-                : loading && retrying ? 'Working on it…'
-                  : loading ? 'Thinking…' : 'Ready'
+  const imagePreparing = imageSubmitting || activeImage?.status === 'submitting'
+  const elmaState: ElmaPresentation['state'] = terminalState === 'image-complete' ? 'image-complete'
+    : terminalState ?? (imagePreparing ? 'image-thinking' : activeImage ? 'image-creating' : loading ? inspecting ? 'inspecting' : 'thinking' : 'idle')
+  const elmaStatus = terminalState === 'error' ? 'Something went wrong'
+    : terminalState === 'success' ? 'Done'
+      : terminalState === 'image-complete' ? 'Image complete'
+        : imagePreparing ? 'Preparing the image workflow…'
+          : activeImage ? activeImage.statusLabel
+            : loading && inspecting ? 'Checking files…'
+              : loading && retrying ? 'Working on it…'
+                : loading ? 'Thinking…' : 'Ready'
   const currentActivity = activeSteps.at(-1)
-  const showElmaStatus = messages.length > 0 || working || Boolean(changeState) || Boolean(terminalState)
+  const elmaActivity = loading ? currentActivity : undefined
+  useEffect(() => {
+    onElmaPresentationChange({ state: elmaState, status: elmaStatus, activity: elmaActivity })
+  }, [elmaState, elmaStatus, elmaActivity, onElmaPresentationChange])
   const placeholder = mode === 'image'
     ? imageReady ? 'Describe an image to generate locally…' : imageEngine?.error ?? 'Connect ComfyUI to generate images'
     : chatReady ? 'Ask Elma about this project…' : 'Connect Ollama and select a model to chat'
@@ -492,27 +500,17 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
       </div>
     )}
 
-    {showElmaStatus && (
-      <div className="elma-status">
-        <Elma state={elmaState} size="presence" />
-        <div>
-          <strong>{elmaStatus}</strong>
-          {loading && currentActivity && (
-            <span>{currentActivity}</span>
-          )}
-        </div>
-      </div>
-    )}
+    {primaryElma && <ElmaPresence {...primaryElma} />}
     <div className="chat-history">
-      {!projectOpen && mode === 'chat' && messages.length === 0 && <div className="chat-empty welcome-state"><Elma state="idle" size="hero" /><span className="eyebrow">LOCAL-FIRST CODING COMPANION</span><h2>Open a project and we'll take a look</h2><p>Elma can inspect your project, prepare focused changes, or switch to Image without opening a folder.</p><button className="primary-button" disabled={projectBusy} onClick={onOpenProject}><span aria-hidden="true">▣</span> {projectBusy ? 'Opening…' : 'Open project'}</button></div>}
+      {!projectOpen && mode === 'chat' && messages.length === 0 && <div className="chat-empty welcome-state"><span className="eyebrow">LOCAL-FIRST CODING COMPANION</span><h2>Open a project and we'll take a look</h2><p>Elma can inspect your project, prepare focused changes, or switch to Image without opening a folder.</p><button className="primary-button" disabled={projectBusy} onClick={onOpenProject}><span aria-hidden="true">▣</span> {projectBusy ? 'Opening…' : 'Open project'}</button></div>}
       {projectOpen && mode === 'chat' && !status && <div className="chat-empty">Checking for a local Ollama service…</div>}
       {projectOpen && mode === 'chat' && status?.state === 'offline' && <div className="chat-empty"><h2>Ollama not detected</h2><p>Start your local Ollama service, then try again.</p><button className="primary-button" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
       {projectOpen && mode === 'chat' && status?.state === 'error' && <div className="chat-empty"><h2>Ollama connection issue</h2><p>{status.error?.message}</p><button className="primary-button" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
       {projectOpen && mode === 'chat' && connected && !status.models.length && <div className="chat-empty"><h2>No local models installed</h2><p>Ollama is connected, but no local models are installed. Pull a model with the Ollama CLI, then retry.</p></div>}
       {mode === 'image' && !imageEngine && <div className="chat-empty">Checking the ComfyUI engine and selected model…</div>}
       {mode === 'image' && imageEngine && !imageSetupDismissed && !activeImage && <ImageSetupCard status={imageEngine} checking={checkingImage} saving={configuringImage} onRetry={() => void refreshImage()} onConnect={configureImage} onDismiss={() => setImageSetupDismissed(true)} />}
-      {projectOpen && mode === 'chat' && chatReady && messages.length === 0 && <div className="chat-empty project-start"><Elma state="idle" size="hero" /><span className="eyebrow">READY TO HAVE A LOOK</span><h2>What are we working on?</h2><p>I can inspect this project, explain what I find, or prepare a focused edit for review.</p><div className="starter-prompts">{STARTER_PROMPTS.map(starter => <button key={starter} onClick={() => setPrompt(starter)}>{starter}<span aria-hidden="true">→</span></button>)}</div></div>}
-      {mode === 'image' && imageReady && (!imageNeedsAttention || imageSetupDismissed) && messages.length === 0 && <div className="chat-empty project-start"><Elma state="idle" size="hero" /><span className="eyebrow">LOCAL SDXL · REVIEW BEFORE SAVE</span><h2>What should we make?</h2><p>Describe one image. Readiness checks passed, but only a real GPU generation can confirm acceptance.</p></div>}
+      {projectOpen && mode === 'chat' && chatReady && messages.length === 0 && <div className="chat-empty project-start"><span className="eyebrow">READY TO HAVE A LOOK</span><h2>What are we working on?</h2><p>I can inspect this project, explain what I find, or prepare a focused edit for review.</p><div className="starter-prompts">{STARTER_PROMPTS.map(starter => <button key={starter} onClick={() => setPrompt(starter)}>{starter}<span aria-hidden="true">→</span></button>)}</div></div>}
+      {mode === 'image' && imageReady && (!imageNeedsAttention || imageSetupDismissed) && messages.length === 0 && <div className="chat-empty project-start"><span className="eyebrow">LOCAL SDXL · REVIEW BEFORE SAVE</span><h2>What should we make?</h2><p>Describe one image. Readiness checks passed, but only a real GPU generation can confirm acceptance.</p></div>}
       {messages.map((message, index) => <div className={`chat-message chat-message-${message.role}`} key={message.imageJob?.jobId ?? index}><div className="chat-speaker"><span>{message.role === 'user' ? 'YOU' : 'ELMA'}</span>{message.role === 'assistant' && message.model && <small>{message.model}</small>}{message.channel === 'image' && <small>IMAGE</small>}</div>{Boolean(message.activity?.length) && <details className="message-activity"><summary>Inspected {message.activity?.length} items</summary><ul>{message.activity?.map((item, step) => <li key={step}>✓ {item.label}</li>)}</ul></details>}{message.content && <div className="message-body">{message.content}</div>}{message.imageJob && <ImageResultCard job={message.imageJob} previewUrl={previewUrls[message.imageJob.jobId]} outcome={message.imageOutcome ?? null} busy={imageActionJob === message.imageJob.jobId} projectOpen={projectOpen} onCancel={() => void cancelImage(message.imageJob!)} onReject={() => void rejectImage(message.imageJob!)} onRegenerate={() => void regenerateImage(message.imageJob!)} onSave={path => void saveImage(message.imageJob!, path)} onSaveAs={() => void saveImageAs(message.imageJob!)} onReveal={path => void revealImage(path)} />}</div>)}
       {loading && <div className="chat-message activity-message"><div>{retrying ? 'Working on it…' : inspecting ? 'Checking files…' : activeSteps.length ? 'Preparing an answer…' : 'Thinking…'}</div>{activeSteps.map((step, index) => <div className="activity-step" key={index}>✓ {step}</div>)}</div>}
       {imageSubmitting && <div className="chat-message activity-message">Submitting the fixed SDXL workflow to ComfyUI…</div>}

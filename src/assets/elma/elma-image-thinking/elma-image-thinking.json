@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "name": "elma-image-thinking",
+  "frameCount": 8,
+  "fps": 6,
+  "frameDurationMs": 166.66666666666666,
+  "spriteSheet": "elma-image-thinking.png",
+  "sheet": {
+    "width": 1464,
+    "height": 228
+  },
+  "cell": {
+    "width": 183,
+    "height": 228
+  },
+  "layout": "horizontal",
+  "frames": [
+    {
+      "slot": 1,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 183,
+        "height": 228
+      }
+    },
+    {
+      "slot": 2,
+      "rect": {
+        "x": 183,
+        "y": 0,
+        "width": 183,
+        "height": 228
+      }
+    },
+    {
+      "slot": 3,
+      "rect": {
+        "x": 366,
+        "y": 0,
+        "width": 183,
+        "height": 228
+      }
+    },
+    {
+      "slot": 4,
+      "rect": {
+        "x": 549,
+        "y": 0,
+        "width": 183,
+        "height": 228
+      }
+    },
+    {
+      "slot": 5,
+      "rect": {
+        "x": 732,
+        "y": 0,
+        "width": 183,
+        "height": 228
+      }
+    },
+    {
+      "slot": 6,
+      "rect": {
+        "x": 915,
+        "y": 0,
+        "width": 183,
+        "height": 228
+      }
+    },
+    {
+      "slot": 7,
+      "rect": {
+        "x": 1098,
+        "y": 0,
+        "width": 183,
+        "height": 228
+      }
+    },
+    {
+      "slot": 8,
+      "rect": {
+        "x": 1281,
+        "y": 0,
+        "width": 183,
+        "height": 228
+      }
+    }
+  ]
+}
