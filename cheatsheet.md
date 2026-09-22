@@ -75,3 +75,10 @@ cargo test --manifest-path src-tauri/Cargo.toml
 git diff --check
 git status --short
 ```
+
+## Image Generation
+
+```powershell
+cd C:\ComfyUI_windows_portable
+.\python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build --lowvram
+```
