@@ -162,19 +162,23 @@ enum SelectionOutcome { Selected(CandidateView), Ambiguous, NoMatch }
 struct ReplacementReply { replacement: String }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum CandidateEditRoute { Legacy, Heading, Unsupported }
+enum CandidateEditRoute { Legacy, Text(CandidateRole), Unsupported }
 
-fn candidate_heading_edit_route(prompt: &str, intent: RequestIntent) -> CandidateEditRoute {
+fn candidate_text_edit_route(prompt: &str, intent: RequestIntent) -> CandidateEditRoute {
     if intent != RequestIntent::Edit { return CandidateEditRoute::Legacy; }
     let lower = prompt.trim().to_ascii_lowercase();
-    let heading = ["main page heading", "main heading", "visible h1", "visible heading"]
-        .iter().any(|target| lower.contains(target));
-    if !heading { return CandidateEditRoute::Legacy; }
+    let role = if ["main page heading", "main heading", "visible h1", "visible heading"].iter().any(|target| lower.contains(target)) {
+        CandidateRole::HeadingOne
+    } else if ["document title", "page title", "browser title"].iter().any(|target| lower.contains(target)) {
+        CandidateRole::DocumentTitle
+    } else if ["paragraph", "intro text", "introductory text"].iter().any(|target| lower.contains(target)) {
+        CandidateRole::Paragraph
+    } else { return CandidateEditRoute::Legacy; };
     let structural = ["preserve", "retain", "span", "markup", "<h1", "html", " tag", "attribute", " class", "style", "format", "bold", "emphasis", "link"]
         .iter().any(|term| lower.contains(term));
     let direct_replacement = ["change", "replace", "rename", "set", "update"].iter().any(|verb| lower.contains(verb))
         && (lower.contains(" to ") || lower.contains(" with "));
-    if structural || !direct_replacement { CandidateEditRoute::Unsupported } else { CandidateEditRoute::Heading }
+    if structural || !direct_replacement { CandidateEditRoute::Unsupported } else { CandidateEditRoute::Text(role) }
 }
 
 fn requests_candidate_selection(prompt: &str, intent: RequestIntent) -> bool {
@@ -264,8 +268,8 @@ async fn generate_candidate_replacement(provider: &impl ModelProvider, model: &s
     let candidate = registry.verify_current(root, candidate_id)?;
     let schema = replacement_schema();
     let messages = [
-        ChatMessage { role: "system".into(), content: "Generate only the complete plain-text replacement for the selected visible h1 content. Do not return HTML, markdown, a path, old text, a source range, a summary, or a proposal. Do not preserve or recreate nested markup. Return exactly one JSON object with the single field replacement.".into() },
-        ChatMessage { role: "user".into(), content: format!("Original request: {prompt}\n\nSelected h1 inner source:\n{}", candidate.original()) },
+        ChatMessage { role: "system".into(), content: "Generate only the complete plain-text replacement for the selected existing text candidate. Do not return HTML, markdown, a path, old text, a source range, a summary, or a proposal. Do not preserve or recreate nested markup. Return exactly one JSON object with the single field replacement.".into() },
+        ChatMessage { role: "user".into(), content: format!("Original request: {prompt}\n\nSelected text candidate ({}):\n{}", candidate.description(), candidate.original()) },
     ];
     debug_log(trace, "generation", format!("Candidate replacement call started\nSchema supplied: {schema}"));
     let response = chat_turn(provider, model, &messages, schema, PROTOCOL_TEMPERATURE, "CANDIDATE REPLACEMENT", false, trace).await?;
@@ -277,23 +281,23 @@ async fn generate_candidate_replacement(provider: &impl ModelProvider, model: &s
     Ok(reply.replacement)
 }
 
-async fn run_candidate_heading_edit(provider: &impl ModelProvider, model: String, prompt: &str, root: &std::path::Path, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<ChatResponse, String> {
+async fn run_candidate_text_edit(provider: &impl ModelProvider, model: String, prompt: &str, required_role: CandidateRole, root: &std::path::Path, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<ChatResponse, String> {
     if let Some(app) = app { let _ = app.emit("repository-inspection-start", ()); }
     let mut registry = CandidateRegistry::new();
     let count = repository::discover_html_candidates(root, &mut registry)?;
     let activity_item = Activity { label: format!("Discovered {count} verified HTML targets") };
     if let Some(app) = app { let _ = app.emit("repository-activity", &activity_item); }
     let activity = vec![activity_item];
-    let selected = match select_candidate(provider, &model, prompt, root, &registry, Some(CandidateRole::HeadingOne), trace).await? {
+    let selected = match select_candidate(provider, &model, prompt, root, &registry, Some(required_role), trace).await? {
         SelectionOutcome::Selected(view) => view,
-        SelectionOutcome::Ambiguous => return Ok(ChatResponse { model, content: "I found multiple plausible visible headings. Please clarify which heading you mean.".into(), activity, proposal: None }),
-        SelectionOutcome::NoMatch => return Ok(ChatResponse { model, content: "I found no verified visible h1 matching that request.".into(), activity, proposal: None }),
+        SelectionOutcome::Ambiguous => return Ok(ChatResponse { model, content: "I found multiple plausible text targets. Please clarify which one you mean.".into(), activity, proposal: None }),
+        SelectionOutcome::NoMatch => return Ok(ChatResponse { model, content: "I found no verified existing text matching that request.".into(), activity, proposal: None }),
     };
-    if selected.role != CandidateRole::HeadingOne { return Err("Selected candidate is not a visible h1.".into()); }
+    if selected.role != required_role { return Err("Selected candidate does not match the requested text target.".into()); }
     let replacement = generate_candidate_replacement(provider, &model, prompt, root, &registry, &selected.id, trace).await?;
     if let Some(app) = app { let _ = app.emit("proposal-validation-start", ()); }
     let proposal = repository::validate_candidate_proposal(
-        root, &registry, &selected.id, format!("Update the visible h1 heading in {}.", selected.path), replacement,
+        root, &registry, &selected.id, format!("Update the {} in {}.", selected.description.to_ascii_lowercase(), selected.path), replacement,
     )?;
     if let Some(pending) = pending {
         *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone());
@@ -786,14 +790,14 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
             proposal: None,
         });
     }
-    match candidate_heading_edit_route(&last_prompt, plan.intent) {
-        CandidateEditRoute::Heading if root.is_some() => {
-            return run_candidate_heading_edit(provider, model, &last_prompt, root.as_deref().unwrap(), pending, app, debug_trace).await;
+    match candidate_text_edit_route(&last_prompt, plan.intent) {
+        CandidateEditRoute::Text(role) if root.is_some() => {
+            return run_candidate_text_edit(provider, model, &last_prompt, role, root.as_deref().unwrap(), pending, app, debug_trace).await;
         }
         CandidateEditRoute::Unsupported if root.is_some() => {
-            return Ok(ChatResponse { model, content: "This first application-led heading editor only supports replacing the complete visible h1 content with plain text. It cannot preserve or rearrange nested markup.".into(), activity: vec![], proposal: None });
+            return Ok(ChatResponse { model, content: "This application-led text editor only supports replacing the complete text of an existing title, heading, or paragraph. It cannot preserve or rearrange nested markup.".into(), activity: vec![], proposal: None });
         }
-        CandidateEditRoute::Legacy | CandidateEditRoute::Heading | CandidateEditRoute::Unsupported => {}
+        CandidateEditRoute::Legacy | CandidateEditRoute::Text(_) | CandidateEditRoute::Unsupported => {}
     }
     let selection_requested = requests_candidate_selection(&last_prompt, plan.intent);
     debug_log(debug_trace, "agent", format!("Current request plan: scope={:?}, intent={:?}", plan.scope, plan.intent));
@@ -1567,6 +1571,28 @@ mod tests {
     }
 
     #[test]
+    fn application_led_paragraph_edit_uses_app_owned_source_range() {
+        let root = grounding_fixture("candidate-paragraph-edit");
+        let original = "<head><title>OrbitNote</title></head>\n<body><h1>Welcome</h1><p>Keep this paragraph.</p></body>";
+        std::fs::write(root.join("src/index.html"), original).unwrap();
+        let pending = PendingChanges::default();
+        let provider = StubProvider::new(&["test-model"], &[
+            "__SELECT_PARAGRAPH__",
+            r#"{"replacement":"A clearer introduction."}"#,
+        ]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Replace the introductory paragraph with a clearer introduction.".into() }],
+            Some(root.clone()), Some(&pending), None, None,
+        )).unwrap();
+        let proposal = response.proposal.expect("candidate edit should prepare a proposal");
+        assert_eq!(proposal.changes[0].before, original);
+        assert_eq!(proposal.changes[0].after, "<head><title>OrbitNote</title></head>\n<body><h1>Welcome</h1><p>A clearer introduction.</p></body>");
+        assert!(pending.0.lock().unwrap().is_some());
+        assert!(!provider.requests.lock().unwrap()[1].iter().any(|message| message.content.contains("old_text")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn candidate_edit_failures_do_not_enter_the_legacy_proposal_path() {
         for (label, selection, expected) in [
             ("unknown", r#"{"result":"selected","candidate_id":"unknown"}"#, "Unknown candidate ID."),
@@ -1599,9 +1625,11 @@ mod tests {
 
     #[test]
     fn heading_capability_gate_rejects_markup_work_and_leaves_other_edits_on_legacy() {
-        assert_eq!(candidate_heading_edit_route("Change the main page heading to Welcome", RequestIntent::Edit), CandidateEditRoute::Heading);
-        assert_eq!(candidate_heading_edit_route("Change the main heading to Welcome but preserve the span", RequestIntent::Edit), CandidateEditRoute::Unsupported);
-        assert_eq!(candidate_heading_edit_route("Improve the signup form accessibility", RequestIntent::Edit), CandidateEditRoute::Legacy);
+        assert_eq!(candidate_text_edit_route("Change the main page heading to Welcome", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::HeadingOne));
+        assert_eq!(candidate_text_edit_route("Change the page title to OrbitNote", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::DocumentTitle));
+        assert_eq!(candidate_text_edit_route("Replace the introductory paragraph with a clearer welcome", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::Paragraph));
+        assert_eq!(candidate_text_edit_route("Change the main heading to Welcome but preserve the span", RequestIntent::Edit), CandidateEditRoute::Unsupported);
+        assert_eq!(candidate_text_edit_route("Improve the signup form accessibility", RequestIntent::Edit), CandidateEditRoute::Legacy);
         let root = grounding_fixture("unsupported-heading-markup");
         let provider = StubProvider::new(&["test-model"], &[]);
         let response = tauri::async_runtime::block_on(run_agent_with_provider(
