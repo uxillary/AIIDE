@@ -20,4 +20,4 @@ Desktop.ini
 *.local
 package-lock.json
 docs/openrouterai.txt
-files
+/files
