@@ -23,6 +23,12 @@ pub enum CandidateRole {
     Link,
     Label,
     ListItem,
+    AttributeHref,
+    AttributeSrc,
+    AttributeAlt,
+    AttributeTitle,
+    AttributePlaceholder,
+    AttributeAriaLabel,
 }
 
 impl CandidateRole {
@@ -35,7 +41,17 @@ impl CandidateRole {
             Self::Link => "Link text",
             Self::Label => "Label text",
             Self::ListItem => "List item text",
+            Self::AttributeHref => "href attribute value",
+            Self::AttributeSrc => "src attribute value",
+            Self::AttributeAlt => "alt attribute value",
+            Self::AttributeTitle => "title attribute value",
+            Self::AttributePlaceholder => "placeholder attribute value",
+            Self::AttributeAriaLabel => "aria-label attribute value",
         }
+    }
+
+    pub fn is_attribute(self) -> bool {
+        matches!(self, Self::AttributeHref | Self::AttributeSrc | Self::AttributeAlt | Self::AttributeTitle | Self::AttributePlaceholder | Self::AttributeAriaLabel)
     }
 }
 
@@ -48,7 +64,7 @@ pub struct Candidate {
     range: Range<usize>,
     original: String,
     role: CandidateRole,
-    description: &'static str,
+    description: String,
     before_context: String,
     after_context: String,
 }
@@ -59,7 +75,7 @@ impl Candidate {
     pub fn range(&self) -> Range<usize> { self.range.clone() }
     pub fn original(&self) -> &str { &self.original }
     pub fn role(&self) -> CandidateRole { self.role }
-    pub fn description(&self) -> &str { self.description }
+    pub fn description(&self) -> &str { &self.description }
     pub fn before_context(&self) -> &str { &self.before_context }
     pub fn after_context(&self) -> &str { &self.after_context }
 }
@@ -124,14 +140,16 @@ impl CandidateRegistry {
         let found = extract_html(&text, MAX_CANDIDATES - self.candidates.len());
         let count = found.len();
         let snapshot_index = self.snapshots.len();
-        for (role, range) in found {
+        for seed in found {
+            let role = seed.role;
+            let range = seed.range;
             let original = text[range.clone()].to_owned();
-            let before_context = bounded_suffix(&text[..range.start], MAX_CANDIDATE_CONTEXT_BYTES);
+            let before_context = if role.is_attribute() { seed.context } else { bounded_suffix(&text[..range.start], MAX_CANDIDATE_CONTEXT_BYTES) };
             let after_context = bounded_prefix(&text[range.end..], MAX_CANDIDATE_CONTEXT_BYTES);
             self.candidates.push(Candidate {
                 id: format!("c{:016x}{:04x}", self.request_id, self.candidates.len() + 1),
                 path: verified_path.clone(), snapshot_index, range, original, role,
-                description: role.description(), before_context, after_context,
+                description: if role.is_attribute() { format!("{} on <{}>", role.description(), seed.element) } else { role.description().to_owned() }, before_context, after_context,
             });
         }
         self.snapshots.push(SourceSnapshot { path: verified_path, text });
@@ -160,7 +178,7 @@ impl CandidateRegistry {
     }
 
     pub fn model_view(&self) -> Vec<CandidateView> {
-        let mut role_counts = [0; 7];
+        let mut role_counts = [0; 13];
         self.candidates.iter().map(|candidate| {
             let snapshot = &self.snapshots[candidate.snapshot_index].text;
             let role_slot = match candidate.role {
@@ -171,13 +189,19 @@ impl CandidateRegistry {
                 CandidateRole::Link => 4,
                 CandidateRole::Label => 5,
                 CandidateRole::ListItem => 6,
+                CandidateRole::AttributeHref => 7,
+                CandidateRole::AttributeSrc => 8,
+                CandidateRole::AttributeAlt => 9,
+                CandidateRole::AttributeTitle => 10,
+                CandidateRole::AttributePlaceholder => 11,
+                CandidateRole::AttributeAriaLabel => 12,
             };
             role_counts[role_slot] += 1;
             CandidateView {
                 id: candidate.id.clone(), role: candidate.role, role_index: role_counts[role_slot], path: candidate.path.clone(),
                 start_line: line_at(snapshot, candidate.range.start),
                 end_line: line_at(snapshot, candidate.range.end.saturating_sub(1)),
-                description: candidate.description.to_owned(),
+                description: candidate.description.clone(),
                 excerpt: excerpt(&candidate.original),
                 before_context: candidate.before_context.clone(),
             }
@@ -214,6 +238,7 @@ fn excerpt(text: &str) -> String {
 struct Tag<'a> {
     name: &'a str,
     attributes: &'a str,
+    attributes_start: usize,
     end: usize,
     closing: bool,
     self_closing: bool,
@@ -243,7 +268,7 @@ fn parse_tag(text: &str, start: usize) -> Option<Tag<'_>> {
     let attributes = &text[name_end..cursor];
     if closing && !attributes.trim().is_empty() { return None; }
     Some(Tag {
-        name: &text[name_start..name_end], attributes, end: cursor + 1, closing,
+        name: &text[name_start..name_end], attributes, attributes_start: name_end, end: cursor + 1, closing,
         self_closing: attributes.trim_end().ends_with('/'),
     })
 }
@@ -265,10 +290,76 @@ fn heading_inline_element(name: &str) -> bool {
     matches!(name, "span" | "em" | "strong" | "b" | "i" | "small" | "mark" | "code")
 }
 
+fn attribute_role(element: &str, attribute: &str) -> Option<CandidateRole> {
+    match (element, attribute) {
+        ("a", "href") => Some(CandidateRole::AttributeHref),
+        ("img", "src") => Some(CandidateRole::AttributeSrc),
+        ("img", "alt") => Some(CandidateRole::AttributeAlt),
+        ("a" | "button" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "img" | "input" | "label" | "li" | "p" | "select" | "textarea", "title") => Some(CandidateRole::AttributeTitle),
+        ("input" | "textarea", "placeholder") => Some(CandidateRole::AttributePlaceholder),
+        ("a" | "button" | "img" | "input" | "label" | "select" | "textarea", "aria-label") => Some(CandidateRole::AttributeAriaLabel),
+        _ => None,
+    }
+}
+
+fn attribute_candidates(text: &str, tag: &Tag<'_>, limit: usize) -> Vec<CandidateSeed> {
+    if limit == 0 { return Vec::new(); }
+    let bytes = tag.attributes.as_bytes();
+    let mut cursor = 0;
+    let mut found: Vec<(CandidateRole, Range<usize>, String, String)> = Vec::new();
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    while cursor < bytes.len() {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) { cursor += 1; }
+        if cursor >= bytes.len() || bytes[cursor] == b'/' { break; }
+        let name_start = cursor;
+        while bytes.get(cursor).is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':')) { cursor += 1; }
+        if name_start == cursor { return Vec::new(); }
+        let attribute = tag.attributes[name_start..cursor].to_ascii_lowercase();
+        let role = attribute_role(&tag.name.to_ascii_lowercase(), &attribute);
+        if role.is_some() { *counts.entry(attribute.clone()).or_default() += 1; }
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) { cursor += 1; }
+        if bytes.get(cursor) != Some(&b'=') { continue; }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) { cursor += 1; }
+        let Some(&quote @ (b'\'' | b'"')) = bytes.get(cursor) else {
+            while bytes.get(cursor).is_some_and(|byte| !byte.is_ascii_whitespace()) { cursor += 1; }
+            continue;
+        };
+        cursor += 1;
+        let value_start = cursor;
+        while bytes.get(cursor).is_some_and(|byte| *byte != quote) { cursor += 1; }
+        if cursor >= bytes.len() { return Vec::new(); }
+        let value_end = cursor;
+        cursor += 1;
+        if let Some(role) = role {
+            let element = tag.name.to_ascii_lowercase();
+            let context = simple_element_text(text, tag.end, &element).unwrap_or_default();
+            found.push((role, tag.attributes_start + value_start..tag.attributes_start + value_end, element, context));
+        }
+    }
+    found.into_iter().filter(|(role, range, _, _)| {
+        let attr = role.description().split_whitespace().next().unwrap_or_default();
+        counts.get(attr).copied().unwrap_or(0) == 1 && range.start <= range.end && range.len() <= MAX_CANDIDATE_SOURCE_BYTES
+            && text.is_char_boundary(range.start) && text.is_char_boundary(range.end)
+    }).take(limit).map(|(role, range, element, context)| CandidateSeed { role, range, element, context }).collect()
+}
+
+fn simple_element_text(text: &str, content_start: usize, element: &str) -> Option<String> {
+    let closing = format!("</{element}");
+    let remainder = &text[content_start..];
+    let offset = remainder.to_ascii_lowercase().find(&closing)?;
+    let content = &remainder[..offset];
+    if content.contains('<') { return None; }
+    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() { return None; }
+    Some(bounded_prefix(&collapsed, MAX_CANDIDATE_CONTEXT_BYTES))
+}
+
 struct OpenElement { name: String, hidden: bool }
 struct OpenCandidate { role: CandidateRole, start: usize, depth: usize, inline_tags: usize, supported: bool }
+struct CandidateSeed { role: CandidateRole, range: Range<usize>, element: String, context: String }
 
-fn extract_html(text: &str, limit: usize) -> Vec<(CandidateRole, Range<usize>)> {
+fn extract_html(text: &str, limit: usize) -> Vec<CandidateSeed> {
     let mut found = Vec::new();
     let mut stack: Vec<OpenElement> = Vec::new();
     let mut active: Option<OpenCandidate> = None;
@@ -306,7 +397,17 @@ fn extract_html(text: &str, limit: usize) -> Vec<(CandidateRole, Range<usize>)> 
                     let range = candidate.start..start;
                     if candidate.supported && range.len() <= MAX_CANDIDATE_SOURCE_BYTES
                         && !text[range.clone()].trim().is_empty() {
-                        found.push((candidate.role, range));
+                        let element = match candidate.role {
+                            CandidateRole::DocumentTitle => "title",
+                            CandidateRole::HeadingOne => "h1",
+                            CandidateRole::Paragraph => "p",
+                            CandidateRole::Button => "button",
+                            CandidateRole::Link => "a",
+                            CandidateRole::Label => "label",
+                            CandidateRole::ListItem => "li",
+                            _ => "",
+                        };
+                        found.push(CandidateSeed { role: candidate.role, range, element: element.to_owned(), context: String::new() });
                     }
                 } else {
                     active = Some(candidate);
@@ -325,6 +426,9 @@ fn extract_html(text: &str, limit: usize) -> Vec<(CandidateRole, Range<usize>)> 
             if !supported_inline { candidate.supported = false; }
         }
         let excluded = stack.iter().any(|open| open.hidden || matches!(open.name.as_str(), "head" | "script" | "style" | "template" | "noscript" | "svg" | "textarea"));
+        if !hidden && !excluded && found.len() < limit {
+            found.extend(attribute_candidates(text, &tag, limit - found.len()));
+        }
         let role = match name.as_str() {
             "title" if !stack.iter().any(|open| open.hidden || matches!(open.name.as_str(), "body" | "script" | "style" | "template" | "noscript" | "svg" | "textarea")) => Some(CandidateRole::DocumentTitle),
             "h1" if !excluded => Some(CandidateRole::HeadingOne),
@@ -397,10 +501,10 @@ mod tests {
         let html = "<html><body><button>Save changes</button><a href='/home'>Home</a><label>Name</label><ul><li>First item</li></ul></body></html>";
         let root = fixture(html);
         let mut registry = CandidateRegistry::new();
-        assert_eq!(registry.discover_html(&root, "page.html").unwrap(), 4);
+        assert_eq!(registry.discover_html(&root, "page.html").unwrap(), 5);
         let views = registry.model_view();
-        assert_eq!(views.iter().map(|view| view.role).collect::<Vec<_>>(), [CandidateRole::Button, CandidateRole::Link, CandidateRole::Label, CandidateRole::ListItem]);
-        for (view, expected) in views.iter().zip(["Save changes", "Home", "Name", "First item"]) {
+        assert_eq!(views.iter().map(|view| view.role).collect::<Vec<_>>(), [CandidateRole::Button, CandidateRole::AttributeHref, CandidateRole::Link, CandidateRole::Label, CandidateRole::ListItem]);
+        for (view, expected) in views.iter().zip(["Save changes", "/home", "Home", "Name", "First item"]) {
             let candidate = registry.candidate(&view.id).unwrap();
             assert_eq!(&html[candidate.range()], expected);
             assert_eq!(candidate.original(), expected);
@@ -412,8 +516,48 @@ mod tests {
     fn control_candidate_with_nested_markup_is_not_exposed() {
         let root = fixture("<body><button><span>Save</span></button><a href='/home'>Home</a></body>");
         let mut registry = CandidateRegistry::new();
-        assert_eq!(registry.discover_html(&root, "page.html").unwrap(), 1);
-        assert_eq!(registry.model_view()[0].role, CandidateRole::Link);
+        assert_eq!(registry.discover_html(&root, "page.html").unwrap(), 2);
+        let roles = registry.model_view().iter().map(|view| view.role).collect::<Vec<_>>();
+        assert_eq!(roles, [CandidateRole::AttributeHref, CandidateRole::Link]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn allowlisted_attribute_candidates_capture_only_quoted_value_bytes() {
+        let html = "<body><a href=\"/old\" title='Join us' aria-label=\"Open signup\">Join</a><img src='/hero.png' alt=\"A &amp; B\"><input placeholder=\"you@example.com\"></body>";
+        let root = fixture(html);
+        let mut registry = CandidateRegistry::new();
+        registry.discover_html(&root, "page.html").unwrap();
+        let views = registry.model_view();
+        for (role, expected) in [
+            (CandidateRole::AttributeHref, "/old"),
+            (CandidateRole::AttributeTitle, "Join us"),
+            (CandidateRole::AttributeAriaLabel, "Open signup"),
+            (CandidateRole::AttributeSrc, "/hero.png"),
+            (CandidateRole::AttributeAlt, "A &amp; B"),
+            (CandidateRole::AttributePlaceholder, "you@example.com"),
+        ] {
+            let view = views.iter().find(|view| view.role == role).unwrap();
+            let candidate = registry.candidate(&view.id).unwrap();
+            assert_eq!(&html[candidate.range()], expected);
+            assert!(!view.before_context.contains("href=") && !view.before_context.contains("alt=") && !view.before_context.contains("placeholder="), "attribute syntax should not be exposed as source context");
+            assert!(view.description.contains('<') && view.description.contains('>'));
+        }
+        assert!(views.iter().find(|view| view.role == CandidateRole::AttributeHref).unwrap().description.contains("<a>"));
+        assert_eq!(views.iter().find(|view| view.role == CandidateRole::AttributeHref).unwrap().before_context, "Join");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_or_unquoted_allowlisted_attributes_are_not_candidates() {
+        let root = fixture("<body><a href='/first' href=/second>Join</a><img src=/hero.png alt='Hero'><input placeholder=you@example.com></body>");
+        let mut registry = CandidateRegistry::new();
+        registry.discover_html(&root, "page.html").unwrap();
+        let roles = registry.model_view().into_iter().map(|view| view.role).collect::<Vec<_>>();
+        assert!(!roles.contains(&CandidateRole::AttributeHref));
+        assert!(!roles.contains(&CandidateRole::AttributeSrc));
+        assert!(!roles.contains(&CandidateRole::AttributePlaceholder));
+        assert!(roles.contains(&CandidateRole::AttributeAlt));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -452,8 +596,8 @@ mod tests {
         let many = format!("<h1>{}</h1>", "<span>x</span>".repeat(MAX_HEADING_INLINE_TAGS + 1));
         let html = format!("<h1>safe <em>emphasis</em></h1><h1>link <a href=\"#\">text</a></h1><h1>hidden <span hidden>text</span></h1><h1>broken <span>text</h1>{deep}{many}");
         let found = extract_html(&html, MAX_CANDIDATES);
-        assert_eq!(found.len(), 1);
-        assert_eq!(&html[found[0].1.clone()], "safe <em>emphasis</em>");
+        assert_eq!(found.len(), 2);
+        assert_eq!(found.iter().find(|candidate| candidate.role == CandidateRole::HeadingOne).map(|candidate| &html[candidate.range.clone()]), Some("safe <em>emphasis</em>"));
     }
 
     #[test]

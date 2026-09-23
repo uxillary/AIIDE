@@ -177,6 +177,15 @@ pub fn validate_candidate_proposal(root: &Path, registry: &CandidateRegistry, ca
     if before.get(range.clone()) != Some(original.as_str()) {
         return Err("Candidate source range is invalid.".into());
     }
+    if candidate.role().is_attribute() {
+        if replacement.chars().any(char::is_control) {
+            return Err("Attribute replacement contains unsupported control characters.".into());
+        }
+        if matches!(candidate.role(), candidates::CandidateRole::AttributeHref | candidates::CandidateRole::AttributeSrc)
+            && !safe_attribute_url(candidate.role(), replacement.trim()) {
+            return Err("Attribute URL uses an unsupported or unsafe scheme.".into());
+        }
+    }
     let replacement = escape_html_text(&replacement);
     if path.len() + original.len() + replacement.len() > MAX_PROPOSAL_BYTES {
         return Err("Proposal exceeds the size limit.".into());
@@ -187,6 +196,29 @@ pub fn validate_candidate_proposal(root: &Path, registry: &CandidateRegistry, ca
     after.push_str(&replacement);
     after.push_str(&before[range.end..]);
     Ok(PendingProposal { summary: summary.trim().to_owned(), changes: vec![PendingChange { path, before, after, replacements: 1 }] })
+}
+
+fn safe_attribute_url(role: candidates::CandidateRole, value: &str) -> bool {
+    if value.is_empty() { return false; }
+    let Some((scheme, _)) = value.split_once(':') else { return true; };
+    let first_path_delimiter = value.find(|character| matches!(character, '/' | '?' | '#')).unwrap_or(value.len());
+    if value.find(':').unwrap_or(value.len()) > first_path_delimiter { return true; }
+    if scheme.is_empty() || !scheme.as_bytes()[0].is_ascii_alphabetic()
+        || !scheme.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')) {
+        return false;
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    let remainder = value.split_once(':').map_or("", |(_, remainder)| remainder);
+    match role {
+        candidates::CandidateRole::AttributeHref => match scheme.as_str() {
+            "http" | "https" => remainder.strip_prefix("//").is_some_and(|authority| !authority.split(|character| matches!(character, '/' | '?' | '#')).next().unwrap_or_default().is_empty()),
+            "mailto" | "tel" => !remainder.trim().is_empty(),
+            _ => false,
+        },
+        candidates::CandidateRole::AttributeSrc => matches!(scheme.as_str(), "http" | "https")
+            && remainder.strip_prefix("//").is_some_and(|authority| !authority.split(|character| matches!(character, '/' | '?' | '#')).next().unwrap_or_default().is_empty()),
+        _ => false,
+    }
 }
 
 pub fn apply_proposal(root: &Path, proposal: &PendingProposal) -> Result<(), String> {
@@ -457,6 +489,23 @@ mod tests {
         assert!(validate_candidate_proposal(&root, &registry, &id, "Heading".into(), "x".repeat(MAX_PROPOSAL_BYTES)).unwrap_err().contains("size limit"));
         fs::write(root.join("page.html"), "<h1>Externally changed</h1>").unwrap();
         assert!(validate_candidate_proposal(&root, &registry, &id, "Heading".into(), "Changed".into()).unwrap_err().contains("changed since discovery"));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn attribute_candidate_proposal_changes_only_value_and_rejects_unsafe_or_stale_source() {
+        let root = fixture();
+        let before = "<body><a href=\"/old\" title='Join'>Join</a></body>";
+        fs::write(root.join("page.html"), before).unwrap();
+        let mut registry = CandidateRegistry::new();
+        registry.discover_html(&root, "page.html").unwrap();
+        let href = registry.model_view().into_iter().find(|candidate| candidate.role == candidates::CandidateRole::AttributeHref).unwrap();
+        let source = registry.candidate(&href.id).unwrap();
+        assert_eq!(&before[source.range()], "/old", "Rust owns the exact value range");
+        let proposal = validate_candidate_proposal(&root, &registry, &href.id, "Update signup destination".into(), "/register?source=a&next=b".into()).unwrap();
+        assert_eq!(proposal.changes[0].after, "<body><a href=\"/register?source=a&amp;next=b\" title='Join'>Join</a></body>");
+        assert_eq!(fs::read_to_string(root.join("page.html")).unwrap(), before);
+        assert!(validate_candidate_proposal(&root, &registry, &href.id, "Unsafe URL".into(), "javascript:alert(1)".into()).unwrap_err().contains("unsafe scheme"));
+        fs::write(root.join("page.html"), before.replace("/old", "/external" )).unwrap();
+        assert!(validate_candidate_proposal(&root, &registry, &href.id, "Stale URL".into(), "/new".into()).unwrap_err().contains("changed since discovery"));
         fs::remove_dir_all(root).unwrap();
     }
     #[test] fn rejects_unsafe_missing_ambiguous_and_noop_proposals() {

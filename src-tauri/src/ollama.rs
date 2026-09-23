@@ -167,7 +167,16 @@ enum CandidateEditRoute { Legacy, Text(CandidateRole), Unsupported }
 fn candidate_text_edit_route(prompt: &str, intent: RequestIntent) -> CandidateEditRoute {
     if intent != RequestIntent::Edit { return CandidateEditRoute::Legacy; }
     let lower = prompt.trim().to_ascii_lowercase();
-    let role = if ["main page heading", "main heading", "visible h1", "visible heading"].iter().any(|target| lower.contains(target)) {
+    let attribute_role = if lower.contains("aria-label") { Some(CandidateRole::AttributeAriaLabel) }
+    else if lower.contains("placeholder") { Some(CandidateRole::AttributePlaceholder) }
+    else if lower.contains("alt text") || lower.contains("image alt") { Some(CandidateRole::AttributeAlt) }
+    else if lower.contains("image source") || lower.contains("src attribute") || lower.contains("image src")
+        || lower.split_whitespace().any(|word| word == "src") { Some(CandidateRole::AttributeSrc) }
+    else if lower.contains("href") || (lower.contains("link") && ["point to", "destination", "url"].iter().any(|term| lower.contains(term))) { Some(CandidateRole::AttributeHref) }
+    else if lower.contains("title attribute") || lower.contains("tooltip") { Some(CandidateRole::AttributeTitle) }
+    else { None };
+    let role = if let Some(role) = attribute_role { role }
+    else if ["main page heading", "main heading", "visible h1", "visible heading"].iter().any(|target| lower.contains(target)) {
         CandidateRole::HeadingOne
     } else if ["document title", "page title", "browser title"].iter().any(|target| lower.contains(target)) {
         CandidateRole::DocumentTitle
@@ -182,11 +191,12 @@ fn candidate_text_edit_route(prompt: &str, intent: RequestIntent) -> CandidateEd
     } else if ["list item", "list-item", "bullet text"].iter().any(|target| lower.contains(target)) {
         CandidateRole::ListItem
     } else { return CandidateEditRoute::Legacy; };
-    let structural = ["preserve", "retain", "span", "markup", "<h1", "html", " tag", "attribute", "href", " url", " class", "style", "color", "background", "font", "size", "alignment", "spacing", "format", "bold", "emphasis"]
+    let structural = ["preserve", "retain", "span", "markup", "<h1", "html", " tag", " class", "style", "color", "background", "font", "size", "alignment", "spacing", "format", "bold", "emphasis"]
         .iter().any(|term| lower.contains(term));
     let direct_replacement = ["change", "replace", "rename", "set", "update"].iter().any(|verb| lower.contains(verb))
         && (lower.contains(" to ") || lower.contains(" with "));
-    if structural || !direct_replacement { CandidateEditRoute::Unsupported } else { CandidateEditRoute::Text(role) }
+    let attribute_keyword_without_attribute_target = !role.is_attribute() && lower.contains("attribute");
+    if structural || attribute_keyword_without_attribute_target || !direct_replacement { CandidateEditRoute::Unsupported } else { CandidateEditRoute::Text(role) }
 }
 
 fn requests_candidate_selection(prompt: &str, intent: RequestIntent) -> bool {
@@ -232,7 +242,7 @@ async fn select_candidate(provider: &impl ModelProvider, model: &str, prompt: &s
     let candidates = serde_json::to_string(&views).map_err(|_| "Could not prepare candidate views.")?;
     let schema = selection_schema();
     let messages = [
-        ChatMessage { role: "system".into(), content: "Select a verified source target for the user's request using only the listed candidate IDs. Compare each candidate's role, roleIndex (its position among candidates of that role), path, lines, excerpt, and bounded preceding context with the request. A document title, visible h1 heading, and paragraph are distinct targets. When exactly one listed candidate has the requested role, select it rather than returning ambiguous. Return exactly one JSON object: {\"result\":\"selected\",\"candidate_id\":\"<listed ID>\"}, {\"result\":\"ambiguous\"}, or {\"result\":\"no_match\"}. If several plausible targets remain and the request does not distinguish them, return ambiguous. Do not invent an ID, source text, replacement code, or a proposal.".into() },
+        ChatMessage { role: "system".into(), content: "Select a verified source target for the user's request using only the listed candidate IDs. Compare each candidate's role and description, roleIndex (its position among candidates of that role), path, lines, excerpt, and bounded safe context with the request. Text content and existing attribute values are distinct targets. When exactly one listed candidate matches the requested target, select it rather than returning ambiguous. Return exactly one JSON object: {\"result\":\"selected\",\"candidate_id\":\"<listed ID>\"}, {\"result\":\"ambiguous\"}, or {\"result\":\"no_match\"}. If several plausible targets remain and the request does not distinguish them, return ambiguous. Do not invent an ID, source text, replacement code, byte offset, or a proposal.".into() },
         ChatMessage { role: "user".into(), content: format!("Request: {prompt}\nVerified candidates: {candidates}") },
     ];
     // Keep candidate excerpts, source context, and the user's request out of the debug trace.
@@ -276,8 +286,8 @@ async fn generate_candidate_replacement(provider: &impl ModelProvider, model: &s
     let candidate = registry.verify_current(root, candidate_id)?;
     let schema = replacement_schema();
     let messages = [
-        ChatMessage { role: "system".into(), content: "Generate only the complete plain-text replacement for the selected existing text candidate. Do not return HTML, markdown, a path, old text, a source range, a summary, or a proposal. Do not preserve or recreate nested markup. Return exactly one JSON object with the single field replacement.".into() },
-        ChatMessage { role: "user".into(), content: format!("Original request: {prompt}\n\nSelected text candidate ({}):\n{}", candidate.description(), candidate.original()) },
+        ChatMessage { role: "system".into(), content: "Generate only the complete replacement value for the selected existing text or attribute candidate. Return the value without surrounding quote delimiters. Do not return HTML, markdown, a path, old text, a source range, a summary, or a proposal. Do not recreate surrounding markup. Return exactly one JSON object with the single field replacement.".into() },
+        ChatMessage { role: "user".into(), content: format!("Original request: {prompt}\n\nSelected candidate ({}), current value:\n{}", candidate.description(), candidate.original()) },
     ];
     debug_log(trace, "generation", format!("Candidate replacement call started\nSchema supplied: {schema}"));
     let response = chat_turn(provider, model, &messages, schema, PROTOCOL_TEMPERATURE, "CANDIDATE REPLACEMENT", false, trace).await?;
@@ -1075,7 +1085,7 @@ mod tests {
             self.formats.lock().unwrap().push(request.format.clone());
             self.requests.lock().unwrap().push(request.messages.to_vec());
             let mut response = self.responses.lock().unwrap().pop_front().ok_or_else(|| ProviderFailure::new(ProviderErrorKind::Api, "No stub response configured."))?;
-            if matches!(response.message.content.as_str(), "__SELECT_FIRST__" | "__SELECT_HEADING__" | "__SELECT_PARAGRAPH__" | "__SELECT_BUTTON__" | "__SELECT_LINK__" | "__SELECT_LABEL__" | "__SELECT_LIST_ITEM__") {
+            if matches!(response.message.content.as_str(), "__SELECT_FIRST__" | "__SELECT_HEADING__" | "__SELECT_PARAGRAPH__" | "__SELECT_BUTTON__" | "__SELECT_LINK__" | "__SELECT_LABEL__" | "__SELECT_LIST_ITEM__" | "__SELECT_HREF__" | "__SELECT_ALT__" | "__SELECT_PLACEHOLDER__") {
                 let payload = request.messages.last().unwrap().content.split_once("Verified candidates: ").unwrap().1;
                 let views: Value = serde_json::from_str(payload).unwrap();
                 let selected = match response.message.content.as_str() {
@@ -1085,6 +1095,9 @@ mod tests {
                     "__SELECT_LINK__" => views.as_array().unwrap().iter().find(|view| view["role"] == "link" && view["roleIndex"] == 1).unwrap(),
                     "__SELECT_LABEL__" => views.as_array().unwrap().iter().find(|view| view["role"] == "label" && view["roleIndex"] == 1).unwrap(),
                     "__SELECT_LIST_ITEM__" => views.as_array().unwrap().iter().find(|view| view["role"] == "list_item" && view["roleIndex"] == 1).unwrap(),
+                    "__SELECT_HREF__" => views.as_array().unwrap().iter().find(|view| view["role"] == "attribute_href" && view["roleIndex"] == 1).unwrap(),
+                    "__SELECT_ALT__" => views.as_array().unwrap().iter().find(|view| view["role"] == "attribute_alt" && view["roleIndex"] == 1).unwrap(),
+                    "__SELECT_PLACEHOLDER__" => views.as_array().unwrap().iter().find(|view| view["role"] == "attribute_placeholder" && view["roleIndex"] == 1).unwrap(),
                     _ => &views[0],
                 };
                 response.message.content = format!("{{\"result\":\"selected\",\"candidate_id\":\"{}\"}}", selected["id"].as_str().unwrap());
@@ -1637,6 +1650,73 @@ mod tests {
     }
 
     #[test]
+    fn application_led_attribute_edits_propose_only_the_selected_value() {
+        for (request, selection, replacement, expected) in [
+            ("Change the signup link to point to /register", "__SELECT_HREF__", "/register", "<a href=\"/register\" title=\"Join us\">"),
+            ("Change the hero image alt text to Elma coding at her desk", "__SELECT_ALT__", "Elma coding at her desk", "<img src='/hero.png' alt=\"Elma coding at her desk\">"),
+            ("Change the email input placeholder to you@example.com", "__SELECT_PLACEHOLDER__", "you@example.com", "<input type='email' placeholder=\"you@example.com\">"),
+        ] {
+            let root = grounding_fixture("candidate-attribute-edit");
+            let before = if selection == "__SELECT_HREF__" {
+                "<body><main><section><a href=\"/old\" title=\"Join us\"><strong>Join</strong></a></section></main><img src='/hero.png' alt=\"Hero image\"><input type='email' placeholder=\"Email address\"></body>"
+            } else {
+                "<body><a href=\"/old\" title=\"Join us\">Join</a><img src='/hero.png' alt=\"Hero image\"><input type='email' placeholder=\"Email address\"></body>"
+            };
+            std::fs::write(root.join("src/index.html"), before).unwrap();
+            let pending = PendingChanges::default();
+            let provider = StubProvider::new(&["test-model"], &[selection, &format!(r#"{{"replacement":"{replacement}"}}"#)]);
+            let response = tauri::async_runtime::block_on(run_agent_with_provider(
+                &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: request.into() }],
+                Some(root.clone()), Some(&pending), None, None,
+            )).unwrap();
+            let proposal = response.proposal.expect("attribute replacement should reach pending Changes");
+            let expected_after = before.replace(match selection {
+                "__SELECT_HREF__" => "href=\"/old\"",
+                "__SELECT_ALT__" => "alt=\"Hero image\"",
+                _ => "placeholder=\"Email address\"",
+            }, match selection {
+                "__SELECT_HREF__" => "href=\"/register\"",
+                "__SELECT_ALT__" => "alt=\"Elma coding at her desk\"",
+                _ => "placeholder=\"you@example.com\"",
+            });
+            assert_eq!(proposal.changes[0].before, before);
+            assert_eq!(proposal.changes[0].after, expected_after);
+            assert!(proposal.changes[0].after.contains(expected));
+            assert!(pending.0.lock().unwrap().is_some());
+            let requests = provider.requests.lock().unwrap();
+            assert!(!requests[1].iter().any(|message| message.content.contains("old_text")));
+            let views: Value = serde_json::from_str(requests[0].last().unwrap().content.split_once("Verified candidates: ").unwrap().1).unwrap();
+            let selected_view = views.as_array().unwrap().first().unwrap();
+            assert!(selected_view["role"].as_str().unwrap().starts_with("attribute_"));
+            assert_eq!(selected_view["beforeContext"], "");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn attribute_candidate_ambiguity_and_missing_targets_do_not_create_proposals() {
+        for (html, request, selection, message) in [
+            ("<body><a href='/one'>Signup</a><a href='/two'>Signup</a></body>", "Change the signup link to point to /register", r#"{"result":"ambiguous"}"#, "multiple plausible"),
+            ("<body><p>Signup</p></body>", "Change the signup link to point to /register", r#"{"result":"no_match"}"#, "no verified existing text"),
+        ] {
+            let root = grounding_fixture("candidate-attribute-safe-outcome");
+            std::fs::write(root.join("src/index.html"), html).unwrap();
+            let pending = PendingChanges::default();
+            let provider = StubProvider::new(&["test-model"], &[selection]);
+            let response = tauri::async_runtime::block_on(run_agent_with_provider(
+                &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: request.into() }],
+                Some(root.clone()), Some(&pending), None, None,
+            )).unwrap();
+            assert!(response.content.contains(message));
+            assert!(response.proposal.is_none());
+            assert!(pending.0.lock().unwrap().is_none());
+            assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), html);
+            assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 1);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn candidate_edit_ambiguity_and_no_match_create_no_proposal() {
         for (html, selection, message) in [
             ("<body><button>Save</button><button>Save</button></body>", r#"{"result":"ambiguous"}"#, "multiple plausible"),
@@ -1698,6 +1778,9 @@ mod tests {
         assert_eq!(candidate_text_edit_route("Change the button text to Continue", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::Button));
         assert_eq!(candidate_text_edit_route("Change the link text to Start", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::Link));
         assert_eq!(candidate_text_edit_route("Rename the list item to Primary", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::ListItem));
+        assert_eq!(candidate_text_edit_route("Change the signup link to point to /register", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::AttributeHref));
+        assert_eq!(candidate_text_edit_route("Change the hero image alt text to Elma at her desk", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::AttributeAlt));
+        assert_eq!(candidate_text_edit_route("Change the email input placeholder to you@example.com", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::AttributePlaceholder));
         assert_eq!(candidate_text_edit_route("Change the main heading to Welcome but preserve the span", RequestIntent::Edit), CandidateEditRoute::Unsupported);
         assert_eq!(candidate_text_edit_route("Improve the signup form accessibility", RequestIntent::Edit), CandidateEditRoute::Legacy);
         let root = grounding_fixture("unsupported-heading-markup");
