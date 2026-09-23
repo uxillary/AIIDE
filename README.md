@@ -54,6 +54,20 @@ npm run benchmark -- --model qwen2.5-coder:7b
 
 The benchmark requires a running provider and installed model. Rust unit tests do not prove live model quality.
 
+## Local image generation
+
+M08A adds an opt-in **Image** composer mode backed by a separately running local ComfyUI service. It uses a fixed SDXL 1.0 workflow at 1024 × 1024 with one GPU-heavy job at a time. Generated PNGs stay in temporary storage until **Save to project** is selected; **Reject** removes the temporary copy without modifying the project. Images never enter the text proposal or diff pipeline.
+
+Windows setup:
+
+1. Install the official [ComfyUI Desktop app](https://www.comfy.org/download), or the official NVIDIA Windows portable build from the [ComfyUI releases](https://github.com/Comfy-Org/ComfyUI/releases).
+2. Download `sd_xl_base_1.0.safetensors` from the [official SDXL model page](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) and place it in `ComfyUI\models\checkpoints`. The checkpoint is approximately 6.94 GB; review its CreativeML Open RAIL++-M license before use.
+3. Start ComfyUI yourself and leave it bound to the local machine. AIIDE uses `http://127.0.0.1:8188` by default.
+4. If needed, set `AIIDE_COMFYUI_ENDPOINT` to another loopback-only HTTP URL and `AIIDE_COMFYUI_CHECKPOINT` to the exact ComfyUI-relative checkpoint filename before launching AIIDE.
+5. On an 8 GB card, close other GPU workloads and start with ComfyUI's default dynamic VRAM behaviour. Record any out-of-memory failure before changing pinned-version options; current ComfyUI documents `--lowvram` as ineffective while dynamic VRAM is active.
+
+AIIDE does not install or start ComfyUI, download models, or use ComfyUI's global interrupt endpoint. The branch contains managed-runtime security foundations, but acquisition and execution are disabled and no install action is exposed. Running-job cancellation requires a current ComfyUI version with prompt-specific cancellation; older versions can still cancel jobs that have not started.
+
 ## Agent Debug Mode
 
 Use **Debug on**, reproduce one request, then open **Agent diagnostics** to copy the latest trace. Debug Mode is off by default, keeps only the latest request in memory, and also writes the trace to the `npm run tauri dev` terminal. Traces can contain prompts, local paths, source context, and raw model responses; review them before sharing.

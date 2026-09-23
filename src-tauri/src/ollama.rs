@@ -339,13 +339,13 @@ fn is_edit_clause(clause: &str) -> bool {
     }
     ["change", "edit", "modify", "fix", "implement", "add", "remove", "rename", "update", "replace", "refactor"]
         .iter().any(|verb| clause == *verb || clause.starts_with(&format!("{verb} ")))
-        || ["make this change", "make only that change", "prepare this change for review", "prepare it for review"]
+        || ["make this change", "make only that change", "prepare this change for review", "prepare it for review", "propose this change for review", "propose the change for review"]
             .iter().any(|phrase| clause.starts_with(phrase))
 }
 
 fn classify_current_request(prompt: &str) -> RequestPlan {
     let text = prompt.trim().to_ascii_lowercase();
-    let edit = text.split(['.', '!', '?', ';', '\n']).any(is_edit_clause);
+    let edit = text.split(['.', '!', '?', ';', ',', '\n']).any(is_edit_clause);
     let selection = requests_candidate_selection(prompt, if edit { RequestIntent::Edit } else { RequestIntent::Answer });
     let repository = edit || selection || file_reference(prompt).is_some() || incomplete_file_reference(prompt).is_some() || has_path_reference(prompt)
         || ["this project", "the project", "this site", "the site", "this page", "the page", "look at the css", "look at the code", "source code", "codebase", "project structure", "repository structure", "repository", "what files", "which files", "list files", "files in ", "files are in ", "directory", "folder", "page heading", "mobile menu", "main heading", "signup form"].iter().any(|phrase| text.contains(phrase));
@@ -411,6 +411,14 @@ fn unsupported_insertion_request(prompt: &str, intent: RequestIntent) -> bool {
     let text = prompt.trim().to_ascii_lowercase();
     text.contains("paragraph") && ["add ", "insert ", "append ", "create "]
         .iter().any(|verb| text.starts_with(verb) || text.starts_with(&format!("please {verb}")))
+}
+
+fn completion_status(result: &Result<ChatResponse, String>) -> &'static str {
+    match result {
+        Ok(response) if response.proposal.is_some() => "PROPOSAL_CREATED",
+        Ok(_) => "ANSWER",
+        Err(_) => "FAILED",
+    }
 }
 
 fn agent_schema(project_open: bool, edit_intent: bool, has_read_evidence: bool, answer_allowed: bool) -> Value {
@@ -736,7 +744,7 @@ pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project
     if let Some(trace) = trace {
         if let Err(error) = &result { debug_log(Some(&trace), "final", format!("FAILED\n{error}")); }
         usage_summary(&trace);
-        debug_log(Some(&trace), "final", format!("Result: {}\nTotal duration: {}ms\n==================================================", if result.is_ok() { "SUCCESS" } else { "FAILED" }, started.elapsed().as_millis()));
+        debug_log(Some(&trace), "final", format!("Result: {}\nTotal duration: {}ms\n==================================================", completion_status(&result), started.elapsed().as_millis()));
         let report = trace.lock().map(|buffer| buffer.lines.join("\n\n")).unwrap_or_else(|_| "Trace unavailable".into());
         let mut state = debug.0.lock().map_err(|_| "Debug state unavailable")?;
         if state.enabled { state.latest = Some(report); }
@@ -958,6 +966,13 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
         let unread = known_file_paths.iter().filter(|path| !read_paths.contains(path)).cloned().collect::<Vec<_>>().join(", ");
         exchange.push(ChatMessage { role: "user".into(), content: format!("{}\nCurrent request intent: {}.", tool_result_message(&request, useful, &output, &known_paths, &unread), if plan.intent == RequestIntent::Edit { "edit — inspect, then propose the focused change" } else { "inspect/answer only — do not propose a change" }) });
         if consecutive_repeats >= 2 { break; }
+    }
+    if plan.intent == RequestIntent::Edit {
+        return Err(if read_paths.is_empty() {
+            "I couldn't inspect the requested edit target, so no proposal was created.".into()
+        } else {
+            "I inspected the requested edit target but couldn't create a validated proposal. No change was prepared for review.".into()
+        });
     }
     if !read_paths.is_empty() {
         let info = root.as_ref().map(|path| super::project::inspect_metadata(path)).unwrap_or_default();
@@ -1263,16 +1278,19 @@ mod tests {
         for prompt in ["tell me about this project", "look at the css and tell me one improvement", "tell me about this project and describe a change you'd make"] {
             assert_eq!(classify_current_request(prompt), RequestPlan { scope: RequestScope::Repository, intent: RequestIntent::Answer }, "{prompt}");
         }
-        for prompt in ["describe one change you'd make", "what would you change here?", "review this page and suggest an improvement", "tell me how you'd fix this"] {
+        for prompt in ["describe one change you'd make", "what would you change here?", "review this page and suggest an improvement", "tell me how you'd fix this", "In src/index.html, what is the page heading?"] {
             assert_eq!(classify_current_request(prompt).intent, RequestIntent::Answer, "{prompt}");
         }
         for prompt in [
             "change the main heading to Welcome",
+            "In src/index.html, change the page heading from \"Welcome to the Sandbox\" to \"Welcome to Elma's Sandbox\". Propose the change for review.",
+            "In src/index.html, replace the old heading with the new heading.",
             "fix the heading",
             "rename this button to Save",
             "add a footer",
             "remove the old paragraph",
             "implement that",
+            "Propose the change for review.",
             "make only that change and prepare it for review",
             "change the main heading to \"Welcome to the AIIDE Sandbox\". make only that change and prepare it for review",
         ] {
@@ -1317,8 +1335,22 @@ mod tests {
         let answer = AgentAction::Answer("unsupported claim".into());
         assert_eq!(validate_action_for_state(&answer, true, false, false, false), Err("repository evidence is required before answering"));
         assert!(validate_action_for_state(&answer, true, false, true, true).is_ok());
+        assert_eq!(validate_action_for_state(&answer, true, true, true, false), Err("an edit request cannot finish with an answer"));
         let proposal = AgentAction::Propose("x".into(), vec![]);
         assert!(validate_action_for_state(&proposal, true, true, false, false).is_err());
+    }
+
+    #[test]
+    fn completion_reporting_distinguishes_answers_proposals_and_failures() {
+        let root = grounding_fixture("completion-status");
+        let proposal = repository::validate_proposal(&root, "Update heading".into(), vec![ProposedReplacement {
+            path: "src/index.html".into(), old_text: "Welcome".into(), new_text: "Changed".into(),
+        }]).unwrap();
+        let response = |proposal| Ok(ChatResponse { model: "test-model".into(), content: "done".into(), activity: vec![], proposal });
+        assert_eq!(completion_status(&response(None)), "ANSWER");
+        assert_eq!(completion_status(&response(Some(proposal))), "PROPOSAL_CREATED");
+        assert_eq!(completion_status(&Err("failed".into())), "FAILED");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn grounding_fixture(label: &str) -> std::path::PathBuf {
@@ -1732,6 +1764,50 @@ mod tests {
         assert!(response.content.contains("cannot insert new content"));
         assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 0);
         assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn path_prefixed_edit_request_reads_then_creates_a_reviewable_proposal() {
+        let root = grounding_fixture("path-prefixed-edit");
+        let before = "<h1>Welcome to the Sandbox</h1>";
+        let after = "<h1>Welcome to Elma's Sandbox</h1>";
+        std::fs::write(root.join("src/index.html"), before).unwrap();
+        let pending = PendingChanges::default();
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            r#"{"action":"propose_change","summary":"Update the page heading.","changes":[{"path":"src/index.html","old_text":"<h1>Welcome to the Sandbox</h1>","new_text":"<h1>Welcome to Elma's Sandbox</h1>"}]}"#,
+        ]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "In src/index.html, change the page heading from \"Welcome to the Sandbox\" to \"Welcome to Elma's Sandbox\". Propose the change for review.".into() }],
+            Some(root.clone()), Some(&pending), None, None,
+        )).unwrap();
+        let proposal = response.proposal.expect("explicit edit request must create a proposal");
+        assert_eq!(proposal.changes[0].path, "src/index.html");
+        assert_eq!(proposal.changes[0].before, before);
+        assert_eq!(proposal.changes[0].after, after);
+        assert!(pending.0.lock().unwrap().is_some());
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), before, "proposal must not write before Apply");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_requested_source_text_is_not_confused_with_answer_intent() {
+        let root = grounding_fixture("missing-edit-source");
+        let before = "<h1>Welcome somewhere else</h1>";
+        std::fs::write(root.join("src/index.html"), before).unwrap();
+        let pending = PendingChanges::default();
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"read_file","path":"src/index.html"}"#,
+            r#"{"action":"propose_change","summary":"Update the page heading.","changes":[{"path":"src/index.html","old_text":"<h1>Welcome to the Sandbox</h1>","new_text":"<h1>Welcome to Elma's Sandbox</h1>"}]}"#,
+        ]);
+        let error = match tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "In src/index.html, change the page heading from \"Welcome to the Sandbox\" to \"Welcome to Elma's Sandbox\". Propose the change for review.".into() }],
+            Some(root.clone()), Some(&pending), None, None,
+        )) { Err(error) => error, Ok(_) => panic!("missing source text must not create a proposal") };
+        assert_eq!(error, "old_text was not found in the current file.");
+        assert!(pending.0.lock().unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), before);
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "name": "elma-image-complete",
+  "frameCount": 8,
+  "fps": 5,
+  "frameDurationMs": 200,
+  "spriteSheet": "elma-image-complete.png",
+  "sheet": {
+    "width": 1384,
+    "height": 183
+  },
+  "cell": {
+    "width": 173,
+    "height": 183
+  },
+  "layout": "horizontal",
+  "frames": [
+    {
+      "slot": 1,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "width": 173,
+        "height": 183
+      }
+    },
+    {
+      "slot": 2,
+      "rect": {
+        "x": 173,
+        "y": 0,
+        "width": 173,
+        "height": 183
+      }
+    },
+    {
+      "slot": 3,
+      "rect": {
+        "x": 346,
+        "y": 0,
+        "width": 173,
+        "height": 183
+      }
+    },
+    {
+      "slot": 4,
+      "rect": {
+        "x": 519,
+        "y": 0,
+        "width": 173,
+        "height": 183
+      }
+    },
+    {
+      "slot": 5,
+      "rect": {
+        "x": 692,
+        "y": 0,
+        "width": 173,
+        "height": 183
+      }
+    },
+    {
+      "slot": 6,
+      "rect": {
+        "x": 865,
+        "y": 0,
+        "width": 173,
+        "height": 183
+      }
+    },
+    {
+      "slot": 7,
+      "rect": {
+        "x": 1038,
+        "y": 0,
+        "width": 173,
+        "height": 183
+      }
+    },
+    {
+      "slot": 8,
+      "rect": {
+        "x": 1211,
+        "y": 0,
+        "width": 173,
+        "height": 183
+      }
+    }
+  ]
+}
