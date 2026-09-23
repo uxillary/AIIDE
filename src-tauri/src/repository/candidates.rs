@@ -19,6 +19,10 @@ pub enum CandidateRole {
     DocumentTitle,
     HeadingOne,
     Paragraph,
+    Button,
+    Link,
+    Label,
+    ListItem,
 }
 
 impl CandidateRole {
@@ -27,6 +31,10 @@ impl CandidateRole {
             Self::DocumentTitle => "Document title",
             Self::HeadingOne => "Visible h1 heading",
             Self::Paragraph => "Paragraph text",
+            Self::Button => "Button text",
+            Self::Link => "Link text",
+            Self::Label => "Label text",
+            Self::ListItem => "List item text",
         }
     }
 }
@@ -152,13 +160,17 @@ impl CandidateRegistry {
     }
 
     pub fn model_view(&self) -> Vec<CandidateView> {
-        let mut role_counts = [0; 3];
+        let mut role_counts = [0; 7];
         self.candidates.iter().map(|candidate| {
             let snapshot = &self.snapshots[candidate.snapshot_index].text;
             let role_slot = match candidate.role {
                 CandidateRole::DocumentTitle => 0,
                 CandidateRole::HeadingOne => 1,
                 CandidateRole::Paragraph => 2,
+                CandidateRole::Button => 3,
+                CandidateRole::Link => 4,
+                CandidateRole::Label => 5,
+                CandidateRole::ListItem => 6,
             };
             role_counts[role_slot] += 1;
             CandidateView {
@@ -317,6 +329,10 @@ fn extract_html(text: &str, limit: usize) -> Vec<(CandidateRole, Range<usize>)> 
             "title" if !stack.iter().any(|open| open.hidden || matches!(open.name.as_str(), "body" | "script" | "style" | "template" | "noscript" | "svg" | "textarea")) => Some(CandidateRole::DocumentTitle),
             "h1" if !excluded => Some(CandidateRole::HeadingOne),
             "p" if !excluded => Some(CandidateRole::Paragraph),
+            "button" if !excluded => Some(CandidateRole::Button),
+            "a" if !excluded => Some(CandidateRole::Link),
+            "label" if !excluded => Some(CandidateRole::Label),
+            "li" if !excluded => Some(CandidateRole::ListItem),
             _ => None,
         };
         if active.is_none() && !hidden && !tag.self_closing {
@@ -373,6 +389,31 @@ mod tests {
             assert_eq!(&registry.snapshot_for(&view.id).unwrap()[candidate.range()], expected);
             assert!(!candidate.description().is_empty());
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn simple_controls_links_labels_and_list_items_have_exact_text_ranges() {
+        let html = "<html><body><button>Save changes</button><a href='/home'>Home</a><label>Name</label><ul><li>First item</li></ul></body></html>";
+        let root = fixture(html);
+        let mut registry = CandidateRegistry::new();
+        assert_eq!(registry.discover_html(&root, "page.html").unwrap(), 4);
+        let views = registry.model_view();
+        assert_eq!(views.iter().map(|view| view.role).collect::<Vec<_>>(), [CandidateRole::Button, CandidateRole::Link, CandidateRole::Label, CandidateRole::ListItem]);
+        for (view, expected) in views.iter().zip(["Save changes", "Home", "Name", "First item"]) {
+            let candidate = registry.candidate(&view.id).unwrap();
+            assert_eq!(&html[candidate.range()], expected);
+            assert_eq!(candidate.original(), expected);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn control_candidate_with_nested_markup_is_not_exposed() {
+        let root = fixture("<body><button><span>Save</span></button><a href='/home'>Home</a></body>");
+        let mut registry = CandidateRegistry::new();
+        assert_eq!(registry.discover_html(&root, "page.html").unwrap(), 1);
+        assert_eq!(registry.model_view()[0].role, CandidateRole::Link);
         fs::remove_dir_all(root).unwrap();
     }
 

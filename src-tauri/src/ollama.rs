@@ -173,8 +173,16 @@ fn candidate_text_edit_route(prompt: &str, intent: RequestIntent) -> CandidateEd
         CandidateRole::DocumentTitle
     } else if ["paragraph", "intro text", "introductory text"].iter().any(|target| lower.contains(target)) {
         CandidateRole::Paragraph
+    } else if ["button text", "button label", "button caption"].iter().any(|target| lower.contains(target)) {
+        CandidateRole::Button
+    } else if ["link text", "anchor text"].iter().any(|target| lower.contains(target)) {
+        CandidateRole::Link
+    } else if ["label", "label text"].iter().any(|target| lower.contains(target)) {
+        CandidateRole::Label
+    } else if ["list item", "list-item", "bullet text"].iter().any(|target| lower.contains(target)) {
+        CandidateRole::ListItem
     } else { return CandidateEditRoute::Legacy; };
-    let structural = ["preserve", "retain", "span", "markup", "<h1", "html", " tag", "attribute", " class", "style", "format", "bold", "emphasis", "link"]
+    let structural = ["preserve", "retain", "span", "markup", "<h1", "html", " tag", "attribute", "href", " url", " class", "style", "color", "background", "font", "size", "alignment", "spacing", "format", "bold", "emphasis"]
         .iter().any(|term| lower.contains(term));
     let direct_replacement = ["change", "replace", "rename", "set", "update"].iter().any(|verb| lower.contains(verb))
         && (lower.contains(" to ") || lower.contains(" with "));
@@ -795,7 +803,7 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
             return run_candidate_text_edit(provider, model, &last_prompt, role, root.as_deref().unwrap(), pending, app, debug_trace).await;
         }
         CandidateEditRoute::Unsupported if root.is_some() => {
-            return Ok(ChatResponse { model, content: "This application-led text editor only supports replacing the complete text of an existing title, heading, or paragraph. It cannot preserve or rearrange nested markup.".into(), activity: vec![], proposal: None });
+            return Ok(ChatResponse { model, content: "This application-led text editor only supports replacing the complete text of a supported existing title, heading, paragraph, button, link, label, or list item. It cannot preserve nested markup or rearrange child elements, and it cannot edit attributes.".into(), activity: vec![], proposal: None });
         }
         CandidateEditRoute::Legacy | CandidateEditRoute::Text(_) | CandidateEditRoute::Unsupported => {}
     }
@@ -1067,12 +1075,16 @@ mod tests {
             self.formats.lock().unwrap().push(request.format.clone());
             self.requests.lock().unwrap().push(request.messages.to_vec());
             let mut response = self.responses.lock().unwrap().pop_front().ok_or_else(|| ProviderFailure::new(ProviderErrorKind::Api, "No stub response configured."))?;
-            if matches!(response.message.content.as_str(), "__SELECT_FIRST__" | "__SELECT_HEADING__" | "__SELECT_PARAGRAPH__") {
+            if matches!(response.message.content.as_str(), "__SELECT_FIRST__" | "__SELECT_HEADING__" | "__SELECT_PARAGRAPH__" | "__SELECT_BUTTON__" | "__SELECT_LINK__" | "__SELECT_LABEL__" | "__SELECT_LIST_ITEM__") {
                 let payload = request.messages.last().unwrap().content.split_once("Verified candidates: ").unwrap().1;
                 let views: Value = serde_json::from_str(payload).unwrap();
                 let selected = match response.message.content.as_str() {
                     "__SELECT_HEADING__" => views.as_array().unwrap().iter().find(|view| view["role"] == "heading_one").unwrap(),
                     "__SELECT_PARAGRAPH__" => views.as_array().unwrap().iter().find(|view| view["role"] == "paragraph" && view["roleIndex"] == 1).unwrap(),
+                    "__SELECT_BUTTON__" => views.as_array().unwrap().iter().find(|view| view["role"] == "button" && view["roleIndex"] == 1).unwrap(),
+                    "__SELECT_LINK__" => views.as_array().unwrap().iter().find(|view| view["role"] == "link" && view["roleIndex"] == 1).unwrap(),
+                    "__SELECT_LABEL__" => views.as_array().unwrap().iter().find(|view| view["role"] == "label" && view["roleIndex"] == 1).unwrap(),
+                    "__SELECT_LIST_ITEM__" => views.as_array().unwrap().iter().find(|view| view["role"] == "list_item" && view["roleIndex"] == 1).unwrap(),
                     _ => &views[0],
                 };
                 response.message.content = format!("{{\"result\":\"selected\",\"candidate_id\":\"{}\"}}", selected["id"].as_str().unwrap());
@@ -1593,6 +1605,61 @@ mod tests {
     }
 
     #[test]
+    fn application_led_button_link_and_list_item_edits_use_verified_ranges() {
+        for (role, request, selection, old, replacement, expected) in [
+            (CandidateRole::Button, "Change the button text to Submit", "__SELECT_BUTTON__", "Save", "Submit", "<button>Submit</button>"),
+            (CandidateRole::Link, "Change the link text to Start", "__SELECT_LINK__", "Home", "Start", "<a href='/home'>Start</a>"),
+            (CandidateRole::ListItem, "Change the list item to Primary", "__SELECT_LIST_ITEM__", "First", "Primary", "<li>Primary</li>"),
+        ] {
+            let root = grounding_fixture(&format!("candidate-{:?}-edit", role));
+            let before = "<body><button>Save</button><a href='/home'>Home</a><ul><li>First</li></ul><p>Keep this.</p></body>";
+            std::fs::write(root.join("src/index.html"), &before).unwrap();
+            let pending = PendingChanges::default();
+            let provider = StubProvider::new(&["test-model"], &[selection, &format!(r#"{{"replacement":"{replacement}"}}"#)]);
+            let response = tauri::async_runtime::block_on(run_agent_with_provider(
+                &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: request.into() }],
+                Some(root.clone()), Some(&pending), None, None,
+            )).unwrap();
+            let proposal = response.proposal.expect("candidate replacement should reach pending Changes");
+            assert_eq!(proposal.changes[0].before, before);
+            assert!(proposal.changes[0].after.contains(expected));
+            assert!(!proposal.changes[0].after.contains(&format!(">{old}<")));
+            assert!(pending.0.lock().unwrap().is_some());
+            let requests = provider.requests.lock().unwrap();
+            assert!(!requests[1].iter().any(|message| message.content.contains("old_text")));
+            let candidates: Value = serde_json::from_str(requests[0].last().unwrap().content.split_once("Verified candidates: ").unwrap().1).unwrap();
+            let selected_id = requests[0].last().unwrap().content.split("\"id\":\"").nth(1).unwrap().split('"').next().unwrap();
+            assert!(candidates.as_array().unwrap().iter().any(|candidate| candidate["id"] == selected_id && candidate["role"] == match role {
+                CandidateRole::Button => "button", CandidateRole::Link => "link", CandidateRole::ListItem => "list_item", _ => unreachable!(),
+            }));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn candidate_edit_ambiguity_and_no_match_create_no_proposal() {
+        for (html, selection, message) in [
+            ("<body><button>Save</button><button>Save</button></body>", r#"{"result":"ambiguous"}"#, "multiple plausible"),
+            ("<body><button>Save</button></body>", r#"{"result":"no_match"}"#, "no verified existing text"),
+        ] {
+            let root = grounding_fixture("candidate-safe-outcome");
+            std::fs::write(root.join("src/index.html"), html).unwrap();
+            let pending = PendingChanges::default();
+            let provider = StubProvider::new(&["test-model"], &[selection]);
+            let response = tauri::async_runtime::block_on(run_agent_with_provider(
+                &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Change the button text to Continue".into() }],
+                Some(root.clone()), Some(&pending), None, None,
+            )).unwrap();
+            assert!(response.content.contains(message));
+            assert!(response.proposal.is_none());
+            assert!(pending.0.lock().unwrap().is_none());
+            assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), html);
+            assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 1);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn candidate_edit_failures_do_not_enter_the_legacy_proposal_path() {
         for (label, selection, expected) in [
             ("unknown", r#"{"result":"selected","candidate_id":"unknown"}"#, "Unknown candidate ID."),
@@ -1628,6 +1695,9 @@ mod tests {
         assert_eq!(candidate_text_edit_route("Change the main page heading to Welcome", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::HeadingOne));
         assert_eq!(candidate_text_edit_route("Change the page title to OrbitNote", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::DocumentTitle));
         assert_eq!(candidate_text_edit_route("Replace the introductory paragraph with a clearer welcome", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::Paragraph));
+        assert_eq!(candidate_text_edit_route("Change the button text to Continue", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::Button));
+        assert_eq!(candidate_text_edit_route("Change the link text to Start", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::Link));
+        assert_eq!(candidate_text_edit_route("Rename the list item to Primary", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::ListItem));
         assert_eq!(candidate_text_edit_route("Change the main heading to Welcome but preserve the span", RequestIntent::Edit), CandidateEditRoute::Unsupported);
         assert_eq!(candidate_text_edit_route("Improve the signup form accessibility", RequestIntent::Edit), CandidateEditRoute::Legacy);
         let root = grounding_fixture("unsupported-heading-markup");
