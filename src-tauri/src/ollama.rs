@@ -5,11 +5,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, State};
+use crate::editing::{self, EditDispatch, RequestIntent, SemanticEditRoute};
 use crate::model_profiles;
 use crate::model_provider::{InferenceRequest, InferenceResponse, ModelMessage, ModelProvider, OllamaProvider, ProviderErrorKind, SelectedProvider, OLLAMA_PROVIDER_ID};
 use crate::project::OpenProject;
 use crate::repository::{self, Activity, PendingChanges, PendingProposal, ProposedReplacement, ToolRequest};
-use crate::repository::candidates::{CandidateRegistry, CandidateRole, CandidateView};
+use crate::repository::candidates::{CandidateRegistry, CandidateRole};
 
 const MAX_MESSAGES: usize = 40;
 const MAX_MESSAGE_CHARS: usize = 12_000;
@@ -127,6 +128,17 @@ pub struct ProviderError { code: &'static str, message: &'static str }
 pub type ChatMessage = ModelMessage;
 type ChatPayloadResponse = InferenceResponse;
 
+struct SemanticInferenceAdapter<'a, P: ModelProvider> { provider: &'a P, trace: Option<&'a Trace> }
+
+impl<P: ModelProvider> editing::SemanticInference for SemanticInferenceAdapter<'_, P> {
+    async fn infer_structured(&self, model: &str, messages: &[ModelMessage], schema: Value, stage: &str) -> Result<editing::StructuredResponse, String> {
+        let response = chat_turn(self.provider, model, messages, schema, PROTOCOL_TEMPERATURE, stage, false, self.trace).await?;
+        Ok(editing::StructuredResponse { content: response.message.content, done_reason: response.done_reason })
+    }
+
+    fn log(&self, category: &str, message: &str) { debug_log(self.trace, category, message); }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatResponse { model: String, content: String, activity: Vec<Activity>, proposal: Option<PendingProposal> }
@@ -147,95 +159,6 @@ enum AgentAction { List(String), Search(String), Read(String), Answer(String), P
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum RequestScope { General, Repository, Unknown }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum RequestIntent { Answer, Edit }
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SelectionReply { result: String, candidate_id: Option<String> }
-
-#[derive(Debug)]
-enum SelectionOutcome { Selected(CandidateView), Ambiguous, NoMatch }
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReplacementReply { replacement: String }
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InsertionReply { element_type: String, text: String, href: Option<String> }
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum SemanticEditRoute {
-    ReplaceCandidate { role: CandidateRole },
-    InsertRelative { anchor: CandidateRole, position: repository::CandidatePosition, element: repository::InsertedElement },
-}
-
-/// Dispatch inventory: supported HTML primitives are Semantic; other exact-source edits remain Legacy;
-/// structural or unbounded requests are Unsupported until a safe ownership model exists.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum EditDispatch { NotEdit, Semantic(SemanticEditRoute), Legacy, Unsupported }
-
-fn dispatch_edit_request(prompt: &str, intent: RequestIntent) -> EditDispatch {
-    if intent != RequestIntent::Edit { return EditDispatch::NotEdit; }
-    let lower = prompt.trim().to_ascii_lowercase();
-    let insertion_verbs = lower.split(|character: char| !character.is_ascii_alphanumeric()).filter(|word| !word.is_empty()).collect::<Vec<_>>();
-    if insertion_verbs.iter().any(|word| matches!(*word, "add" | "insert" | "append" | "create")) {
-        if insertion_verbs.iter().any(|word| matches!(*word, "append" | "create")) {
-            return EditDispatch::Unsupported;
-        }
-        let relations = [("after", repository::CandidatePosition::After), ("below", repository::CandidatePosition::After), ("beneath", repository::CandidatePosition::After), ("before", repository::CandidatePosition::Before), ("above", repository::CandidatePosition::Before)];
-        let Some((position_at, relation, position)) = relations.iter().filter_map(|(relation, position)| lower.find(relation).map(|at| (at, *relation, *position))).min_by_key(|(at, _, _)| *at) else {
-            return EditDispatch::Unsupported;
-        };
-        let content_request = &lower[..position_at];
-        let anchor_request = &lower[position_at + relation.len()..];
-        let element = if content_request.contains("paragraph") { Some(repository::InsertedElement::Paragraph) }
-            else if content_request.contains("link") { Some(repository::InsertedElement::Link) }
-            else if content_request.contains("heading") { Some(repository::InsertedElement::Heading) }
-            else { None };
-        let anchor = if anchor_request.contains("heading") { Some(CandidateRole::HeadingOne) }
-            else if anchor_request.contains("paragraph") { Some(CandidateRole::Paragraph) }
-            else if anchor_request.contains("form") { Some(CandidateRole::Form) }
-            else { None };
-        return match (anchor, element) {
-            (Some(anchor), Some(element)) => EditDispatch::Semantic(SemanticEditRoute::InsertRelative { anchor, position, element }),
-            _ => EditDispatch::Unsupported,
-        };
-    }
-    let attribute_role = if lower.contains("aria-label") { Some(CandidateRole::AttributeAriaLabel) }
-    else if lower.contains("placeholder") { Some(CandidateRole::AttributePlaceholder) }
-    else if lower.contains("alt text") || lower.contains("image alt") { Some(CandidateRole::AttributeAlt) }
-    else if lower.contains("image source") || lower.contains("src attribute") || lower.contains("image src")
-        || lower.split_whitespace().any(|word| word == "src") { Some(CandidateRole::AttributeSrc) }
-    else if lower.contains("href") || (lower.contains("link") && ["point to", "destination", "url"].iter().any(|term| lower.contains(term))) { Some(CandidateRole::AttributeHref) }
-    else if lower.contains("title attribute") || lower.contains("tooltip") { Some(CandidateRole::AttributeTitle) }
-    else { None };
-    let role = if let Some(role) = attribute_role { role }
-    else if ["main page heading", "main heading", "visible h1", "visible heading"].iter().any(|target| lower.contains(target)) {
-        CandidateRole::HeadingOne
-    } else if ["document title", "page title", "browser title"].iter().any(|target| lower.contains(target)) {
-        CandidateRole::DocumentTitle
-    } else if ["paragraph", "intro text", "introductory text"].iter().any(|target| lower.contains(target)) {
-        CandidateRole::Paragraph
-    } else if ["button text", "button label", "button caption"].iter().any(|target| lower.contains(target)) {
-        CandidateRole::Button
-    } else if ["link text", "anchor text"].iter().any(|target| lower.contains(target)) {
-        CandidateRole::Link
-    } else if ["label", "label text"].iter().any(|target| lower.contains(target)) {
-        CandidateRole::Label
-    } else if ["list item", "list-item", "bullet text"].iter().any(|target| lower.contains(target)) {
-        CandidateRole::ListItem
-    } else { return EditDispatch::Legacy; };
-    let structural = ["preserve", "retain", "span", "markup", "<h1", "html", " tag", " class", "style", "color", "background", "font", "size", "alignment", "spacing", "format", "bold", "emphasis"]
-        .iter().any(|term| lower.contains(term));
-    let direct_replacement = ["change", "replace", "rename", "set", "update"].iter().any(|verb| lower.contains(verb))
-        && (lower.contains(" to ") || lower.contains(" with "));
-    let attribute_keyword_without_attribute_target = !role.is_attribute() && lower.contains("attribute");
-    if structural || attribute_keyword_without_attribute_target || !direct_replacement { EditDispatch::Unsupported }
-    else { EditDispatch::Semantic(SemanticEditRoute::ReplaceCandidate { role }) }
-}
-
 fn requests_candidate_selection(prompt: &str, intent: RequestIntent) -> bool {
     if intent != RequestIntent::Answer { return false; }
     let lower = prompt.trim().to_ascii_lowercase();
@@ -247,194 +170,16 @@ fn is_html_path(path: &str) -> bool {
     std::path::Path::new(path).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm"))
 }
 
-fn selection_schema() -> Value {
-    json!({"type":"object","properties":{
-        "result":{"type":"string","enum":["selected","ambiguous","no_match"]},
-        "candidate_id":{"type":"string","description":"Required only for selected; copy one listed ID exactly."}
-    },"required":["result"],"additionalProperties":false})
-}
-
-fn replacement_schema() -> Value {
-    json!({"type":"object","properties":{
-        "replacement":{"type":"string","minLength":1,"maxLength":repository::MAX_PROPOSAL_BYTES}
-    },"required":["replacement"],"additionalProperties":false})
-}
-
-fn insertion_schema(element: repository::InsertedElement) -> Value {
-    let element_type = match element {
-        repository::InsertedElement::Paragraph => "paragraph",
-        repository::InsertedElement::Heading => "heading",
-        repository::InsertedElement::Link => "link",
-    };
-    let mut properties = json!({
-        "element_type":{"type":"string","enum":[element_type]},
-        "text":{"type":"string","minLength":1,"maxLength":repository::candidates::MAX_CANDIDATE_SOURCE_BYTES}
-    });
-    let mut required = vec!["element_type", "text"];
-    if element == repository::InsertedElement::Link {
-        properties["href"] = json!({"type":"string","minLength":1,"maxLength":repository::candidates::MAX_CANDIDATE_SOURCE_BYTES});
-        required.push("href");
-    }
-    json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
-}
-
-fn resolve_selection(raw: &str, registry: &CandidateRegistry, root: &std::path::Path) -> Result<SelectionOutcome, String> {
-    let reply: SelectionReply = serde_json::from_str(raw.trim()).map_err(|_| "Candidate selection response was malformed.")?;
-    match (reply.result.as_str(), reply.candidate_id) {
-        ("selected", Some(id)) if !id.is_empty() => {
-            let candidate = registry.verify_current(root, &id)?;
-            let view = registry.model_view().into_iter().find(|view| view.id == candidate.id()).ok_or("Unknown candidate ID.")?;
-            Ok(SelectionOutcome::Selected(view))
-        }
-        ("ambiguous", None) => Ok(SelectionOutcome::Ambiguous),
-        ("no_match", None) => Ok(SelectionOutcome::NoMatch),
-        _ => Err("Candidate selection response was malformed.".into()),
-    }
-}
-
-async fn select_candidate(provider: &impl ModelProvider, model: &str, prompt: &str, root: &std::path::Path, registry: &CandidateRegistry, required_role: Option<CandidateRole>, trace: Option<&Trace>) -> Result<SelectionOutcome, String> {
-    let views = registry.model_view().into_iter().filter(|view| required_role.is_none_or(|role| view.role == role)).collect::<Vec<_>>();
-    let candidates = serde_json::to_string(&views).map_err(|_| "Could not prepare candidate views.")?;
-    let schema = selection_schema();
-    let messages = [
-        ChatMessage { role: "system".into(), content: "Select a verified source target for the user's request using only the listed candidate IDs. Compare each candidate's role and description, roleIndex (its position among candidates of that role), path, lines, excerpt, and bounded safe context with the request. Text content and existing attribute values are distinct targets. When exactly one listed candidate matches the requested target, select it rather than returning ambiguous. Return exactly one JSON object: {\"result\":\"selected\",\"candidate_id\":\"<listed ID>\"}, {\"result\":\"ambiguous\"}, or {\"result\":\"no_match\"}. If several plausible targets remain and the request does not distinguish them, return ambiguous. Do not invent an ID, source text, replacement code, byte offset, or a proposal.".into() },
-        ChatMessage { role: "user".into(), content: format!("Request: {prompt}\nVerified candidates: {candidates}") },
-    ];
-    // Keep candidate excerpts, source context, and the user's request out of the debug trace.
-    debug_log(trace, "semantic_selection", format!("Selection call started\nCandidate count: {}\nSchema supplied: {schema}", views.len()));
-    let started = Instant::now();
-    let response = chat_turn(provider, model, &messages, schema, PROTOCOL_TEMPERATURE, "CANDIDATE SELECTION", false, trace).await.map_err(|error| {
-        debug_log(trace, "semantic_selection", format!("Selection call failed after {}ms\nValidation: not run", started.elapsed().as_millis()));
-        error
-    })?;
-    debug_log(trace, "semantic_selection", format!("Selection response received in {}ms", started.elapsed().as_millis()));
-    if response.done_reason.as_deref() == Some("length") {
-        debug_log(trace, "semantic_selection", "Structured action: unavailable\nValidation: failed\nError: Candidate selection response was malformed.");
-        return Err("Candidate selection response was malformed.".into());
-    }
-    let action = serde_json::from_str::<SelectionReply>(response.message.content.trim()).ok();
-    let action_name = action.as_ref().map_or("malformed", |reply| match reply.result.as_str() {
-        "selected" => "selected", "ambiguous" => "ambiguous", "no_match" => "no_match", _ => "invalid",
-    });
-    let id = if action_name == "selected" {
-        action.as_ref().and_then(|reply| reply.candidate_id.as_deref())
-            .filter(|id| registry.candidate(id).is_some()).unwrap_or("unverified")
-    } else { "none" };
-    debug_log(trace, "semantic_selection", format!("Structured action: {action_name}\nCandidate ID: {id}"));
-    if action_name == "selected" && !views.iter().any(|view| Some(view.id.as_str()) == action.as_ref().and_then(|reply| reply.candidate_id.as_deref())) {
-        debug_log(trace, "semantic_selection", "Validation: failed\nError: Unknown candidate ID.");
-        return Err("Unknown candidate ID.".into());
-    }
-    let outcome = resolve_selection(&response.message.content, registry, root).map_err(|error| {
-        debug_log(trace, "semantic_selection", format!("Validation: failed\nError: {error}"));
-        error
-    })?;
-    debug_log(trace, "semantic_selection", match &outcome {
-        SelectionOutcome::Selected(view) => format!("Validation: passed\nSelected ID: {} at {}:{}", view.id, view.path, view.start_line),
-        SelectionOutcome::Ambiguous => "Validation: passed\nAmbiguous candidates; clarification required".into(),
-        SelectionOutcome::NoMatch => "Validation: passed\nNo matching candidate".into(),
-    });
-    Ok(outcome)
-}
-
-async fn generate_candidate_replacement(provider: &impl ModelProvider, model: &str, prompt: &str, root: &std::path::Path, registry: &CandidateRegistry, candidate_id: &str, trace: Option<&Trace>) -> Result<String, String> {
-    let candidate = registry.verify_current(root, candidate_id)?;
-    let schema = replacement_schema();
-    let messages = [
-        ChatMessage { role: "system".into(), content: "Generate only the complete replacement value for the selected existing text or attribute candidate. Return the value without surrounding quote delimiters. Do not return HTML, markdown, a path, old text, a source range, a summary, or a proposal. Do not recreate surrounding markup. Return exactly one JSON object with the single field replacement.".into() },
-        ChatMessage { role: "user".into(), content: format!("Original request: {prompt}\n\nSelected candidate ({}), current value:\n{}", candidate.description(), candidate.original()) },
-    ];
-    debug_log(trace, "semantic_generation", format!("Candidate replacement call started\nSchema supplied: {schema}"));
-    let response = chat_turn(provider, model, &messages, schema, PROTOCOL_TEMPERATURE, "CANDIDATE REPLACEMENT", false, trace).await?;
-    if response.done_reason.as_deref() == Some("length") { return Err("Candidate replacement response was malformed.".into()); }
-    let reply: ReplacementReply = serde_json::from_str(response.message.content.trim())
-        .map_err(|_| "Candidate replacement response was malformed.".to_owned())?;
-    if reply.replacement.trim().is_empty() { return Err("Candidate replacement must not be empty.".into()); }
-    debug_log(trace, "semantic_generation", "Candidate replacement response validated");
-    Ok(reply.replacement)
-}
-
-async fn generate_candidate_insertion(provider: &impl ModelProvider, model: &str, prompt: &str, root: &std::path::Path, registry: &CandidateRegistry, candidate_id: &str, element: repository::InsertedElement, trace: Option<&Trace>) -> Result<InsertionReply, String> {
-    let candidate = registry.verify_current(root, candidate_id)?;
-    let schema = insertion_schema(element);
-    let element_name = match element {
-        repository::InsertedElement::Paragraph => "paragraph",
-        repository::InsertedElement::Heading => "heading",
-        repository::InsertedElement::Link => "link",
-    };
-    let messages = [
-        ChatMessage { role: "system".into(), content: format!("Generate content for one new {element_name} element. Return structured data only: element_type must be {element_name}; text is plain text, never HTML. For a link, provide its destination in href without quote delimiters. Do not return markup, paths, source text, offsets, or insertion positions. Return exactly one JSON object matching the supplied schema.") },
-        ChatMessage { role: "user".into(), content: format!("Original request: {prompt}\n\nSelected insertion anchor: {}", candidate.description()) },
-    ];
-    debug_log(trace, "semantic_generation", format!("Candidate insertion content call started\nSchema supplied: {schema}"));
-    let response = chat_turn(provider, model, &messages, schema, PROTOCOL_TEMPERATURE, "CANDIDATE INSERTION", false, trace).await?;
-    if response.done_reason.as_deref() == Some("length") { return Err("Candidate insertion response was malformed.".into()); }
-    serde_json::from_str(response.message.content.trim()).map_err(|_| "Candidate insertion response was malformed.".to_owned())
-}
-
 async fn run_candidate_text_edit(provider: &impl ModelProvider, model: String, prompt: &str, required_role: CandidateRole, root: &std::path::Path, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<ChatResponse, String> {
-    if let Some(app) = app { let _ = app.emit("repository-inspection-start", ()); }
-    let mut registry = CandidateRegistry::new();
-    let count = repository::discover_html_candidates(root, &mut registry)?;
-    let activity_item = Activity { label: format!("Discovered {count} verified HTML targets") };
-    if let Some(app) = app { let _ = app.emit("repository-activity", &activity_item); }
-    let activity = vec![activity_item];
-    let selected = match select_candidate(provider, &model, prompt, root, &registry, Some(required_role), trace).await? {
-        SelectionOutcome::Selected(view) => view,
-        SelectionOutcome::Ambiguous => return Ok(ChatResponse { model, content: "I found multiple plausible text targets. Please clarify which one you mean.".into(), activity, proposal: None }),
-        SelectionOutcome::NoMatch => return Ok(ChatResponse { model, content: "I found no verified existing text matching that request.".into(), activity, proposal: None }),
-    };
-    if selected.role != required_role { return Err("Selected candidate does not match the requested text target.".into()); }
-    let replacement = generate_candidate_replacement(provider, &model, prompt, root, &registry, &selected.id, trace).await?;
-    if let Some(app) = app { let _ = app.emit("proposal-validation-start", ()); }
-    let summary = format!("Update the {} in {}.", selected.description.to_ascii_lowercase(), selected.path);
-    let semantic_edit = if selected.role.is_attribute() {
-        repository::SemanticEdit::ReplaceAttribute { candidate_id: selected.id.clone(), replacement_value: replacement, summary }
-    } else {
-        repository::SemanticEdit::ReplaceTextCandidate { candidate_id: selected.id.clone(), replacement, summary }
-    };
-    let proposal = repository::validate_semantic_edit(root, &registry, semantic_edit)?;
-    if let Some(pending) = pending {
-        repository::stage_pending_proposal(pending, proposal.clone())?;
-    }
-    debug_log(trace, "semantic_proposal", "Validation: passed\nPending Changes creation: passed");
-    Ok(ChatResponse { model, content: "Done — have a wee look in Changes 👀".into(), activity, proposal: Some(proposal) })
+    let inference = SemanticInferenceAdapter { provider, trace };
+    let result = editing::run_text_replacement(&inference, &model, prompt, required_role, root, pending, app).await?;
+    Ok(ChatResponse { model, content: result.content, activity: result.activity, proposal: result.proposal })
 }
 
 async fn run_candidate_insertion(provider: &impl ModelProvider, model: String, prompt: &str, anchor_role: CandidateRole, position: repository::CandidatePosition, element: repository::InsertedElement, root: &std::path::Path, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<ChatResponse, String> {
-    if let Some(app) = app { let _ = app.emit("repository-inspection-start", ()); }
-    let mut registry = CandidateRegistry::new();
-    let count = repository::discover_html_candidates(root, &mut registry)?;
-    let activity_item = Activity { label: format!("Discovered {count} verified HTML targets") };
-    if let Some(app) = app { let _ = app.emit("repository-activity", &activity_item); }
-    let activity = vec![activity_item];
-    let selected = match select_candidate(provider, &model, prompt, root, &registry, Some(anchor_role), trace).await? {
-        SelectionOutcome::Selected(view) => view,
-        SelectionOutcome::Ambiguous => return Ok(ChatResponse { model, content: "I found multiple plausible insertion anchors. Please clarify which one you mean.".into(), activity, proposal: None }),
-        SelectionOutcome::NoMatch => return Ok(ChatResponse { model, content: "I found no verified existing element matching that insertion request.".into(), activity, proposal: None }),
-    };
-    if selected.role != anchor_role { return Err("Selected candidate does not match the requested insertion anchor.".into()); }
-    let generated = generate_candidate_insertion(provider, &model, prompt, root, &registry, &selected.id, element, trace).await?;
-    let expected_type = match element {
-        repository::InsertedElement::Paragraph => "paragraph",
-        repository::InsertedElement::Heading => "heading",
-        repository::InsertedElement::Link => "link",
-    };
-    if generated.element_type != expected_type {
-        return Err("Candidate insertion response used an unsupported element type.".into());
-    }
-    if element != repository::InsertedElement::Link && generated.href.is_some() {
-        return Err("Only an inserted link may include a destination.".into());
-    }
-    if let Some(app) = app { let _ = app.emit("proposal-validation-start", ()); }
-    let relation = match position { repository::CandidatePosition::Before => "before", repository::CandidatePosition::After => "after" };
-    let proposal = repository::validate_semantic_edit(root, &registry, repository::SemanticEdit::InsertRelative {
-        anchor_candidate_id: selected.id.clone(), position, element, text: generated.text, href: generated.href,
-        summary: format!("Insert a {expected_type} {relation} {} in {}.", selected.description.to_ascii_lowercase(), selected.path),
-    })?;
-    if let Some(pending) = pending { repository::stage_pending_proposal(pending, proposal.clone())?; }
-    debug_log(trace, "semantic_proposal", "Validation: passed\nPending Changes creation: passed");
-    Ok(ChatResponse { model, content: "Done — have a wee look in Changes 👀".into(), activity, proposal: Some(proposal) })
+    let inference = SemanticInferenceAdapter { provider, trace };
+    let result = editing::run_relative_insertion(&inference, &model, prompt, anchor_role, position, element, root, pending, app).await?;
+    Ok(ChatResponse { model, content: result.content, activity: result.activity, proposal: result.proposal })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -465,29 +210,17 @@ impl EvidenceRequirement {
     }
 }
 
-fn is_edit_clause(clause: &str) -> bool {
-    let mut clause = clause.trim();
-    loop {
-        let stripped = ["please ", "can you ", "could you ", "okay ", "ok ", "now "]
-            .iter().find_map(|prefix| clause.strip_prefix(prefix));
-        if let Some(value) = stripped { clause = value.trim_start(); } else { break; }
-    }
-    ["change", "edit", "modify", "fix", "implement", "add", "remove", "rename", "update", "replace", "refactor"]
-        .iter().any(|verb| clause == *verb || clause.starts_with(&format!("{verb} ")))
-        || ["make this change", "make only that change", "prepare this change for review", "prepare it for review", "propose this change for review", "propose the change for review"]
-            .iter().any(|phrase| clause.starts_with(phrase))
-}
-
 fn classify_current_request(prompt: &str) -> RequestPlan {
     let text = prompt.trim().to_ascii_lowercase();
-    let edit = text.split(['.', '!', '?', ';', ',', '\n']).any(is_edit_clause);
+    let intent = editing::classify_request_intent(prompt);
+    let edit = intent == RequestIntent::Edit;
     let selection = requests_candidate_selection(prompt, if edit { RequestIntent::Edit } else { RequestIntent::Answer });
     let repository = edit || selection || file_reference(prompt).is_some() || incomplete_file_reference(prompt).is_some() || has_path_reference(prompt)
         || ["this project", "the project", "this site", "the site", "this page", "the page", "look at the css", "look at the code", "source code", "codebase", "project structure", "repository structure", "repository", "what files", "which files", "list files", "files in ", "files are in ", "directory", "folder", "page heading", "mobile menu", "main heading", "signup form"].iter().any(|phrase| text.contains(phrase));
     let general = matches!(text.as_str(), "hey" | "hello" | "hi" | "how are you" | "how are you?")
         || text.starts_with("what is ") || text.starts_with("what's ") || text.starts_with("explain ")
         || is_drafting_request(&text);
-    RequestPlan { scope: if repository { RequestScope::Repository } else if general { RequestScope::General } else { RequestScope::Unknown }, intent: if edit { RequestIntent::Edit } else { RequestIntent::Answer } }
+    RequestPlan { scope: if repository { RequestScope::Repository } else if general { RequestScope::General } else { RequestScope::Unknown }, intent }
 }
 
 fn is_drafting_request(text: &str) -> bool {
@@ -933,7 +666,7 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
         return Ok(ChatResponse { model, content: if root.is_some() { "I can inspect this project and prepare focused changes for your review. Only the Apply button can write them." } else { "No project is open, so I cannot inspect or propose changes to files." }.into(), activity: vec![], proposal: None });
     }
     let plan = classify_current_request(&last_prompt);
-    let dispatch = dispatch_edit_request(&last_prompt, plan.intent);
+    let dispatch = editing::dispatch_edit_request(&last_prompt, plan.intent);
     match dispatch {
         EditDispatch::Semantic(_) => debug_log(debug_trace, "edit_dispatch", "Edit dispatch: SEMANTIC"),
         EditDispatch::Legacy => debug_log(debug_trace, "edit_dispatch", "Edit dispatch: LEGACY"),
@@ -1121,11 +854,12 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
             let root = root.as_deref().expect("project is open for repository tools");
             let mut registry = CandidateRegistry::new();
             registry.discover_html(root, &request.path)?;
-            let outcome = select_candidate(provider, &model, &last_prompt, root, &registry, None, debug_trace).await?;
+            let inference = SemanticInferenceAdapter { provider, trace: debug_trace };
+            let outcome = editing::select_candidate(&inference, &model, &last_prompt, root, &registry, None).await?;
             let content = match outcome {
-                SelectionOutcome::Selected(view) => format!("Verified target: {} ({}) in {} at lines {}–{}. This selection is read-only; no change is prepared.", view.id, view.description, view.path, view.start_line, view.end_line),
-                SelectionOutcome::Ambiguous => "I found multiple plausible targets. Please clarify which element or location you mean before I select one.".into(),
-                SelectionOutcome::NoMatch => "I found no verified target matching that request in the inspected file. Please specify another file or target.".into(),
+                editing::SelectionOutcome::Selected(view) => format!("Verified target: {} ({}) in {} at lines {}–{}. This selection is read-only; no change is prepared.", view.id, view.description, view.path, view.start_line, view.end_line),
+                editing::SelectionOutcome::Ambiguous => "I found multiple plausible targets. Please clarify which element or location you mean before I select one.".into(),
+                editing::SelectionOutcome::NoMatch => "I found no verified target matching that request in the inspected file. Please specify another file or target.".into(),
             };
             return Ok(ChatResponse { model, content, activity, proposal: None });
         }
@@ -1665,16 +1399,16 @@ mod tests {
         let mut first = CandidateRegistry::new();
         first.discover_html(&root, "src/index.html").unwrap();
         let id = first.model_view()[0].id.clone();
-        assert!(matches!(resolve_selection(&format!(r#"{{"result":"selected","candidate_id":"{id}"}}"#), &first, &root), Ok(SelectionOutcome::Selected(_))));
-        assert_eq!(resolve_selection(r#"{"result":"selected","candidate_id":"unknown"}"#, &first, &root).unwrap_err(), "Unknown candidate ID.");
+        assert!(matches!(editing::resolve_selection(&format!(r#"{{"result":"selected","candidate_id":"{id}"}}"#), &first, &root), Ok(editing::SelectionOutcome::Selected(_))));
+        assert_eq!(editing::resolve_selection(r#"{"result":"selected","candidate_id":"unknown"}"#, &first, &root).unwrap_err(), "Unknown candidate ID.");
         for raw in ["not json", r#"{"result":"selected"}"#, r#"{"result":"ambiguous","candidate_id":"x"}"#, r#"{"result":"no_match","extra":1}"#] {
-            assert_eq!(resolve_selection(raw, &first, &root).unwrap_err(), "Candidate selection response was malformed.");
+            assert_eq!(editing::resolve_selection(raw, &first, &root).unwrap_err(), "Candidate selection response was malformed.");
         }
         let mut second = CandidateRegistry::new();
         second.discover_html(&root, "src/index.html").unwrap();
-        assert_eq!(resolve_selection(&format!(r#"{{"result":"selected","candidate_id":"{id}"}}"#), &second, &root).unwrap_err(), "Unknown candidate ID.");
+        assert_eq!(editing::resolve_selection(&format!(r#"{{"result":"selected","candidate_id":"{id}"}}"#), &second, &root).unwrap_err(), "Unknown candidate ID.");
         std::fs::write(root.join("src/index.html"), "<h1>Changed</h1>").unwrap();
-        assert_eq!(resolve_selection(&format!(r#"{{"result":"selected","candidate_id":"{id}"}}"#), &first, &root).unwrap_err(), "Candidate source changed since discovery. Inspect it again.");
+        assert_eq!(editing::resolve_selection(&format!(r#"{{"result":"selected","candidate_id":"{id}"}}"#), &first, &root).unwrap_err(), "Candidate source changed since discovery. Inspect it again.");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1685,8 +1419,9 @@ mod tests {
         registry.discover_html(&root, "src/index.html").unwrap();
         let provider = StubProvider::new(&["test-model"], &[r#"{"result":"selected","candidate_id":"unknown"}"#]);
         let trace = Arc::new(Mutex::new(TraceBuffer::default()));
-        let error = tauri::async_runtime::block_on(select_candidate(
-            &provider, "test-model", "Select the heading", &root, &registry, None, Some(&trace),
+        let inference = SemanticInferenceAdapter { provider: &provider, trace: Some(&trace) };
+        let error = tauri::async_runtime::block_on(editing::select_candidate(
+            &inference, "test-model", "Select the heading", &root, &registry, None,
         )).unwrap_err();
         assert_eq!(error, "Unknown candidate ID.");
         let report = trace.lock().unwrap().lines.join("\n");
@@ -1704,8 +1439,9 @@ mod tests {
         registry.discover_html(&root, "src/index.html").unwrap();
         let provider = StubProvider::new(&["test-model"], &[]);
         let trace = Arc::new(Mutex::new(TraceBuffer::default()));
-        let error = tauri::async_runtime::block_on(select_candidate(
-            &provider, "test-model", "Select the heading", &root, &registry, None, Some(&trace),
+        let inference = SemanticInferenceAdapter { provider: &provider, trace: Some(&trace) };
+        let error = tauri::async_runtime::block_on(editing::select_candidate(
+            &inference, "test-model", "Select the heading", &root, &registry, None,
         )).unwrap_err();
         assert_eq!(error, "No stub response configured.");
         let report = trace.lock().unwrap().lines.join("\n");
@@ -2028,26 +1764,6 @@ mod tests {
 
     #[test]
     fn heading_capability_gate_rejects_markup_work_and_leaves_other_edits_on_legacy() {
-        let semantic_text = |role| EditDispatch::Semantic(SemanticEditRoute::ReplaceCandidate { role });
-        assert_eq!(dispatch_edit_request("Change the main page heading to Welcome", RequestIntent::Edit), semantic_text(CandidateRole::HeadingOne));
-        assert_eq!(dispatch_edit_request("Change the page title to OrbitNote", RequestIntent::Edit), semantic_text(CandidateRole::DocumentTitle));
-        assert_eq!(dispatch_edit_request("Replace the introductory paragraph with a clearer welcome", RequestIntent::Edit), semantic_text(CandidateRole::Paragraph));
-        assert_eq!(dispatch_edit_request("Change the button text to Continue", RequestIntent::Edit), semantic_text(CandidateRole::Button));
-        assert_eq!(dispatch_edit_request("Change the link text to Start", RequestIntent::Edit), semantic_text(CandidateRole::Link));
-        assert_eq!(dispatch_edit_request("Rename the list item to Primary", RequestIntent::Edit), semantic_text(CandidateRole::ListItem));
-        assert_eq!(dispatch_edit_request("Change the signup link to point to /register", RequestIntent::Edit), semantic_text(CandidateRole::AttributeHref));
-        assert_eq!(dispatch_edit_request("Change the hero image alt text to Elma at her desk", RequestIntent::Edit), semantic_text(CandidateRole::AttributeAlt));
-        assert_eq!(dispatch_edit_request("Change the email input placeholder to you@example.com", RequestIntent::Edit), semantic_text(CandidateRole::AttributePlaceholder));
-        assert_eq!(dispatch_edit_request("Add a paragraph below the main heading saying Built with AIIDE", RequestIntent::Edit), EditDispatch::Semantic(SemanticEditRoute::InsertRelative { anchor: CandidateRole::HeadingOne, position: repository::CandidatePosition::After, element: repository::InsertedElement::Paragraph }));
-        assert_eq!(dispatch_edit_request("Add a small heading before the intro paragraph saying Join us", RequestIntent::Edit), EditDispatch::Semantic(SemanticEditRoute::InsertRelative { anchor: CandidateRole::Paragraph, position: repository::CandidatePosition::Before, element: repository::InsertedElement::Heading }));
-        assert_eq!(dispatch_edit_request("Add a link after the intro paragraph saying View", RequestIntent::Edit), EditDispatch::Semantic(SemanticEditRoute::InsertRelative { anchor: CandidateRole::Paragraph, position: repository::CandidatePosition::After, element: repository::InsertedElement::Link }));
-        assert_eq!(dispatch_edit_request("Add a small heading before the signup form saying Join us", RequestIntent::Edit), EditDispatch::Semantic(SemanticEditRoute::InsertRelative { anchor: CandidateRole::Form, position: repository::CandidatePosition::Before, element: repository::InsertedElement::Heading }));
-        assert_eq!(dispatch_edit_request("Change the main heading to Welcome but preserve the span", RequestIntent::Edit), EditDispatch::Unsupported);
-        assert_eq!(dispatch_edit_request("Improve the signup form accessibility", RequestIntent::Edit), EditDispatch::Legacy);
-        assert_eq!(dispatch_edit_request("In src/site.css, change the body color to black", RequestIntent::Edit), EditDispatch::Legacy);
-        assert_eq!(dispatch_edit_request("In src/app.ts, rename the function to start", RequestIntent::Edit), EditDispatch::Legacy);
-        assert_eq!(dispatch_edit_request("Add a paragraph to src/index.html", RequestIntent::Edit), EditDispatch::Unsupported);
-        assert_eq!(dispatch_edit_request("Change the main heading to Welcome", RequestIntent::Answer), EditDispatch::NotEdit);
         let root = grounding_fixture("unsupported-heading-markup");
         let provider = StubProvider::new(&["test-model"], &[]);
         let response = tauri::async_runtime::block_on(run_agent_with_provider(

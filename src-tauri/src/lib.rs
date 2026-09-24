@@ -1,5 +1,6 @@
 mod project;
 mod ollama;
+mod editing;
 mod repository;
 mod model_profiles;
 mod model_provider;
