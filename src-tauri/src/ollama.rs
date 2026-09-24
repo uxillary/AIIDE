@@ -297,15 +297,15 @@ async fn select_candidate(provider: &impl ModelProvider, model: &str, prompt: &s
         ChatMessage { role: "user".into(), content: format!("Request: {prompt}\nVerified candidates: {candidates}") },
     ];
     // Keep candidate excerpts, source context, and the user's request out of the debug trace.
-    debug_log(trace, "selection", format!("Selection call started\nCandidate count: {}\nSchema supplied: {schema}", views.len()));
+    debug_log(trace, "semantic_selection", format!("Selection call started\nCandidate count: {}\nSchema supplied: {schema}", views.len()));
     let started = Instant::now();
     let response = chat_turn(provider, model, &messages, schema, PROTOCOL_TEMPERATURE, "CANDIDATE SELECTION", false, trace).await.map_err(|error| {
-        debug_log(trace, "selection", format!("Selection call failed after {}ms\nValidation: not run", started.elapsed().as_millis()));
+        debug_log(trace, "semantic_selection", format!("Selection call failed after {}ms\nValidation: not run", started.elapsed().as_millis()));
         error
     })?;
-    debug_log(trace, "selection", format!("Selection response received in {}ms", started.elapsed().as_millis()));
+    debug_log(trace, "semantic_selection", format!("Selection response received in {}ms", started.elapsed().as_millis()));
     if response.done_reason.as_deref() == Some("length") {
-        debug_log(trace, "selection", "Structured action: unavailable\nValidation: failed\nError: Candidate selection response was malformed.");
+        debug_log(trace, "semantic_selection", "Structured action: unavailable\nValidation: failed\nError: Candidate selection response was malformed.");
         return Err("Candidate selection response was malformed.".into());
     }
     let action = serde_json::from_str::<SelectionReply>(response.message.content.trim()).ok();
@@ -316,16 +316,16 @@ async fn select_candidate(provider: &impl ModelProvider, model: &str, prompt: &s
         action.as_ref().and_then(|reply| reply.candidate_id.as_deref())
             .filter(|id| registry.candidate(id).is_some()).unwrap_or("unverified")
     } else { "none" };
-    debug_log(trace, "selection", format!("Structured action: {action_name}\nCandidate ID: {id}"));
+    debug_log(trace, "semantic_selection", format!("Structured action: {action_name}\nCandidate ID: {id}"));
     if action_name == "selected" && !views.iter().any(|view| Some(view.id.as_str()) == action.as_ref().and_then(|reply| reply.candidate_id.as_deref())) {
-        debug_log(trace, "selection", "Validation: failed\nError: Unknown candidate ID.");
+        debug_log(trace, "semantic_selection", "Validation: failed\nError: Unknown candidate ID.");
         return Err("Unknown candidate ID.".into());
     }
     let outcome = resolve_selection(&response.message.content, registry, root).map_err(|error| {
-        debug_log(trace, "selection", format!("Validation: failed\nError: {error}"));
+        debug_log(trace, "semantic_selection", format!("Validation: failed\nError: {error}"));
         error
     })?;
-    debug_log(trace, "selection", match &outcome {
+    debug_log(trace, "semantic_selection", match &outcome {
         SelectionOutcome::Selected(view) => format!("Validation: passed\nSelected ID: {} at {}:{}", view.id, view.path, view.start_line),
         SelectionOutcome::Ambiguous => "Validation: passed\nAmbiguous candidates; clarification required".into(),
         SelectionOutcome::NoMatch => "Validation: passed\nNo matching candidate".into(),
@@ -340,13 +340,13 @@ async fn generate_candidate_replacement(provider: &impl ModelProvider, model: &s
         ChatMessage { role: "system".into(), content: "Generate only the complete replacement value for the selected existing text or attribute candidate. Return the value without surrounding quote delimiters. Do not return HTML, markdown, a path, old text, a source range, a summary, or a proposal. Do not recreate surrounding markup. Return exactly one JSON object with the single field replacement.".into() },
         ChatMessage { role: "user".into(), content: format!("Original request: {prompt}\n\nSelected candidate ({}), current value:\n{}", candidate.description(), candidate.original()) },
     ];
-    debug_log(trace, "generation", format!("Candidate replacement call started\nSchema supplied: {schema}"));
+    debug_log(trace, "semantic_generation", format!("Candidate replacement call started\nSchema supplied: {schema}"));
     let response = chat_turn(provider, model, &messages, schema, PROTOCOL_TEMPERATURE, "CANDIDATE REPLACEMENT", false, trace).await?;
     if response.done_reason.as_deref() == Some("length") { return Err("Candidate replacement response was malformed.".into()); }
     let reply: ReplacementReply = serde_json::from_str(response.message.content.trim())
         .map_err(|_| "Candidate replacement response was malformed.".to_owned())?;
     if reply.replacement.trim().is_empty() { return Err("Candidate replacement must not be empty.".into()); }
-    debug_log(trace, "generation", "Candidate replacement response validated");
+    debug_log(trace, "semantic_generation", "Candidate replacement response validated");
     Ok(reply.replacement)
 }
 
@@ -362,7 +362,7 @@ async fn generate_candidate_insertion(provider: &impl ModelProvider, model: &str
         ChatMessage { role: "system".into(), content: format!("Generate content for one new {element_name} element. Return structured data only: element_type must be {element_name}; text is plain text, never HTML. For a link, provide its destination in href without quote delimiters. Do not return markup, paths, source text, offsets, or insertion positions. Return exactly one JSON object matching the supplied schema.") },
         ChatMessage { role: "user".into(), content: format!("Original request: {prompt}\n\nSelected insertion anchor: {}", candidate.description()) },
     ];
-    debug_log(trace, "generation", format!("Candidate insertion content call started\nSchema supplied: {schema}"));
+    debug_log(trace, "semantic_generation", format!("Candidate insertion content call started\nSchema supplied: {schema}"));
     let response = chat_turn(provider, model, &messages, schema, PROTOCOL_TEMPERATURE, "CANDIDATE INSERTION", false, trace).await?;
     if response.done_reason.as_deref() == Some("length") { return Err("Candidate insertion response was malformed.".into()); }
     serde_json::from_str(response.message.content.trim()).map_err(|_| "Candidate insertion response was malformed.".to_owned())
@@ -383,13 +383,17 @@ async fn run_candidate_text_edit(provider: &impl ModelProvider, model: String, p
     if selected.role != required_role { return Err("Selected candidate does not match the requested text target.".into()); }
     let replacement = generate_candidate_replacement(provider, &model, prompt, root, &registry, &selected.id, trace).await?;
     if let Some(app) = app { let _ = app.emit("proposal-validation-start", ()); }
-    let proposal = repository::validate_candidate_proposal(
-        root, &registry, &selected.id, format!("Update the {} in {}.", selected.description.to_ascii_lowercase(), selected.path), replacement,
-    )?;
+    let summary = format!("Update the {} in {}.", selected.description.to_ascii_lowercase(), selected.path);
+    let semantic_edit = if selected.role.is_attribute() {
+        repository::SemanticEdit::ReplaceAttribute { candidate_id: selected.id.clone(), replacement_value: replacement, summary }
+    } else {
+        repository::SemanticEdit::ReplaceTextCandidate { candidate_id: selected.id.clone(), replacement, summary }
+    };
+    let proposal = repository::validate_semantic_edit(root, &registry, semantic_edit)?;
     if let Some(pending) = pending {
-        *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone());
+        repository::stage_pending_proposal(pending, proposal.clone())?;
     }
-    debug_log(trace, "tool", "Candidate proposal validation: passed\nPending change creation: passed");
+    debug_log(trace, "semantic_proposal", "Validation: passed\nPending Changes creation: passed");
     Ok(ChatResponse { model, content: "Done — have a wee look in Changes 👀".into(), activity, proposal: Some(proposal) })
 }
 
@@ -420,12 +424,12 @@ async fn run_candidate_insertion(provider: &impl ModelProvider, model: String, p
     }
     if let Some(app) = app { let _ = app.emit("proposal-validation-start", ()); }
     let relation = match position { repository::CandidatePosition::Before => "before", repository::CandidatePosition::After => "after" };
-    let proposal = repository::validate_candidate_insertion(
-        root, &registry, &selected.id, position, element, generated.text, generated.href,
-        format!("Insert a {expected_type} {relation} {} in {}.", selected.description.to_ascii_lowercase(), selected.path),
-    )?;
-    if let Some(pending) = pending { *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone()); }
-    debug_log(trace, "tool", "Candidate insertion validation: passed\nPending change creation: passed");
+    let proposal = repository::validate_semantic_edit(root, &registry, repository::SemanticEdit::InsertRelative {
+        anchor_candidate_id: selected.id.clone(), position, element, text: generated.text, href: generated.href,
+        summary: format!("Insert a {expected_type} {relation} {} in {}.", selected.description.to_ascii_lowercase(), selected.path),
+    })?;
+    if let Some(pending) = pending { repository::stage_pending_proposal(pending, proposal.clone())?; }
+    debug_log(trace, "semantic_proposal", "Validation: passed\nPending Changes creation: passed");
     Ok(ChatResponse { model, content: "Done — have a wee look in Changes 👀".into(), activity, proposal: Some(proposal) })
 }
 
@@ -971,7 +975,7 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
                 continue;
             }
             if let Some(app) = app { let _ = app.emit("proposal-validation-start", ()); }
-            debug_log(debug_trace, "tool", format!("propose_change selected\nPath: {}\nReplacements: {}\nValidation: started", edits.first().map(|edit| edit.path.as_str()).unwrap_or("none"), edits.len()));
+            debug_log(debug_trace, "legacy_proposal", format!("propose_change selected\nPath: {}\nReplacements: {}\nValidation: started", edits.first().map(|edit| edit.path.as_str()).unwrap_or("none"), edits.len()));
             let shape = anchor_shape(&edits);
             let proposal = match repository::validate_proposal(root, summary, edits) {
                 Ok(proposal) => proposal,
@@ -988,7 +992,7 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
             if let Some(pending) = pending {
                 *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone());
             }
-            debug_log(debug_trace, "tool", "Proposal validation: passed\nPending change creation: passed");
+            debug_log(debug_trace, "legacy_proposal", "Validation: passed\nPending change creation: passed");
             return Ok(ChatResponse { model: result.model, content: "Done — have a wee look in Changes 👀".into(), activity, proposal: Some(proposal) });
         }
         if let AgentAction::Answer(answer) = action {
@@ -2157,6 +2161,26 @@ mod tests {
         assert_eq!(proposal.changes[0].after, after);
         assert!(pending.0.lock().unwrap().is_some());
         assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), before, "proposal must not write before Apply");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsupported_css_edit_still_uses_the_legacy_proposal_path() {
+        let root = grounding_fixture("legacy-css-edit");
+        let before = "body { color: white; }";
+        std::fs::write(root.join("src/site.css"), before).unwrap();
+        let provider = StubProvider::new(&["test-model"], &[
+            r#"{"action":"read_file","path":"src/site.css"}"#,
+            r#"{"action":"propose_change","summary":"Update body color.","changes":[{"path":"src/site.css","old_text":"color: white","new_text":"color: black"}]}"#,
+        ]);
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "In src/site.css, change the body color from white to black.".into() }],
+            Some(root.clone()), None, None, None,
+        )).unwrap();
+        let proposal = response.proposal.expect("unsupported CSS edits remain reviewable through legacy propose_change");
+        assert_eq!(proposal.changes[0].path, "src/site.css");
+        assert_eq!(proposal.changes[0].after, "body { color: black; }");
+        assert_eq!(std::fs::read_to_string(root.join("src/site.css")).unwrap(), before);
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -51,6 +51,14 @@ pub enum CandidatePosition { Before, After }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InsertedElement { Paragraph, Heading, Link }
 
+/// Application-owned semantic intent. Candidate IDs are resolved against the request-scoped registry.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SemanticEdit {
+    ReplaceTextCandidate { candidate_id: String, replacement: String, summary: String },
+    ReplaceAttribute { candidate_id: String, replacement_value: String, summary: String },
+    InsertRelative { anchor_candidate_id: String, position: CandidatePosition, element: InsertedElement, text: String, href: Option<String>, summary: String },
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewedFile {
@@ -60,6 +68,34 @@ pub struct ViewedFile {
 
 #[derive(Default)]
 pub struct PendingChanges(pub Mutex<Option<PendingProposal>>);
+
+/// Convert supported semantic intent into an application-built proposal using the same validators.
+pub fn validate_semantic_edit(root: &Path, registry: &CandidateRegistry, edit: SemanticEdit) -> Result<PendingProposal, String> {
+    match edit {
+        SemanticEdit::ReplaceTextCandidate { candidate_id, replacement, summary } => {
+            let candidate = registry.candidate(&candidate_id).ok_or("Unknown candidate ID.")?;
+            if candidate.role().is_attribute() || candidate.role() == candidates::CandidateRole::Form {
+                return Err("Text replacement does not match the candidate role.".into());
+            }
+            validate_candidate_proposal(root, registry, &candidate_id, summary, replacement)
+        }
+        SemanticEdit::ReplaceAttribute { candidate_id, replacement_value, summary } => {
+            let candidate = registry.candidate(&candidate_id).ok_or("Unknown candidate ID.")?;
+            if !candidate.role().is_attribute() {
+                return Err("Attribute replacement does not match the candidate role.".into());
+            }
+            validate_candidate_proposal(root, registry, &candidate_id, summary, replacement_value)
+        }
+        SemanticEdit::InsertRelative { anchor_candidate_id, position, element, text, href, summary } => {
+            validate_candidate_insertion(root, registry, &anchor_candidate_id, position, element, text, href, summary)
+        }
+    }
+}
+
+pub fn stage_pending_proposal(pending: &PendingChanges, proposal: PendingProposal) -> Result<(), String> {
+    *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal);
+    Ok(())
+}
 
 #[tauri::command]
 pub fn apply_pending_change(open_project: State<'_, OpenProject>, pending: State<'_, PendingChanges>) -> Result<(), String> {
@@ -534,6 +570,49 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), before, "rejecting a proposal must not write");
         apply_proposal(&root, &proposal).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), proposal.changes[0].after);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn semantic_edits_validate_supported_primitives_and_stage_pending_changes() {
+        let root = fixture();
+        let before = "<head><title>OrbitNote</title></head><body><h1>Main</h1><p>Intro</p><a href=\"/old\">Join</a></body>";
+        fs::write(root.join("page.html"), before).unwrap();
+        let mut registry = CandidateRegistry::new();
+        registry.discover_html(&root, "page.html").unwrap();
+        let views = registry.model_view();
+        let id = |role| views.iter().find(|view| view.role == role).unwrap().id.clone();
+        let heading_id = id(candidates::CandidateRole::HeadingOne);
+        let title_id = id(candidates::CandidateRole::DocumentTitle);
+        let href_id = id(candidates::CandidateRole::AttributeHref);
+        let text = validate_semantic_edit(&root, &registry, SemanticEdit::ReplaceTextCandidate {
+            candidate_id: heading_id.clone(), replacement: "Welcome".into(), summary: "Update heading".into(),
+        }).unwrap();
+        assert!(text.changes[0].after.contains("<h1>Welcome</h1>"));
+        let attribute = validate_semantic_edit(&root, &registry, SemanticEdit::ReplaceAttribute {
+            candidate_id: href_id, replacement_value: "/start".into(), summary: "Update destination".into(),
+        }).unwrap();
+        assert!(attribute.changes[0].after.contains("href=\"/start\""));
+        let insertion = validate_semantic_edit(&root, &registry, SemanticEdit::InsertRelative {
+            anchor_candidate_id: id(candidates::CandidateRole::Paragraph), position: CandidatePosition::After,
+            element: InsertedElement::Heading, text: "Next steps".into(), href: None, summary: "Add heading".into(),
+        }).unwrap();
+        assert!(insertion.changes[0].after.contains("<h2>Next steps</h2>"));
+
+        let pending = PendingChanges::default();
+        stage_pending_proposal(&pending, text.clone()).unwrap();
+        assert_eq!(pending.0.lock().unwrap().as_ref().unwrap().changes[0].after, text.changes[0].after);
+        assert!(validate_semantic_edit(&root, &registry, SemanticEdit::ReplaceTextCandidate {
+            candidate_id: "unknown".into(), replacement: "x".into(), summary: "x".into(),
+        }).unwrap_err().contains("Unknown candidate ID"));
+        assert!(validate_semantic_edit(&root, &registry, SemanticEdit::ReplaceAttribute {
+            candidate_id: heading_id.clone(), replacement_value: "x".into(), summary: "x".into(),
+        }).unwrap_err().contains("does not match"));
+        assert!(validate_semantic_edit(&root, &registry, SemanticEdit::ReplaceTextCandidate {
+            candidate_id: title_id, replacement: "New title".into(), summary: "Update title".into(),
+        }).unwrap().changes[0].after.contains("<title>New title</title>"));
+        fs::write(root.join("page.html"), before.replace("Main", "Externally changed")).unwrap();
+        assert!(validate_semantic_edit(&root, &registry, SemanticEdit::ReplaceTextCandidate {
+            candidate_id: heading_id, replacement: "Stale".into(), summary: "Update heading".into(),
+        }).unwrap_err().contains("changed since discovery"));
         fs::remove_dir_all(root).unwrap();
     }
     #[test] fn candidate_proposals_escape_text_and_fail_closed() {
