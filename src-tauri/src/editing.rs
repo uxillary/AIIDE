@@ -108,7 +108,7 @@ pub(crate) fn dispatch_edit_request(prompt: &str, intent: RequestIntent) -> Edit
     } else if ["list item", "list-item", "bullet text"].iter().any(|target| lower.contains(target)) {
         CandidateRole::ListItem
     } else { return EditDispatch::Legacy; };
-    let structural = ["preserve", "retain", "span", "markup", "<h1", "html", " tag", " class", "style", "color", "background", "font", "size", "alignment", "spacing", "format", "bold", "emphasis"]
+    let structural = ["preserve", "retain", "span", "markup", "<h1", "structure", " tag", " class", "style", "color", "background", "font", "size", "alignment", "spacing", "format", "bold", "emphasis"]
         .iter().any(|term| lower.contains(term));
     let direct_replacement = ["change", "replace", "rename", "set", "update"].iter().any(|verb| lower.contains(verb))
         && (lower.contains(" to ") || lower.contains(" with "));

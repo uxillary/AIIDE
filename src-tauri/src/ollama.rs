@@ -614,8 +614,9 @@ pub async fn ollama_status() -> ProviderStatus {
 }
 
 #[tauri::command]
-pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project: State<'_, OpenProject>, pending: State<'_, PendingChanges>, debug: State<'_, AgentDebug>, app: tauri::AppHandle) -> Result<ChatResponse, String> {
+pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, provider_id: Option<String>, open_project: State<'_, OpenProject>, pending: State<'_, PendingChanges>, debug: State<'_, AgentDebug>, app: tauri::AppHandle) -> Result<ChatResponse, String> {
     let root = open_project.0.lock().map_err(|_| "Project state unavailable")?.clone();
+    let provider_id = provider_id.as_deref().unwrap_or(OLLAMA_PROVIDER_ID);
     let started = Instant::now();
     let (request, trace) = {
         let mut state = debug.0.lock().map_err(|_| "Debug state unavailable")?;
@@ -626,9 +627,9 @@ pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, open_project
     };
     if let Some(trace) = trace.as_ref() {
         let started_at = SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0);
-        debug_log(Some(trace), "agent", format!("==================================================\nAIIDE AGENT DEBUG TRACE\nTrace version: 2\nRequest: #{request}\nStarted at Unix ms: {started_at}\nModel: {model}\nProject open: {}\nPrompt and response content: omitted\nCore agent instructions: included on agent turns\nDefault personality: included only on final conversational turns\n==================================================", root.is_some()));
+        debug_log(Some(trace), "agent", format!("==================================================\nAIIDE AGENT DEBUG TRACE\nTrace version: 2\nRequest: #{request}\nStarted at Unix ms: {started_at}\nProvider: {provider_id}\nModel: {model}\nProject open: {}\nPrompt and response content: omitted\nCore agent instructions: included on agent turns\nDefault personality: included only on final conversational turns\n==================================================", root.is_some()));
     }
-    let result = run_agent(OLLAMA_PROVIDER_ID, model, messages, root, Some(&pending), Some(&app), trace.as_ref()).await;
+    let result = run_agent(provider_id, model, messages, root, Some(&pending), Some(&app), trace.as_ref()).await;
     if let Some(trace) = trace {
         if let Err(error) = &result { debug_log(Some(&trace), "final", format!("FAILED\n{error}")); }
         usage_summary(&trace);
@@ -925,6 +926,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct StubProvider {
+        provider_id: &'static str,
         models: Vec<String>,
         responses: Mutex<VecDeque<InferenceResponse>>,
         formats: Mutex<Vec<Value>>,
@@ -935,7 +937,12 @@ mod tests {
 
     impl StubProvider {
         fn new(models: &[&str], responses: &[&str]) -> Self {
+            Self::new_for_provider(OLLAMA_PROVIDER_ID, models, responses)
+        }
+
+        fn new_for_provider(provider_id: &'static str, models: &[&str], responses: &[&str]) -> Self {
             Self {
+                provider_id,
                 models: models.iter().map(|value| (*value).to_owned()).collect(),
                 responses: Mutex::new(responses.iter().map(|content| InferenceResponse {
                     model: "test-model".into(),
@@ -958,7 +965,10 @@ mod tests {
 
     impl ModelProvider for StubProvider {
         fn metadata(&self) -> ProviderMetadata {
-            ProviderMetadata { id: OLLAMA_PROVIDER_ID, locality: ProviderLocality::Local }
+            ProviderMetadata {
+                id: self.provider_id,
+                locality: if self.provider_id == crate::model_provider::OPENROUTER_PROVIDER_ID { ProviderLocality::Remote } else { ProviderLocality::Local },
+            }
         }
 
         async fn is_available(&self) -> bool { true }
@@ -1484,6 +1494,80 @@ mod tests {
         assert!(!requests[0][1].content.contains("document_title") && !requests[0][1].content.contains("paragraph"));
         assert!(!requests[1].iter().any(|message| message.content.contains("src/index.html")));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn openrouter_provider_uses_the_shared_semantic_text_replacement_flow() {
+        let root = grounding_fixture("openrouter-semantic-replacement");
+        let original = "<h1>Welcome to the Sandbox</h1>";
+        std::fs::write(root.join("src/index.html"), original).unwrap();
+        let pending = PendingChanges::default();
+        let provider = StubProvider::new_for_provider(
+            crate::model_provider::OPENROUTER_PROVIDER_ID,
+            &["test-model"],
+            &["__SELECT_HEADING__", r#"{"replacement":"Welcome to Elma's Sandbox"}"#],
+        );
+        let response = tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider,
+            "test-model".into(),
+            vec![ChatMessage { role: "user".into(), content: "In src/index.html, change the main page heading from \"Welcome to the Sandbox\" to \"Welcome to Elma's Sandbox\". Propose the change for review.".into() }],
+            Some(root.clone()), Some(&pending), None, None,
+        )).unwrap();
+
+        let proposal = response.proposal.expect("OpenRouter semantic edit should prepare a proposal");
+        assert_eq!(proposal.changes[0].before, original);
+        assert_eq!(proposal.changes[0].after, "<h1>Welcome to Elma&#39;s Sandbox</h1>");
+        assert!(pending.0.lock().unwrap().is_some());
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), original);
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 2, "selection and replacement use the same two calls as Ollama");
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[0].last().unwrap().content.contains("\"role\":\"heading_one\""));
+        assert!(!requests[1].iter().any(|message| message.content.contains("old_text")));
+        let formats = provider.formats.lock().unwrap();
+        assert!(formats[0]["properties"].get("candidate_id").is_some());
+        assert_eq!(formats[1]["required"], json!(["replacement"]));
+        drop(formats);
+        drop(requests);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn openrouter_semantic_selection_outcomes_never_create_or_fall_back_to_a_proposal() {
+        for (label, selection, expected) in [
+            ("openrouter-ambiguous", r#"{"result":"ambiguous"}"#, "multiple plausible"),
+            ("openrouter-no-match", r#"{"result":"no_match"}"#, "no verified existing text"),
+            ("openrouter-malformed", "not json", "Candidate selection response was malformed."),
+            ("openrouter-unknown-id", r#"{"result":"selected","candidate_id":"unknown"}"#, "Unknown candidate ID."),
+        ] {
+            let root = grounding_fixture(label);
+            let pending = PendingChanges::default();
+            let provider = StubProvider::new_for_provider(
+                crate::model_provider::OPENROUTER_PROVIDER_ID,
+                &["test-model"],
+                &[selection, r#"{"action":"propose_change","summary":"legacy fallback","changes":[]}"#],
+            );
+            let result = tauri::async_runtime::block_on(run_agent_with_provider(
+                &provider,
+                "test-model".into(),
+                vec![ChatMessage { role: "user".into(), content: "Change the main heading to Changed".into() }],
+                Some(root.clone()), Some(&pending), None, None,
+            ));
+            match expected {
+                "multiple plausible" | "no verified existing text" => {
+                    let response = result.unwrap();
+                    assert!(response.content.contains(expected));
+                    assert!(response.proposal.is_none());
+                }
+                _ => match result {
+                    Err(error) => assert_eq!(error, expected),
+                    Ok(_) => panic!("invalid semantic selection must fail without a proposal"),
+                },
+            }
+            assert!(pending.0.lock().unwrap().is_none());
+            assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 1, "semantic selection must not enter the legacy protocol");
+            assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), "<h1>Welcome</h1>");
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
