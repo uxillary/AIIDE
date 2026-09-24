@@ -104,6 +104,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .workspace-controls label { color: #7b9487; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .image-model-label { max-width: 330px; overflow: hidden; color: #9caaa2; text-overflow: ellipsis; white-space: nowrap; }
 .model-select { max-width: 230px; min-width: 148px; height: 30px; border: 1px solid #35403a; border-radius: 4px; background: #1b201d; padding: 5px 24px 5px 8px; color: #eeeae4; font-family: ui-monospace, monospace; font-size: 11px; }
+.provider-select { max-width: 140px; min-width: 112px; }
 .model-select:disabled { color: #78716c; }
 .small-button, .icon-button, .reject-button { border: 1px solid #35403a; border-radius: 4px; background: #1b201d; color: #b3ada5; font-size: 11px; }
 .small-button { display: inline-flex; min-height: 28px; align-items: center; gap: 6px; padding: 5px 8px; }

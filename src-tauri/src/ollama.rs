@@ -7,7 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, State};
 use crate::editing::{self, EditDispatch, RequestIntent, SemanticEditRoute};
 use crate::model_profiles;
-use crate::model_provider::{InferenceRequest, InferenceResponse, ModelMessage, ModelProvider, OllamaProvider, ProviderErrorKind, SelectedProvider, OLLAMA_PROVIDER_ID};
+use crate::model_provider::{InferenceRequest, InferenceResponse, ModelMessage, ModelProvider, ProviderErrorKind, SelectedProvider, OLLAMA_PROVIDER_ID};
 use crate::project::OpenProject;
 use crate::repository::{self, Activity, PendingChanges, PendingProposal, ProposedReplacement, ToolRequest};
 use crate::repository::candidates::{CandidateRegistry, CandidateRole};
@@ -124,6 +124,10 @@ pub struct ModelInfo { id: String, name: String, profile: model_profiles::ModelP
 
 #[derive(Serialize)]
 pub struct ProviderError { code: &'static str, message: &'static str }
+
+fn selected_provider_id(provider_id: Option<&str>) -> &str {
+    provider_id.unwrap_or(OLLAMA_PROVIDER_ID)
+}
 
 pub type ChatMessage = ModelMessage;
 type ChatPayloadResponse = InferenceResponse;
@@ -602,21 +606,43 @@ async fn conversational_turn(provider: &impl ModelProvider, model: &str, prompt:
 }
 
 #[tauri::command]
-pub async fn ollama_status() -> ProviderStatus {
-    let offline = || ProviderStatus { state: "offline", models: vec![], error: Some(ProviderError { code: "unavailable", message: "Ollama not detected. Start Ollama and try again." }) };
-    let Ok(provider) = OllamaProvider::new(Duration::from_secs(4)) else { return offline() };
-    if !provider.is_available().await { return offline(); }
+pub async fn ollama_status(provider_id: Option<String>) -> ProviderStatus {
+    let provider_id = selected_provider_id(provider_id.as_deref());
+    let provider = match SelectedProvider::from_id(provider_id, Duration::from_secs(4)) {
+        Ok(provider) => provider,
+        Err(error) => return ProviderStatus {
+            state: "error",
+            models: vec![],
+            error: Some(ProviderError {
+                code: if error.kind == ProviderErrorKind::MissingCredential { "missing_credential" } else { "provider_unavailable" },
+                message: if error.kind == ProviderErrorKind::MissingCredential { "OpenRouter requires OPENROUTER_API_KEY in the AIIDE process environment." }
+                    else if provider_id == OLLAMA_PROVIDER_ID { "Could not prepare the Ollama connection." }
+                    else { "The selected AI provider is not configured or supported." },
+            }),
+        },
+    };
+    if provider_id == OLLAMA_PROVIDER_ID && !provider.is_available().await {
+        return ProviderStatus { state: "offline", models: vec![], error: Some(ProviderError { code: "unavailable", message: "Ollama not detected. Start Ollama and try again." }) };
+    }
     match provider.installed_models().await {
         Ok(models) => ProviderStatus { state: "connected", models: models.into_iter().filter(|model| !model.is_empty()).map(|model| ModelInfo { id: model.clone(), profile: model_profiles::resolve(&model), name: model }).collect(), error: None },
-        Err(error) if error.kind == ProviderErrorKind::MalformedResponse => ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "malformed_response", message: "Ollama returned an invalid model list." }) },
-        Err(_) => ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "model_list_failed", message: "Ollama is connected, but its model list could not be loaded." }) },
+        Err(error) if provider_id == OLLAMA_PROVIDER_ID && error.kind == ProviderErrorKind::MalformedResponse => ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "malformed_response", message: "Ollama returned an invalid model list." }) },
+        Err(_) if provider_id == OLLAMA_PROVIDER_ID => ProviderStatus { state: "error", models: vec![], error: Some(ProviderError { code: "model_list_failed", message: "Ollama is connected, but its model list could not be loaded." }) },
+        Err(error) => ProviderStatus {
+            state: "error",
+            models: vec![],
+            error: Some(ProviderError {
+                code: if error.kind == ProviderErrorKind::MissingCredential { "missing_credential" } else { "provider_unavailable" },
+                message: if error.kind == ProviderErrorKind::MissingCredential { "OpenRouter requires OPENROUTER_API_KEY in the AIIDE process environment." } else { "OpenRouter could not load its model list. Check its configuration and retry." },
+            }),
+        },
     }
 }
 
 #[tauri::command]
 pub async fn ollama_chat(model: String, messages: Vec<ChatMessage>, provider_id: Option<String>, open_project: State<'_, OpenProject>, pending: State<'_, PendingChanges>, debug: State<'_, AgentDebug>, app: tauri::AppHandle) -> Result<ChatResponse, String> {
     let root = open_project.0.lock().map_err(|_| "Project state unavailable")?.clone();
-    let provider_id = provider_id.as_deref().unwrap_or(OLLAMA_PROVIDER_ID);
+    let provider_id = selected_provider_id(provider_id.as_deref());
     let started = Instant::now();
     let (request, trace) = {
         let mut state = debug.0.lock().map_err(|_| "Debug state unavailable")?;
@@ -1003,6 +1029,13 @@ mod tests {
             }
             Ok(response)
         }
+    }
+
+    #[test]
+    fn chat_provider_defaults_to_ollama_and_accepts_explicit_provider_ids() {
+        assert_eq!(selected_provider_id(None), OLLAMA_PROVIDER_ID);
+        assert_eq!(selected_provider_id(Some("ollama")), OLLAMA_PROVIDER_ID);
+        assert_eq!(selected_provider_id(Some(crate::model_provider::OPENROUTER_PROVIDER_ID)), crate::model_provider::OPENROUTER_PROVIDER_ID);
     }
 
     #[test]

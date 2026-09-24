@@ -4,12 +4,13 @@ import { save } from '@tauri-apps/plugin-dialog'
 import { ElmaPresence, type ElmaPresentation } from './Elma'
 import { ImageResultCard } from './ImageResultCard'
 import { ImageSetupCard } from './ImageSetupCard'
-import { getAgentDebugStatus, getLatestAgentTrace, ollamaProvider, setAgentDebug } from '../services/ai/ollama'
+import { aiProviders, getAgentDebugStatus, getLatestAgentTrace, setAgentDebug } from '../services/ai/ollama'
 import { comfyUiProvider } from '../services/image/comfyui'
-import type { ChatMessage, PendingProposal, ProviderStatus } from '../types/ai'
+import type { ChatMessage, PendingProposal, ProviderId, ProviderStatus } from '../types/ai'
 import type { ImageEngineStatus, ImageJob } from '../types/image'
 
 const MODEL_KEY = 'aiide.selected-model'
+const PROVIDER_KEY = 'aiide.selected-provider'
 const MODE_KEY = 'aiide.composer-mode'
 const CHAT_DRAFT_KEY = 'aiide.chat-draft'
 const IMAGE_DRAFT_KEY = 'aiide.image-draft'
@@ -19,6 +20,8 @@ const SUCCESS_DISPLAY_MS = 1300
 const ERROR_DISPLAY_MS = 2000
 const IMAGE_POLL_MS = 1200
 const STARTER_PROMPTS = ['Tell me about this project', 'Find where this is implemented', 'Make a small change']
+const providerModelKey = (providerId: ProviderId) => providerId === 'ollama' ? MODEL_KEY : `${MODEL_KEY}.${providerId}`
+const savedProvider = (): ProviderId => localStorage.getItem(PROVIDER_KEY) === 'openrouter' ? 'openrouter' : 'ollama'
 const FALLBACK_IMAGE_MODEL = {
   id: 'sdxl-1.0-base',
   displayName: 'SDXL 1.0 Base',
@@ -77,6 +80,7 @@ function unavailableImageStatus(message: string): ImageEngineStatus {
 
 export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal, onChangePreparation, onElmaPresentationChange, primaryElma }: { projectOpen: boolean; projectBusy: boolean; onOpenProject: () => void; onProposal: (proposal: PendingProposal) => void; onChangePreparation: (active: boolean) => void; onElmaPresentationChange: (presentation: ElmaPresentation) => void; primaryElma: ({ presentation: ElmaPresentation; animation?: Parameters<typeof ElmaPresence>[0]['animation']; onAnimationComplete?: () => void }) | null }) {
   const [mode, setMode] = useState<'chat' | 'image'>(() => localStorage.getItem(MODE_KEY) === 'image' ? 'image' : 'chat')
+  const [selectedProvider, setSelectedProvider] = useState<ProviderId>(savedProvider)
   const [status, setStatus] = useState<ProviderStatus | null>(null)
   const [imageEngine, setImageEngine] = useState<ImageEngineStatus | null>(null)
   const [selectedModel, setSelectedModel] = useState('')
@@ -105,7 +109,9 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
   const chatSubmitRef = useRef(false)
   const imageSubmitRef = useRef(false)
   const endRef = useRef<HTMLDivElement>(null)
-  const checkingRef = useRef(false)
+  const providerRef = useRef<ProviderId>(selectedProvider)
+  providerRef.current = selectedProvider
+  const statusRequestRef = useRef(0)
   const checkingImageRef = useRef(false)
   const inspectionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const terminalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -135,23 +141,35 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
     terminalTimerRef.current = setTimeout(() => setTerminalState(null), duration)
   }, [])
 
-  const refresh = useCallback(async () => {
-    if (checkingRef.current) return
-    checkingRef.current = true
+  const refresh = useCallback(async (providerId: ProviderId = providerRef.current) => {
+    const requestId = ++statusRequestRef.current
     setChecking(true)
     try {
-      const next = await ollamaProvider.getStatus()
+      const next = await aiProviders[providerId].getStatus()
+      if (requestId !== statusRequestRef.current || providerRef.current !== providerId) return
       setStatus(next)
-      setSelectedModel(current => {
-        const saved = localStorage.getItem(MODEL_KEY)
-        return next.models.find(model => model.id === current)?.id
-          ?? next.models.find(model => model.id === saved)?.id
-          ?? next.models[0]?.id ?? ''
-      })
+      setSelectedModel(current => next.models.find(model => model.id === current)?.id
+        ?? next.models.find(model => model.id === localStorage.getItem(providerModelKey(providerId)))?.id
+        ?? next.models[0]?.id ?? '')
     } catch (cause) {
-      setStatus({ state: 'offline', models: [], error: { code: 'unavailable', message: messageOf(cause) } })
-    } finally { checkingRef.current = false; setChecking(false) }
+      if (requestId === statusRequestRef.current && providerRef.current === providerId) {
+        setStatus({ state: 'error', models: [], error: { code: 'unavailable', message: messageOf(cause) } })
+        setSelectedModel('')
+      }
+    } finally {
+      if (requestId === statusRequestRef.current) setChecking(false)
+    }
   }, [])
+
+  function selectProvider(providerId: ProviderId) {
+    if (providerId === selectedProvider || loading) return
+    providerRef.current = providerId
+    setSelectedProvider(providerId)
+    localStorage.setItem(PROVIDER_KEY, providerId)
+    setSelectedModel('')
+    setStatus(null)
+    void refresh(providerId)
+  }
 
   const refreshImage = useCallback(async () => {
     if (checkingImageRef.current) return
@@ -301,7 +319,7 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
     setError(null)
     try {
       const chatMessages = nextMessages.filter(message => message.channel !== 'image' && !message.imageJob)
-      const response = await ollamaProvider.chat({ model, messages: chatMessages.slice(-39).map(({ role, content }) => ({ role, content })) })
+      const response = await aiProviders[selectedProvider].chat({ providerId: selectedProvider, model, messages: chatMessages.slice(-39).map(({ role, content }) => ({ role, content })) })
       setMessages(current => [...current, { role: 'assistant', content: response.content, model: response.model, activity: response.activity, channel: 'chat' }])
       if (response.proposal) onProposal(response.proposal)
       showTerminalState('success', SUCCESS_DISPLAY_MS)
@@ -411,6 +429,7 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
 
   const connected = status?.state === 'connected'
   const chatReady = projectOpen && connected && status.models.length > 0
+  const activeProvider = aiProviders[selectedProvider]
   const imageReady = Boolean(imageEngine?.ready) && !imageEngine?.busy && !activeImage && !loading
   const imageNeedsAttention = Boolean(imageEngine && !imageEngine.ready)
   const ready = mode === 'chat' ? chatReady : imageReady
@@ -432,14 +451,14 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
   }, [elmaState, elmaStatus, elmaActivity, onElmaPresentationChange])
   const placeholder = mode === 'image'
     ? imageReady ? 'Describe an image to generate locally…' : imageEngine?.error ?? 'Connect ComfyUI to generate images'
-    : chatReady ? 'Ask Elma about this project…' : 'Connect Ollama and select a model to chat'
+    : chatReady ? 'Ask Elma about this project…' : `Connect ${activeProvider.name} and select a model to chat`
 
   return <main className="main-panel">
-    <div className="main-label">ELMA · LOCAL AI</div>
+    <div className="main-label">ELMA · {selectedProvider === 'ollama' ? 'LOCAL AI' : 'OPENROUTER AI'}</div>
     <div className="chat-toolbar">
       {mode === 'chat' ? <>
-        <div className="provider-state"><span className={`connection-dot ${connected ? 'connected' : ''}`} /><span>{ollamaProvider.name}</span><span className="connection-state">{checking ? 'Checking…' : connected ? 'Connected' : status?.state === 'error' ? 'Error' : 'Offline'}</span></div>
-        <div className="workspace-controls"><label htmlFor="model">Model</label><select id="model" className="model-select" value={selectedModel} disabled={!chatReady || loading} onChange={event => { setSelectedModel(event.target.value); localStorage.setItem(MODEL_KEY, event.target.value) }}><option value="">{connected && status.models.length ? 'Select model' : 'No models'}</option>{status?.models.map(model => <option key={model.id} value={model.id}>{model.name} — {model.profile.label}</option>)}</select><button className="small-button" aria-pressed={debug} disabled={loading} onClick={() => void toggleDebug()}><span aria-hidden="true">›_</span> Debug {debug ? 'on' : 'off'}</button><button className="icon-button" aria-label="Retry Ollama connection" title="Retry connection" onClick={() => void refresh()} disabled={checking || loading}>↻</button></div>
+        <div className="provider-state"><span className={`connection-dot ${connected ? 'connected' : ''}`} /><span>{activeProvider.name}</span><span className="connection-state">{checking ? 'Checking…' : connected ? 'Connected' : status?.error?.code === 'missing_credential' ? 'Setup required' : status?.state === 'error' ? 'Error' : 'Offline'}</span></div>
+        <div className="workspace-controls"><label htmlFor="provider">Provider</label><select id="provider" className="model-select provider-select" value={selectedProvider} disabled={loading} onChange={event => selectProvider(event.target.value as ProviderId)}><option value="ollama">Ollama</option><option value="openrouter">OpenRouter</option></select><label htmlFor="model">Model</label><select id="model" className="model-select" value={selectedModel} disabled={!chatReady || loading} onChange={event => { setSelectedModel(event.target.value); localStorage.setItem(providerModelKey(selectedProvider), event.target.value) }}><option value="">{checking ? 'Loading models…' : connected && status.models.length ? 'Select model' : status?.error?.code === 'missing_credential' ? 'Configure API key' : 'No models'}</option>{status?.models.map(model => <option key={model.id} value={model.id}>{model.name} — {model.profile.label}</option>)}</select><button className="small-button" aria-pressed={debug} disabled={loading} onClick={() => void toggleDebug()}><span aria-hidden="true">›_</span> Debug {debug ? 'on' : 'off'}</button><button className="icon-button" aria-label={`Retry ${activeProvider.name} connection`} title="Retry connection" onClick={() => void refresh()} disabled={checking || loading}>↻</button></div>
       </> : <>
         <div className="provider-state"><span className={`connection-dot ${imageEngine?.engineStatus === 'reachable' || imageEngine?.engineStatus === 'busy' ? 'connected' : ''}`} /><span>{comfyUiProvider.name}</span><span className="connection-state">{imageConnectionLabel(imageEngine, checkingImage)}</span></div>
         <div className="workspace-controls"><span className="image-model-label">{imageEngine?.model.displayName ?? 'SDXL 1.0 Base'} · {imageEngine?.checkpoint ?? 'sd_xl_base_1.0.safetensors'}</span><button className="small-button" onClick={() => setImageSetupDismissed(false)}>{imageNeedsAttention ? imageEngine?.engineStatus === 'unavailable' ? 'Connect / reconnect' : 'Configure' : 'Details'}</button><button className="icon-button" aria-label="Retry ComfyUI readiness" title="Retry readiness" onClick={() => void refreshImage()} disabled={checkingImage || imageSubmitting}>↻</button></div>
@@ -503,10 +522,10 @@ export function LocalChat({ projectOpen, projectBusy, onOpenProject, onProposal,
     {primaryElma && <ElmaPresence {...primaryElma} />}
     <div className="chat-history">
       {!projectOpen && mode === 'chat' && messages.length === 0 && <div className="chat-empty welcome-state"><span className="eyebrow">LOCAL-FIRST CODING COMPANION</span><h2>Open a project and we'll take a look</h2><p>Elma can inspect your project, prepare focused changes, or switch to Image without opening a folder.</p><button className="primary-button" disabled={projectBusy} onClick={onOpenProject}><span aria-hidden="true">▣</span> {projectBusy ? 'Opening…' : 'Open project'}</button></div>}
-      {projectOpen && mode === 'chat' && !status && <div className="chat-empty">Checking for a local Ollama service…</div>}
-      {projectOpen && mode === 'chat' && status?.state === 'offline' && <div className="chat-empty"><h2>Ollama not detected</h2><p>Start your local Ollama service, then try again.</p><button className="primary-button" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
-      {projectOpen && mode === 'chat' && status?.state === 'error' && <div className="chat-empty"><h2>Ollama connection issue</h2><p>{status.error?.message}</p><button className="primary-button" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
-      {projectOpen && mode === 'chat' && connected && !status.models.length && <div className="chat-empty"><h2>No local models installed</h2><p>Ollama is connected, but no local models are installed. Pull a model with the Ollama CLI, then retry.</p></div>}
+      {projectOpen && mode === 'chat' && !status && <div className="chat-empty">Checking {activeProvider.name} availability…</div>}
+      {projectOpen && mode === 'chat' && status?.state === 'offline' && <div className="chat-empty"><h2>{activeProvider.name} not detected</h2><p>{status.error?.message}</p><button className="primary-button" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
+      {projectOpen && mode === 'chat' && status?.state === 'error' && <div className="chat-empty"><h2>{status.error?.code === 'missing_credential' ? 'OpenRouter setup required' : `${activeProvider.name} connection issue`}</h2><p>{status.error?.message}</p><button className="primary-button" onClick={() => void refresh()} disabled={checking}>Retry</button></div>}
+      {projectOpen && mode === 'chat' && connected && !status.models.length && <div className="chat-empty"><h2>No models available</h2><p>{activeProvider.name} is connected, but no models are available. Retry after checking this provider's model configuration.</p></div>}
       {mode === 'image' && !imageEngine && <div className="chat-empty">Checking the ComfyUI engine and selected model…</div>}
       {mode === 'image' && imageEngine && !imageSetupDismissed && !activeImage && <ImageSetupCard status={imageEngine} checking={checkingImage} saving={configuringImage} onRetry={() => void refreshImage()} onConnect={configureImage} onDismiss={() => setImageSetupDismissed(true)} />}
       {projectOpen && mode === 'chat' && chatReady && messages.length === 0 && <div className="chat-empty project-start"><span className="eyebrow">READY TO HAVE A LOOK</span><h2>What are we working on?</h2><p>I can inspect this project, explain what I find, or prepare a focused edit for review.</p><div className="starter-prompts">{STARTER_PROMPTS.map(starter => <button key={starter} onClick={() => setPrompt(starter)}>{starter}<span aria-hidden="true">→</span></button>)}</div></div>}
