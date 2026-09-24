@@ -29,6 +29,7 @@ pub enum CandidateRole {
     AttributeTitle,
     AttributePlaceholder,
     AttributeAriaLabel,
+    Form,
 }
 
 impl CandidateRole {
@@ -47,6 +48,7 @@ impl CandidateRole {
             Self::AttributeTitle => "title attribute value",
             Self::AttributePlaceholder => "placeholder attribute value",
             Self::AttributeAriaLabel => "aria-label attribute value",
+            Self::Form => "Form element",
         }
     }
 
@@ -62,6 +64,7 @@ pub struct Candidate {
     path: String,
     snapshot_index: usize,
     range: Range<usize>,
+    element_range: Option<Range<usize>>,
     original: String,
     role: CandidateRole,
     description: String,
@@ -73,6 +76,7 @@ impl Candidate {
     pub fn id(&self) -> &str { &self.id }
     pub fn path(&self) -> &str { &self.path }
     pub fn range(&self) -> Range<usize> { self.range.clone() }
+    pub fn element_range(&self) -> Option<Range<usize>> { self.element_range.clone() }
     pub fn original(&self) -> &str { &self.original }
     pub fn role(&self) -> CandidateRole { self.role }
     pub fn description(&self) -> &str { &self.description }
@@ -148,7 +152,7 @@ impl CandidateRegistry {
             let after_context = bounded_prefix(&text[range.end..], MAX_CANDIDATE_CONTEXT_BYTES);
             self.candidates.push(Candidate {
                 id: format!("c{:016x}{:04x}", self.request_id, self.candidates.len() + 1),
-                path: verified_path.clone(), snapshot_index, range, original, role,
+                path: verified_path.clone(), snapshot_index, range, element_range: seed.element_range, original, role,
                 description: if role.is_attribute() { format!("{} on <{}>", role.description(), seed.element) } else { role.description().to_owned() }, before_context, after_context,
             });
         }
@@ -178,7 +182,7 @@ impl CandidateRegistry {
     }
 
     pub fn model_view(&self) -> Vec<CandidateView> {
-        let mut role_counts = [0; 13];
+        let mut role_counts = [0; 14];
         self.candidates.iter().map(|candidate| {
             let snapshot = &self.snapshots[candidate.snapshot_index].text;
             let role_slot = match candidate.role {
@@ -195,6 +199,7 @@ impl CandidateRegistry {
                 CandidateRole::AttributeTitle => 10,
                 CandidateRole::AttributePlaceholder => 11,
                 CandidateRole::AttributeAriaLabel => 12,
+                CandidateRole::Form => 13,
             };
             role_counts[role_slot] += 1;
             CandidateView {
@@ -341,7 +346,7 @@ fn attribute_candidates(text: &str, tag: &Tag<'_>, limit: usize) -> Vec<Candidat
         let attr = role.description().split_whitespace().next().unwrap_or_default();
         counts.get(attr).copied().unwrap_or(0) == 1 && range.start <= range.end && range.len() <= MAX_CANDIDATE_SOURCE_BYTES
             && text.is_char_boundary(range.start) && text.is_char_boundary(range.end)
-    }).take(limit).map(|(role, range, element, context)| CandidateSeed { role, range, element, context }).collect()
+    }).take(limit).map(|(role, range, element, context)| CandidateSeed { role, range, element_range: None, element, context }).collect()
 }
 
 fn simple_element_text(text: &str, content_start: usize, element: &str) -> Option<String> {
@@ -356,12 +361,13 @@ fn simple_element_text(text: &str, content_start: usize, element: &str) -> Optio
 }
 
 struct OpenElement { name: String, hidden: bool }
-struct OpenCandidate { role: CandidateRole, start: usize, depth: usize, inline_tags: usize, supported: bool }
-struct CandidateSeed { role: CandidateRole, range: Range<usize>, element: String, context: String }
+struct OpenCandidate { role: CandidateRole, start: usize, element_start: usize, depth: usize, inline_tags: usize, supported: bool }
+struct CandidateSeed { role: CandidateRole, range: Range<usize>, element_range: Option<Range<usize>>, element: String, context: String }
 
 fn extract_html(text: &str, limit: usize) -> Vec<CandidateSeed> {
     let mut found = Vec::new();
     let mut stack: Vec<OpenElement> = Vec::new();
+    let mut open_forms: Vec<(usize, usize, usize)> = Vec::new();
     let mut active: Option<OpenCandidate> = None;
     let mut cursor = 0;
     while cursor < text.len() && found.len() < limit {
@@ -389,6 +395,7 @@ fn extract_html(text: &str, limit: usize) -> Vec<CandidateSeed> {
         if tag.closing {
             if !stack.last().is_some_and(|open| open.name == name) {
                 stack.clear();
+                open_forms.clear();
                 active = None;
                 continue;
             }
@@ -407,10 +414,23 @@ fn extract_html(text: &str, limit: usize) -> Vec<CandidateSeed> {
                             CandidateRole::ListItem => "li",
                             _ => "",
                         };
-                        found.push(CandidateSeed { role: candidate.role, range, element: element.to_owned(), context: String::new() });
+                        found.push(CandidateSeed { role: candidate.role, range, element_range: Some(candidate.element_start..tag.end), element: element.to_owned(), context: String::new() });
                     }
                 } else {
                     active = Some(candidate);
+                }
+            }
+            if name == "form" {
+                if let Some((element_start, content_start, depth)) = open_forms.pop() {
+                    if depth == stack.len() && start.saturating_sub(content_start) <= MAX_CANDIDATE_SOURCE_BYTES && found.len() < limit {
+                        found.push(CandidateSeed {
+                            role: CandidateRole::Form,
+                            range: content_start..start,
+                            element_range: Some(element_start..tag.end),
+                            element: "form".to_owned(),
+                            context: String::new(),
+                        });
+                    }
                 }
             }
             stack.pop();
@@ -426,6 +446,9 @@ fn extract_html(text: &str, limit: usize) -> Vec<CandidateSeed> {
             if !supported_inline { candidate.supported = false; }
         }
         let excluded = stack.iter().any(|open| open.hidden || matches!(open.name.as_str(), "head" | "script" | "style" | "template" | "noscript" | "svg" | "textarea"));
+        if name == "form" && !hidden && !excluded && !tag.self_closing {
+            open_forms.push((start, tag.end, stack.len() + 1));
+        }
         if !hidden && !excluded && found.len() < limit {
             found.extend(attribute_candidates(text, &tag, limit - found.len()));
         }
@@ -441,7 +464,7 @@ fn extract_html(text: &str, limit: usize) -> Vec<CandidateSeed> {
         };
         if active.is_none() && !hidden && !tag.self_closing {
             if let Some(role) = role {
-                active = Some(OpenCandidate { role, start: tag.end, depth: stack.len() + 1, inline_tags: 0, supported: true });
+                active = Some(OpenCandidate { role, start: tag.end, element_start: start, depth: stack.len() + 1, inline_tags: 0, supported: true });
             }
         }
         if !tag.self_closing && !void_element(&name) {

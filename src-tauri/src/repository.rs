@@ -45,6 +45,12 @@ pub struct PendingProposal {
     pub changes: Vec<PendingChange>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CandidatePosition { Before, After }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum InsertedElement { Paragraph, Heading, Link }
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewedFile {
@@ -199,7 +205,7 @@ pub fn validate_candidate_proposal(root: &Path, registry: &CandidateRegistry, ca
 }
 
 fn safe_attribute_url(role: candidates::CandidateRole, value: &str) -> bool {
-    if value.is_empty() { return false; }
+    if value.is_empty() || value.chars().any(char::is_control) { return false; }
     let Some((scheme, _)) = value.split_once(':') else { return true; };
     let first_path_delimiter = value.find(|character| matches!(character, '/' | '?' | '#')).unwrap_or(value.len());
     if value.find(':').unwrap_or(value.len()) > first_path_delimiter { return true; }
@@ -219,6 +225,61 @@ fn safe_attribute_url(role: candidates::CandidateRole, value: &str) -> bool {
             && remainder.strip_prefix("//").is_some_and(|authority| !authority.split(|character| matches!(character, '/' | '?' | '#')).next().unwrap_or_default().is_empty()),
         _ => false,
     }
+}
+
+pub fn validate_candidate_insertion(
+    root: &Path,
+    registry: &CandidateRegistry,
+    candidate_id: &str,
+    position: CandidatePosition,
+    element: InsertedElement,
+    text: String,
+    href: Option<String>,
+    summary: String,
+) -> Result<PendingProposal, String> {
+    if summary.trim().is_empty() || summary.chars().count() > 240 { return Err("Proposal summary is missing or too long.".into()); }
+    if text.trim().is_empty() || text.len() > candidates::MAX_CANDIDATE_SOURCE_BYTES { return Err("Inserted text is empty or exceeds the size limit.".into()); }
+    let candidate = registry.verify_current(root, candidate_id)?;
+    if !matches!(candidate.role(), candidates::CandidateRole::HeadingOne | candidates::CandidateRole::Paragraph | candidates::CandidateRole::Form) {
+        return Err("Insertion anchor must be a verified heading, paragraph, or form.".into());
+    }
+    let element_range = candidate.element_range().ok_or("Insertion anchor has no verified element boundary.")?;
+    let content_range = candidate.range();
+    let before = registry.snapshot_for(candidate_id).ok_or("Unknown candidate ID.")?.to_owned();
+    if before.get(element_range.clone()).is_none() || before.get(content_range.clone()).is_none()
+        || content_range.start < element_range.start || content_range.end > element_range.end {
+        return Err("Insertion anchor range is invalid.".into());
+    }
+    let escaped_text = escape_html_text(&text);
+    let html = match (element, href) {
+        (InsertedElement::Paragraph, None) => format!("<p>{escaped_text}</p>"),
+        (InsertedElement::Heading, None) => format!("<h2>{escaped_text}</h2>"),
+        (InsertedElement::Link, Some(href)) if safe_attribute_url(candidates::CandidateRole::AttributeHref, href.trim()) => {
+            format!("<a href=\"{}\">{escaped_text}</a>", escape_html_text(&href))
+        }
+        (InsertedElement::Link, Some(_)) => return Err("Attribute URL uses an unsupported or unsafe scheme.".into()),
+        (InsertedElement::Link, None) => return Err("Inserted link requires a safe destination.".into()),
+        (_, Some(_)) => return Err("Only inserted links may include a destination.".into()),
+    };
+    if candidate.path().len() + before.len() + html.len() > MAX_PROPOSAL_BYTES {
+        return Err("Proposal exceeds the size limit.".into());
+    }
+    let offset = match position { CandidatePosition::Before => element_range.start, CandidatePosition::After => element_range.end };
+    let line_start = before[..element_range.start].rfind('\n').map_or(0, |index| index + 1);
+    let prefix = &before[line_start..element_range.start];
+    let newline = if before.contains("\r\n") { "\r\n" } else { "\n" };
+    let insertion = if prefix.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+        let indentation = prefix;
+        match position {
+            CandidatePosition::Before => format!("{html}{newline}{indentation}"),
+            CandidatePosition::After => format!("{newline}{indentation}{html}"),
+        }
+    } else { html };
+    let mut after = String::with_capacity(before.len() + insertion.len());
+    after.push_str(&before[..offset]);
+    after.push_str(&insertion);
+    after.push_str(&before[offset..]);
+    Ok(PendingProposal { summary: summary.trim().to_owned(), changes: vec![PendingChange { path: candidate.path().to_owned(), before, after, replacements: 1 }] })
 }
 
 pub fn apply_proposal(root: &Path, proposal: &PendingProposal) -> Result<(), String> {
@@ -506,6 +567,31 @@ mod tests {
         assert!(validate_candidate_proposal(&root, &registry, &href.id, "Unsafe URL".into(), "javascript:alert(1)".into()).unwrap_err().contains("unsafe scheme"));
         fs::write(root.join("page.html"), before.replace("/old", "/external" )).unwrap();
         assert!(validate_candidate_proposal(&root, &registry, &href.id, "Stale URL".into(), "/new".into()).unwrap_err().contains("changed since discovery"));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn candidate_insertion_uses_verified_element_bounds_and_apply_rejects_stale_file() {
+        let root = fixture();
+        let path = root.join("page.html");
+        let before = "<body>\r\n  <h1>Main</h1>\r\n</body>";
+        fs::write(&path, before).unwrap();
+        let mut registry = CandidateRegistry::new();
+        registry.discover_html(&root, "page.html").unwrap();
+        let heading = registry.model_view().into_iter().find(|candidate| candidate.role == candidates::CandidateRole::HeadingOne).unwrap();
+        let anchor = registry.candidate(&heading.id).unwrap();
+        let element_range = anchor.element_range().unwrap();
+        assert_eq!(&before[element_range], "<h1>Main</h1>");
+        let proposal = validate_candidate_insertion(
+            &root, &registry, &heading.id, CandidatePosition::After, InsertedElement::Paragraph,
+            "Built <AIIDE>".into(), None, "Insert paragraph".into(),
+        ).unwrap();
+        assert_eq!(proposal.changes[0].after, "<body>\r\n  <h1>Main</h1>\r\n  <p>Built &lt;AIIDE&gt;</p>\r\n</body>");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "proposal construction must not write");
+        assert!(validate_candidate_insertion(
+            &root, &registry, &heading.id, CandidatePosition::After, InsertedElement::Link,
+            "Unsafe".into(), Some("javascript:alert(1)".into()), "Unsafe link".into(),
+        ).unwrap_err().contains("unsafe scheme"));
+        fs::write(&path, before.replace("Main", "Changed elsewhere")).unwrap();
+        assert!(apply_proposal(&root, &proposal).unwrap_err().contains("changed since"));
         fs::remove_dir_all(root).unwrap();
     }
     #[test] fn rejects_unsafe_missing_ambiguous_and_noop_proposals() {

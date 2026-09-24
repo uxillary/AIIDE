@@ -161,12 +161,45 @@ enum SelectionOutcome { Selected(CandidateView), Ambiguous, NoMatch }
 #[serde(deny_unknown_fields)]
 struct ReplacementReply { replacement: String }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InsertionReply { element_type: String, text: String, href: Option<String> }
+
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum CandidateEditRoute { Legacy, Text(CandidateRole), Unsupported }
+enum CandidateEditRoute {
+    Legacy,
+    Text(CandidateRole),
+    Insert { anchor: CandidateRole, position: repository::CandidatePosition, element: repository::InsertedElement },
+    Unsupported,
+}
 
 fn candidate_text_edit_route(prompt: &str, intent: RequestIntent) -> CandidateEditRoute {
     if intent != RequestIntent::Edit { return CandidateEditRoute::Legacy; }
     let lower = prompt.trim().to_ascii_lowercase();
+    let insertion_verbs = lower.split(|character: char| !character.is_ascii_alphanumeric()).filter(|word| !word.is_empty()).collect::<Vec<_>>();
+    if insertion_verbs.iter().any(|word| matches!(*word, "add" | "insert" | "append" | "create")) {
+        if insertion_verbs.iter().any(|word| matches!(*word, "append" | "create")) {
+            return CandidateEditRoute::Unsupported;
+        }
+        let relations = [("after", repository::CandidatePosition::After), ("below", repository::CandidatePosition::After), ("beneath", repository::CandidatePosition::After), ("before", repository::CandidatePosition::Before), ("above", repository::CandidatePosition::Before)];
+        let Some((position_at, relation, position)) = relations.iter().filter_map(|(relation, position)| lower.find(relation).map(|at| (at, *relation, *position))).min_by_key(|(at, _, _)| *at) else {
+            return CandidateEditRoute::Unsupported;
+        };
+        let content_request = &lower[..position_at];
+        let anchor_request = &lower[position_at + relation.len()..];
+        let element = if content_request.contains("paragraph") { Some(repository::InsertedElement::Paragraph) }
+            else if content_request.contains("link") { Some(repository::InsertedElement::Link) }
+            else if content_request.contains("heading") { Some(repository::InsertedElement::Heading) }
+            else { None };
+        let anchor = if anchor_request.contains("heading") { Some(CandidateRole::HeadingOne) }
+            else if anchor_request.contains("paragraph") { Some(CandidateRole::Paragraph) }
+            else if anchor_request.contains("form") { Some(CandidateRole::Form) }
+            else { None };
+        return match (anchor, element) {
+            (Some(anchor), Some(element)) => CandidateEditRoute::Insert { anchor, position, element },
+            _ => CandidateEditRoute::Unsupported,
+        };
+    }
     let attribute_role = if lower.contains("aria-label") { Some(CandidateRole::AttributeAriaLabel) }
     else if lower.contains("placeholder") { Some(CandidateRole::AttributePlaceholder) }
     else if lower.contains("alt text") || lower.contains("image alt") { Some(CandidateRole::AttributeAlt) }
@@ -221,6 +254,24 @@ fn replacement_schema() -> Value {
     json!({"type":"object","properties":{
         "replacement":{"type":"string","minLength":1,"maxLength":repository::MAX_PROPOSAL_BYTES}
     },"required":["replacement"],"additionalProperties":false})
+}
+
+fn insertion_schema(element: repository::InsertedElement) -> Value {
+    let element_type = match element {
+        repository::InsertedElement::Paragraph => "paragraph",
+        repository::InsertedElement::Heading => "heading",
+        repository::InsertedElement::Link => "link",
+    };
+    let mut properties = json!({
+        "element_type":{"type":"string","enum":[element_type]},
+        "text":{"type":"string","minLength":1,"maxLength":repository::candidates::MAX_CANDIDATE_SOURCE_BYTES}
+    });
+    let mut required = vec!["element_type", "text"];
+    if element == repository::InsertedElement::Link {
+        properties["href"] = json!({"type":"string","minLength":1,"maxLength":repository::candidates::MAX_CANDIDATE_SOURCE_BYTES});
+        required.push("href");
+    }
+    json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
 
 fn resolve_selection(raw: &str, registry: &CandidateRegistry, root: &std::path::Path) -> Result<SelectionOutcome, String> {
@@ -299,6 +350,24 @@ async fn generate_candidate_replacement(provider: &impl ModelProvider, model: &s
     Ok(reply.replacement)
 }
 
+async fn generate_candidate_insertion(provider: &impl ModelProvider, model: &str, prompt: &str, root: &std::path::Path, registry: &CandidateRegistry, candidate_id: &str, element: repository::InsertedElement, trace: Option<&Trace>) -> Result<InsertionReply, String> {
+    let candidate = registry.verify_current(root, candidate_id)?;
+    let schema = insertion_schema(element);
+    let element_name = match element {
+        repository::InsertedElement::Paragraph => "paragraph",
+        repository::InsertedElement::Heading => "heading",
+        repository::InsertedElement::Link => "link",
+    };
+    let messages = [
+        ChatMessage { role: "system".into(), content: format!("Generate content for one new {element_name} element. Return structured data only: element_type must be {element_name}; text is plain text, never HTML. For a link, provide its destination in href without quote delimiters. Do not return markup, paths, source text, offsets, or insertion positions. Return exactly one JSON object matching the supplied schema.") },
+        ChatMessage { role: "user".into(), content: format!("Original request: {prompt}\n\nSelected insertion anchor: {}", candidate.description()) },
+    ];
+    debug_log(trace, "generation", format!("Candidate insertion content call started\nSchema supplied: {schema}"));
+    let response = chat_turn(provider, model, &messages, schema, PROTOCOL_TEMPERATURE, "CANDIDATE INSERTION", false, trace).await?;
+    if response.done_reason.as_deref() == Some("length") { return Err("Candidate insertion response was malformed.".into()); }
+    serde_json::from_str(response.message.content.trim()).map_err(|_| "Candidate insertion response was malformed.".to_owned())
+}
+
 async fn run_candidate_text_edit(provider: &impl ModelProvider, model: String, prompt: &str, required_role: CandidateRole, root: &std::path::Path, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<ChatResponse, String> {
     if let Some(app) = app { let _ = app.emit("repository-inspection-start", ()); }
     let mut registry = CandidateRegistry::new();
@@ -321,6 +390,42 @@ async fn run_candidate_text_edit(provider: &impl ModelProvider, model: String, p
         *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone());
     }
     debug_log(trace, "tool", "Candidate proposal validation: passed\nPending change creation: passed");
+    Ok(ChatResponse { model, content: "Done — have a wee look in Changes 👀".into(), activity, proposal: Some(proposal) })
+}
+
+async fn run_candidate_insertion(provider: &impl ModelProvider, model: String, prompt: &str, anchor_role: CandidateRole, position: repository::CandidatePosition, element: repository::InsertedElement, root: &std::path::Path, pending: Option<&PendingChanges>, app: Option<&tauri::AppHandle>, trace: Option<&Trace>) -> Result<ChatResponse, String> {
+    if let Some(app) = app { let _ = app.emit("repository-inspection-start", ()); }
+    let mut registry = CandidateRegistry::new();
+    let count = repository::discover_html_candidates(root, &mut registry)?;
+    let activity_item = Activity { label: format!("Discovered {count} verified HTML targets") };
+    if let Some(app) = app { let _ = app.emit("repository-activity", &activity_item); }
+    let activity = vec![activity_item];
+    let selected = match select_candidate(provider, &model, prompt, root, &registry, Some(anchor_role), trace).await? {
+        SelectionOutcome::Selected(view) => view,
+        SelectionOutcome::Ambiguous => return Ok(ChatResponse { model, content: "I found multiple plausible insertion anchors. Please clarify which one you mean.".into(), activity, proposal: None }),
+        SelectionOutcome::NoMatch => return Ok(ChatResponse { model, content: "I found no verified existing element matching that insertion request.".into(), activity, proposal: None }),
+    };
+    if selected.role != anchor_role { return Err("Selected candidate does not match the requested insertion anchor.".into()); }
+    let generated = generate_candidate_insertion(provider, &model, prompt, root, &registry, &selected.id, element, trace).await?;
+    let expected_type = match element {
+        repository::InsertedElement::Paragraph => "paragraph",
+        repository::InsertedElement::Heading => "heading",
+        repository::InsertedElement::Link => "link",
+    };
+    if generated.element_type != expected_type {
+        return Err("Candidate insertion response used an unsupported element type.".into());
+    }
+    if element != repository::InsertedElement::Link && generated.href.is_some() {
+        return Err("Only an inserted link may include a destination.".into());
+    }
+    if let Some(app) = app { let _ = app.emit("proposal-validation-start", ()); }
+    let relation = match position { repository::CandidatePosition::Before => "before", repository::CandidatePosition::After => "after" };
+    let proposal = repository::validate_candidate_insertion(
+        root, &registry, &selected.id, position, element, generated.text, generated.href,
+        format!("Insert a {expected_type} {relation} {} in {}.", selected.description.to_ascii_lowercase(), selected.path),
+    )?;
+    if let Some(pending) = pending { *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone()); }
+    debug_log(trace, "tool", "Candidate insertion validation: passed\nPending change creation: passed");
     Ok(ChatResponse { model, content: "Done — have a wee look in Changes 👀".into(), activity, proposal: Some(proposal) })
 }
 
@@ -800,7 +905,8 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
         return Ok(ChatResponse { model, content: if root.is_some() { "I can inspect this project and prepare focused changes for your review. Only the Apply button can write them." } else { "No project is open, so I cannot inspect or propose changes to files." }.into(), activity: vec![], proposal: None });
     }
     let plan = classify_current_request(&last_prompt);
-    if unsupported_insertion_request(&last_prompt, plan.intent) {
+    if unsupported_insertion_request(&last_prompt, plan.intent)
+        && !matches!(candidate_text_edit_route(&last_prompt, plan.intent), CandidateEditRoute::Insert { .. }) {
         return Ok(ChatResponse {
             model,
             content: "I can draft the paragraph, but the current editing workflow cannot insert new content into a file. Ask me to write a paragraph you could add, then add it manually. Existing supported heading replacements can still be prepared for review.".into(),
@@ -809,13 +915,16 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
         });
     }
     match candidate_text_edit_route(&last_prompt, plan.intent) {
+        CandidateEditRoute::Insert { anchor, position, element } if root.is_some() => {
+            return run_candidate_insertion(provider, model, &last_prompt, anchor, position, element, root.as_deref().unwrap(), pending, app, debug_trace).await;
+        }
         CandidateEditRoute::Text(role) if root.is_some() => {
             return run_candidate_text_edit(provider, model, &last_prompt, role, root.as_deref().unwrap(), pending, app, debug_trace).await;
         }
         CandidateEditRoute::Unsupported if root.is_some() => {
-            return Ok(ChatResponse { model, content: "This application-led text editor only supports replacing the complete text of a supported existing title, heading, paragraph, button, link, label, or list item. It cannot preserve nested markup or rearrange child elements, and it cannot edit attributes.".into(), activity: vec![], proposal: None });
+            return Ok(ChatResponse { model, content: "This application-led editor supports verified text and attribute replacements, plus inserting a simple paragraph, heading, or link before or after an existing heading, paragraph, or form. It cannot preserve nested markup for structural edits or guess a target.".into(), activity: vec![], proposal: None });
         }
-        CandidateEditRoute::Legacy | CandidateEditRoute::Text(_) | CandidateEditRoute::Unsupported => {}
+        CandidateEditRoute::Legacy | CandidateEditRoute::Text(_) | CandidateEditRoute::Insert { .. } | CandidateEditRoute::Unsupported => {}
     }
     let selection_requested = requests_candidate_selection(&last_prompt, plan.intent);
     debug_log(debug_trace, "agent", format!("Current request plan: scope={:?}, intent={:?}", plan.scope, plan.intent));
@@ -1085,7 +1194,7 @@ mod tests {
             self.formats.lock().unwrap().push(request.format.clone());
             self.requests.lock().unwrap().push(request.messages.to_vec());
             let mut response = self.responses.lock().unwrap().pop_front().ok_or_else(|| ProviderFailure::new(ProviderErrorKind::Api, "No stub response configured."))?;
-            if matches!(response.message.content.as_str(), "__SELECT_FIRST__" | "__SELECT_HEADING__" | "__SELECT_PARAGRAPH__" | "__SELECT_BUTTON__" | "__SELECT_LINK__" | "__SELECT_LABEL__" | "__SELECT_LIST_ITEM__" | "__SELECT_HREF__" | "__SELECT_ALT__" | "__SELECT_PLACEHOLDER__") {
+            if matches!(response.message.content.as_str(), "__SELECT_FIRST__" | "__SELECT_HEADING__" | "__SELECT_PARAGRAPH__" | "__SELECT_BUTTON__" | "__SELECT_LINK__" | "__SELECT_LABEL__" | "__SELECT_LIST_ITEM__" | "__SELECT_HREF__" | "__SELECT_ALT__" | "__SELECT_PLACEHOLDER__" | "__SELECT_FORM__") {
                 let payload = request.messages.last().unwrap().content.split_once("Verified candidates: ").unwrap().1;
                 let views: Value = serde_json::from_str(payload).unwrap();
                 let selected = match response.message.content.as_str() {
@@ -1098,6 +1207,7 @@ mod tests {
                     "__SELECT_HREF__" => views.as_array().unwrap().iter().find(|view| view["role"] == "attribute_href" && view["roleIndex"] == 1).unwrap(),
                     "__SELECT_ALT__" => views.as_array().unwrap().iter().find(|view| view["role"] == "attribute_alt" && view["roleIndex"] == 1).unwrap(),
                     "__SELECT_PLACEHOLDER__" => views.as_array().unwrap().iter().find(|view| view["role"] == "attribute_placeholder" && view["roleIndex"] == 1).unwrap(),
+                    "__SELECT_FORM__" => views.as_array().unwrap().iter().find(|view| view["role"] == "form" && view["roleIndex"] == 1).unwrap(),
                     _ => &views[0],
                 };
                 response.message.content = format!("{{\"result\":\"selected\",\"candidate_id\":\"{}\"}}", selected["id"].as_str().unwrap());
@@ -1717,6 +1827,80 @@ mod tests {
     }
 
     #[test]
+    fn application_led_insertions_use_selected_element_boundaries_and_pending_changes() {
+        for (request, selection, generated, expected_after) in [
+            (
+                "Add a paragraph below the main heading saying Built <AIIDE>.", "__SELECT_HEADING__",
+                r#"{"element_type":"paragraph","text":"Built <AIIDE>"}"#,
+                "<body>\r\n  <h1>Main</h1>\r\n  <p>Built &lt;AIIDE&gt;</p>\r\n  <p>Intro</p>\r\n</body>",
+            ),
+            (
+                "Add a small heading before the intro paragraph saying Join & us.", "__SELECT_PARAGRAPH__",
+                r#"{"element_type":"heading","text":"Join & us"}"#,
+                "<body>\r\n  <h1>Main</h1>\r\n  <h2>Join &amp; us</h2>\r\n  <p>Intro</p>\r\n</body>",
+            ),
+            (
+                "Add a link after the intro paragraph that says View on GitHub and points to https://github.com/uxillary/AIIDE?ref=a&next=b.", "__SELECT_PARAGRAPH__",
+                r#"{"element_type":"link","text":"View on GitHub","href":"https://github.com/uxillary/AIIDE?ref=a&next=b"}"#,
+                "<body>\r\n  <h1>Main</h1>\r\n  <p>Intro</p>\r\n  <a href=\"https://github.com/uxillary/AIIDE?ref=a&amp;next=b\">View on GitHub</a>\r\n</body>",
+            ),
+            (
+                "Add a small heading before the signup form saying Join us.", "__SELECT_FORM__",
+                r#"{"element_type":"heading","text":"Join us"}"#,
+                "<body>\r\n  <h1>Main</h1>\r\n  <h2>Join us</h2>\r\n  <form id='signup'><label>Email</label><input></form>\r\n</body>",
+            ),
+        ] {
+            let root = grounding_fixture("candidate-insertion-edit");
+            let before = if selection == "__SELECT_FORM__" {
+                "<body>\r\n  <h1>Main</h1>\r\n  <form id='signup'><label>Email</label><input></form>\r\n</body>"
+            } else {
+                "<body>\r\n  <h1>Main</h1>\r\n  <p>Intro</p>\r\n</body>"
+            };
+            std::fs::write(root.join("src/index.html"), before).unwrap();
+            let pending = PendingChanges::default();
+            let provider = StubProvider::new(&["test-model"], &[selection, generated]);
+            let response = tauri::async_runtime::block_on(run_agent_with_provider(
+                &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: request.into() }],
+                Some(root.clone()), Some(&pending), None, None,
+            )).unwrap();
+            let proposal = response.proposal.unwrap_or_else(|| panic!("insertion should reach pending Changes; response: {}", response.content));
+            assert_eq!(proposal.changes[0].before, before);
+            assert_eq!(proposal.changes[0].after, expected_after);
+            assert!(pending.0.lock().unwrap().is_some());
+            assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), before, "proposal construction must not write");
+            assert!(!generated.contains("old_text") && !generated.contains("\"offset\"") && !generated.contains("\"position\""));
+            let formats = provider.formats.lock().unwrap();
+            let schema = &formats[1];
+            assert!(!schema["properties"].get("position").is_some());
+            assert!(!schema["properties"].get("offset").is_some());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn application_led_insertion_ambiguity_and_missing_anchor_do_not_fall_back() {
+        for (html, request, selection, message) in [
+            ("<body><h1>First</h1><h1>Second</h1></body>", "Add a paragraph below the main heading saying More.", r#"{"result":"ambiguous"}"#, "multiple plausible insertion anchors"),
+            ("<body><h1>Only heading</h1></body>", "Add a paragraph below the intro paragraph saying More.", r#"{"result":"no_match"}"#, "no verified existing element"),
+        ] {
+            let root = grounding_fixture("candidate-insertion-safe-outcome");
+            std::fs::write(root.join("src/index.html"), html).unwrap();
+            let pending = PendingChanges::default();
+            let provider = StubProvider::new(&["test-model"], &[selection]);
+            let response = tauri::async_runtime::block_on(run_agent_with_provider(
+                &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: request.into() }],
+                Some(root.clone()), Some(&pending), None, None,
+            )).unwrap();
+            assert!(response.content.contains(message));
+            assert!(response.proposal.is_none());
+            assert!(pending.0.lock().unwrap().is_none());
+            assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 1, "selection failure must not generate content or use the legacy protocol");
+            assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), html);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn candidate_edit_ambiguity_and_no_match_create_no_proposal() {
         for (html, selection, message) in [
             ("<body><button>Save</button><button>Save</button></body>", r#"{"result":"ambiguous"}"#, "multiple plausible"),
@@ -1781,6 +1965,10 @@ mod tests {
         assert_eq!(candidate_text_edit_route("Change the signup link to point to /register", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::AttributeHref));
         assert_eq!(candidate_text_edit_route("Change the hero image alt text to Elma at her desk", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::AttributeAlt));
         assert_eq!(candidate_text_edit_route("Change the email input placeholder to you@example.com", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::AttributePlaceholder));
+        assert_eq!(candidate_text_edit_route("Add a paragraph below the main heading saying Built with AIIDE", RequestIntent::Edit), CandidateEditRoute::Insert { anchor: CandidateRole::HeadingOne, position: repository::CandidatePosition::After, element: repository::InsertedElement::Paragraph });
+        assert_eq!(candidate_text_edit_route("Add a small heading before the intro paragraph saying Join us", RequestIntent::Edit), CandidateEditRoute::Insert { anchor: CandidateRole::Paragraph, position: repository::CandidatePosition::Before, element: repository::InsertedElement::Heading });
+        assert_eq!(candidate_text_edit_route("Add a link after the intro paragraph saying View", RequestIntent::Edit), CandidateEditRoute::Insert { anchor: CandidateRole::Paragraph, position: repository::CandidatePosition::After, element: repository::InsertedElement::Link });
+        assert_eq!(candidate_text_edit_route("Add a small heading before the signup form saying Join us", RequestIntent::Edit), CandidateEditRoute::Insert { anchor: CandidateRole::Form, position: repository::CandidatePosition::Before, element: repository::InsertedElement::Heading });
         assert_eq!(candidate_text_edit_route("Change the main heading to Welcome but preserve the span", RequestIntent::Edit), CandidateEditRoute::Unsupported);
         assert_eq!(candidate_text_edit_route("Improve the signup form accessibility", RequestIntent::Edit), CandidateEditRoute::Legacy);
         let root = grounding_fixture("unsupported-heading-markup");
