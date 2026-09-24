@@ -166,24 +166,27 @@ struct ReplacementReply { replacement: String }
 struct InsertionReply { element_type: String, text: String, href: Option<String> }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum CandidateEditRoute {
-    Legacy,
-    Text(CandidateRole),
-    Insert { anchor: CandidateRole, position: repository::CandidatePosition, element: repository::InsertedElement },
-    Unsupported,
+enum SemanticEditRoute {
+    ReplaceCandidate { role: CandidateRole },
+    InsertRelative { anchor: CandidateRole, position: repository::CandidatePosition, element: repository::InsertedElement },
 }
 
-fn candidate_text_edit_route(prompt: &str, intent: RequestIntent) -> CandidateEditRoute {
-    if intent != RequestIntent::Edit { return CandidateEditRoute::Legacy; }
+/// Dispatch inventory: supported HTML primitives are Semantic; other exact-source edits remain Legacy;
+/// structural or unbounded requests are Unsupported until a safe ownership model exists.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EditDispatch { NotEdit, Semantic(SemanticEditRoute), Legacy, Unsupported }
+
+fn dispatch_edit_request(prompt: &str, intent: RequestIntent) -> EditDispatch {
+    if intent != RequestIntent::Edit { return EditDispatch::NotEdit; }
     let lower = prompt.trim().to_ascii_lowercase();
     let insertion_verbs = lower.split(|character: char| !character.is_ascii_alphanumeric()).filter(|word| !word.is_empty()).collect::<Vec<_>>();
     if insertion_verbs.iter().any(|word| matches!(*word, "add" | "insert" | "append" | "create")) {
         if insertion_verbs.iter().any(|word| matches!(*word, "append" | "create")) {
-            return CandidateEditRoute::Unsupported;
+            return EditDispatch::Unsupported;
         }
         let relations = [("after", repository::CandidatePosition::After), ("below", repository::CandidatePosition::After), ("beneath", repository::CandidatePosition::After), ("before", repository::CandidatePosition::Before), ("above", repository::CandidatePosition::Before)];
         let Some((position_at, relation, position)) = relations.iter().filter_map(|(relation, position)| lower.find(relation).map(|at| (at, *relation, *position))).min_by_key(|(at, _, _)| *at) else {
-            return CandidateEditRoute::Unsupported;
+            return EditDispatch::Unsupported;
         };
         let content_request = &lower[..position_at];
         let anchor_request = &lower[position_at + relation.len()..];
@@ -196,8 +199,8 @@ fn candidate_text_edit_route(prompt: &str, intent: RequestIntent) -> CandidateEd
             else if anchor_request.contains("form") { Some(CandidateRole::Form) }
             else { None };
         return match (anchor, element) {
-            (Some(anchor), Some(element)) => CandidateEditRoute::Insert { anchor, position, element },
-            _ => CandidateEditRoute::Unsupported,
+            (Some(anchor), Some(element)) => EditDispatch::Semantic(SemanticEditRoute::InsertRelative { anchor, position, element }),
+            _ => EditDispatch::Unsupported,
         };
     }
     let attribute_role = if lower.contains("aria-label") { Some(CandidateRole::AttributeAriaLabel) }
@@ -223,13 +226,14 @@ fn candidate_text_edit_route(prompt: &str, intent: RequestIntent) -> CandidateEd
         CandidateRole::Label
     } else if ["list item", "list-item", "bullet text"].iter().any(|target| lower.contains(target)) {
         CandidateRole::ListItem
-    } else { return CandidateEditRoute::Legacy; };
+    } else { return EditDispatch::Legacy; };
     let structural = ["preserve", "retain", "span", "markup", "<h1", "html", " tag", " class", "style", "color", "background", "font", "size", "alignment", "spacing", "format", "bold", "emphasis"]
         .iter().any(|term| lower.contains(term));
     let direct_replacement = ["change", "replace", "rename", "set", "update"].iter().any(|verb| lower.contains(verb))
         && (lower.contains(" to ") || lower.contains(" with "));
     let attribute_keyword_without_attribute_target = !role.is_attribute() && lower.contains("attribute");
-    if structural || attribute_keyword_without_attribute_target || !direct_replacement { CandidateEditRoute::Unsupported } else { CandidateEditRoute::Text(role) }
+    if structural || attribute_keyword_without_attribute_target || !direct_replacement { EditDispatch::Unsupported }
+    else { EditDispatch::Semantic(SemanticEditRoute::ReplaceCandidate { role }) }
 }
 
 fn requests_candidate_selection(prompt: &str, intent: RequestIntent) -> bool {
@@ -568,8 +572,7 @@ fn agent_schema(project_open: bool, edit_intent: bool, has_read_evidence: bool, 
         properties.insert("answer".into(), json!({"type":"string","description":"Required response text when action is answer. Do not ask for project content that repository tools can obtain."}));
     }
     if project_open && edit_intent && has_read_evidence {
-        properties.insert("summary".into(), json!({"type":"string","maxLength":160,"description":"For propose_change only: one short sentence describing the edit."}));
-        properties.insert("changes".into(), json!({"type":"array","minItems":1,"maxItems":4,"description":"Focused exact replacements for propose_change.","items":{"type":"object","properties":{"path":{"type":"string","description":"Exact project-relative path previously read."},"old_text":{"type":"string","description":"Exact text copied from the inspected file that matches exactly once. Include unchanged surrounding context when a smaller fragment repeats. Never include displayed line numbers."},"new_text":{"type":"string","description":"Replacement text for that unique old_text anchor."}},"required":["path","old_text","new_text"],"additionalProperties":false}}));
+        add_legacy_proposal_schema(&mut properties);
     }
     let required = if project_open && edit_intent && has_read_evidence {
         json!(["action", "summary", "changes"])
@@ -577,6 +580,27 @@ fn agent_schema(project_open: bool, edit_intent: bool, has_read_evidence: bool, 
         json!(["action"])
     };
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
+}
+
+/// Schema for the intentionally retained exact-text compatibility path.
+fn add_legacy_proposal_schema(properties: &mut serde_json::Map<String, Value>) {
+    properties.insert("summary".into(), json!({"type":"string","maxLength":160,"description":"For propose_change only: one short sentence describing the edit."}));
+    properties.insert("changes".into(), json!({"type":"array","minItems":1,"maxItems":4,"description":"Focused exact replacements for propose_change.","items":{"type":"object","properties":{"path":{"type":"string","description":"Exact project-relative path previously read."},"old_text":{"type":"string","description":"Exact text copied from the inspected file that matches exactly once. Include unchanged surrounding context when a smaller fragment repeats. Never include displayed line numbers."},"new_text":{"type":"string","description":"Replacement text for that unique old_text anchor."}},"required":["path","old_text","new_text"],"additionalProperties":false}}));
+}
+
+/// Legacy compatibility execution stays guarded by prior reads and repository validation.
+fn validate_and_stage_legacy_proposal(
+    root: &std::path::Path,
+    summary: String,
+    edits: Vec<ProposedReplacement>,
+    pending: Option<&PendingChanges>,
+    trace: Option<&Trace>,
+) -> Result<PendingProposal, String> {
+    debug_log(trace, "legacy_proposal", format!("propose_change selected\nPath: {}\nReplacements: {}\nValidation: started", edits.first().map(|edit| edit.path.as_str()).unwrap_or("none"), edits.len()));
+    let proposal = repository::validate_proposal(root, summary, edits)?;
+    if let Some(pending) = pending { *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone()); }
+    debug_log(trace, "legacy_proposal", "Validation: passed\nPending change creation: passed");
+    Ok(proposal)
 }
 
 fn scope_schema() -> Value {
@@ -909,8 +933,15 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
         return Ok(ChatResponse { model, content: if root.is_some() { "I can inspect this project and prepare focused changes for your review. Only the Apply button can write them." } else { "No project is open, so I cannot inspect or propose changes to files." }.into(), activity: vec![], proposal: None });
     }
     let plan = classify_current_request(&last_prompt);
+    let dispatch = dispatch_edit_request(&last_prompt, plan.intent);
+    match dispatch {
+        EditDispatch::Semantic(_) => debug_log(debug_trace, "edit_dispatch", "Edit dispatch: SEMANTIC"),
+        EditDispatch::Legacy => debug_log(debug_trace, "edit_dispatch", "Edit dispatch: LEGACY"),
+        EditDispatch::Unsupported => debug_log(debug_trace, "edit_dispatch", "Edit dispatch: UNSUPPORTED"),
+        EditDispatch::NotEdit => {}
+    }
     if unsupported_insertion_request(&last_prompt, plan.intent)
-        && !matches!(candidate_text_edit_route(&last_prompt, plan.intent), CandidateEditRoute::Insert { .. }) {
+        && !matches!(dispatch, EditDispatch::Semantic(SemanticEditRoute::InsertRelative { .. })) {
         return Ok(ChatResponse {
             model,
             content: "I can draft the paragraph, but the current editing workflow cannot insert new content into a file. Ask me to write a paragraph you could add, then add it manually. Existing supported heading replacements can still be prepared for review.".into(),
@@ -918,17 +949,23 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
             proposal: None,
         });
     }
-    match candidate_text_edit_route(&last_prompt, plan.intent) {
-        CandidateEditRoute::Insert { anchor, position, element } if root.is_some() => {
-            return run_candidate_insertion(provider, model, &last_prompt, anchor, position, element, root.as_deref().unwrap(), pending, app, debug_trace).await;
+    match dispatch {
+        EditDispatch::Semantic(SemanticEditRoute::InsertRelative { anchor, position, element }) => {
+            let Some(root) = root.as_deref() else {
+                return Ok(ChatResponse { model, content: "No project is open, so I cannot prepare this edit for review.".into(), activity: vec![], proposal: None });
+            };
+            return run_candidate_insertion(provider, model, &last_prompt, anchor, position, element, root, pending, app, debug_trace).await;
         }
-        CandidateEditRoute::Text(role) if root.is_some() => {
-            return run_candidate_text_edit(provider, model, &last_prompt, role, root.as_deref().unwrap(), pending, app, debug_trace).await;
+        EditDispatch::Semantic(SemanticEditRoute::ReplaceCandidate { role }) => {
+            let Some(root) = root.as_deref() else {
+                return Ok(ChatResponse { model, content: "No project is open, so I cannot prepare this edit for review.".into(), activity: vec![], proposal: None });
+            };
+            return run_candidate_text_edit(provider, model, &last_prompt, role, root, pending, app, debug_trace).await;
         }
-        CandidateEditRoute::Unsupported if root.is_some() => {
+        EditDispatch::Unsupported => {
             return Ok(ChatResponse { model, content: "This application-led editor supports verified text and attribute replacements, plus inserting a simple paragraph, heading, or link before or after an existing heading, paragraph, or form. It cannot preserve nested markup for structural edits or guess a target.".into(), activity: vec![], proposal: None });
         }
-        CandidateEditRoute::Legacy | CandidateEditRoute::Text(_) | CandidateEditRoute::Insert { .. } | CandidateEditRoute::Unsupported => {}
+        EditDispatch::Legacy | EditDispatch::NotEdit => {}
     }
     let selection_requested = requests_candidate_selection(&last_prompt, plan.intent);
     debug_log(debug_trace, "agent", format!("Current request plan: scope={:?}, intent={:?}", plan.scope, plan.intent));
@@ -975,9 +1012,8 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
                 continue;
             }
             if let Some(app) = app { let _ = app.emit("proposal-validation-start", ()); }
-            debug_log(debug_trace, "legacy_proposal", format!("propose_change selected\nPath: {}\nReplacements: {}\nValidation: started", edits.first().map(|edit| edit.path.as_str()).unwrap_or("none"), edits.len()));
             let shape = anchor_shape(&edits);
-            let proposal = match repository::validate_proposal(root, summary, edits) {
+            let proposal = match validate_and_stage_legacy_proposal(root, summary, edits, pending, debug_trace) {
                 Ok(proposal) => proposal,
                 Err(error) if error == repository::AMBIGUOUS_OLD_TEXT_ERROR && proposal_repairs < MAX_REPAIRS => {
                     proposal_repairs += 1;
@@ -989,10 +1025,6 @@ async fn run_agent_with_provider(provider: &impl ModelProvider, model: String, m
                 }
                 Err(error) => return Err(error),
             };
-            if let Some(pending) = pending {
-                *pending.0.lock().map_err(|_| "Pending change state unavailable")? = Some(proposal.clone());
-            }
-            debug_log(debug_trace, "legacy_proposal", "Validation: passed\nPending change creation: passed");
             return Ok(ChatResponse { model: result.model, content: "Done — have a wee look in Changes 👀".into(), activity, proposal: Some(proposal) });
         }
         if let AgentAction::Answer(answer) = action {
@@ -1164,6 +1196,7 @@ mod tests {
         formats: Mutex<Vec<Value>>,
         requests: Mutex<Vec<Vec<ChatMessage>>>,
         inference_calls: AtomicUsize,
+        mutate_after_inference: Mutex<Option<(std::path::PathBuf, String)>>,
     }
 
     impl StubProvider {
@@ -1180,7 +1213,12 @@ mod tests {
                 formats: Mutex::new(Vec::new()),
                 requests: Mutex::new(Vec::new()),
                 inference_calls: AtomicUsize::new(0),
+                mutate_after_inference: Mutex::new(None),
             }
+        }
+
+        fn mutate_after_next_inference(&self, path: std::path::PathBuf, contents: &str) {
+            *self.mutate_after_inference.lock().unwrap() = Some((path, contents.to_owned()));
         }
     }
 
@@ -1215,6 +1253,9 @@ mod tests {
                     _ => &views[0],
                 };
                 response.message.content = format!("{{\"result\":\"selected\",\"candidate_id\":\"{}\"}}", selected["id"].as_str().unwrap());
+            }
+            if let Some((path, contents)) = self.mutate_after_inference.lock().unwrap().take() {
+                std::fs::write(path, contents).unwrap();
             }
             Ok(response)
         }
@@ -1956,25 +1997,57 @@ mod tests {
         assert_eq!(error, "Candidate replacement response was malformed.");
         assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 2);
         std::fs::remove_dir_all(root).unwrap();
+
+        let root = grounding_fixture("stale-semantic-candidate");
+        let pending = PendingChanges::default();
+        let provider = StubProvider::new(&["test-model"], &["__SELECT_HEADING__", r#"{"action":"propose_change","summary":"must not run","changes":[{"path":"src/index.html","old_text":"<h1>Welcome</h1>","new_text":"Legacy fallback"}]}"#]);
+        provider.mutate_after_next_inference(root.join("src/index.html"), "<h1>Changed elsewhere</h1>");
+        let error = match tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Change the main heading to Changed".into() }],
+            Some(root.clone()), Some(&pending), None, None,
+        )) { Err(error) => error, Ok(_) => panic!("stale semantic candidates must fail without legacy fallback") };
+        assert!(error.contains("changed since discovery"));
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 1, "stale semantic candidates must not enter the legacy agent loop");
+        assert!(pending.0.lock().unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(root.join("src/index.html")).unwrap(), "<h1>Changed elsewhere</h1>");
+        std::fs::remove_dir_all(root).unwrap();
+
+        let root = grounding_fixture("unsafe-semantic-candidate");
+        std::fs::write(root.join("src/index.html"), "<a href=\"/old\">Signup</a>").unwrap();
+        let pending = PendingChanges::default();
+        let provider = StubProvider::new(&["test-model"], &["__SELECT_HREF__", r#"{"replacement":"javascript:alert(1)"}"#, r#"{"action":"propose_change","summary":"must not run","changes":[{"path":"src/index.html","old_text":"/old","new_text":"https://safe.example"}]}"#]);
+        let error = match tauri::async_runtime::block_on(run_agent_with_provider(
+            &provider, "test-model".into(), vec![ChatMessage { role: "user".into(), content: "Change the signup link to point to /register".into() }],
+            Some(root.clone()), Some(&pending), None, None,
+        )) { Err(error) => error, Ok(_) => panic!("semantic validation failure must not fall back to legacy") };
+        assert!(error.contains("unsafe scheme"));
+        assert_eq!(provider.inference_calls.load(Ordering::SeqCst), 2);
+        assert!(pending.0.lock().unwrap().is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn heading_capability_gate_rejects_markup_work_and_leaves_other_edits_on_legacy() {
-        assert_eq!(candidate_text_edit_route("Change the main page heading to Welcome", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::HeadingOne));
-        assert_eq!(candidate_text_edit_route("Change the page title to OrbitNote", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::DocumentTitle));
-        assert_eq!(candidate_text_edit_route("Replace the introductory paragraph with a clearer welcome", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::Paragraph));
-        assert_eq!(candidate_text_edit_route("Change the button text to Continue", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::Button));
-        assert_eq!(candidate_text_edit_route("Change the link text to Start", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::Link));
-        assert_eq!(candidate_text_edit_route("Rename the list item to Primary", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::ListItem));
-        assert_eq!(candidate_text_edit_route("Change the signup link to point to /register", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::AttributeHref));
-        assert_eq!(candidate_text_edit_route("Change the hero image alt text to Elma at her desk", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::AttributeAlt));
-        assert_eq!(candidate_text_edit_route("Change the email input placeholder to you@example.com", RequestIntent::Edit), CandidateEditRoute::Text(CandidateRole::AttributePlaceholder));
-        assert_eq!(candidate_text_edit_route("Add a paragraph below the main heading saying Built with AIIDE", RequestIntent::Edit), CandidateEditRoute::Insert { anchor: CandidateRole::HeadingOne, position: repository::CandidatePosition::After, element: repository::InsertedElement::Paragraph });
-        assert_eq!(candidate_text_edit_route("Add a small heading before the intro paragraph saying Join us", RequestIntent::Edit), CandidateEditRoute::Insert { anchor: CandidateRole::Paragraph, position: repository::CandidatePosition::Before, element: repository::InsertedElement::Heading });
-        assert_eq!(candidate_text_edit_route("Add a link after the intro paragraph saying View", RequestIntent::Edit), CandidateEditRoute::Insert { anchor: CandidateRole::Paragraph, position: repository::CandidatePosition::After, element: repository::InsertedElement::Link });
-        assert_eq!(candidate_text_edit_route("Add a small heading before the signup form saying Join us", RequestIntent::Edit), CandidateEditRoute::Insert { anchor: CandidateRole::Form, position: repository::CandidatePosition::Before, element: repository::InsertedElement::Heading });
-        assert_eq!(candidate_text_edit_route("Change the main heading to Welcome but preserve the span", RequestIntent::Edit), CandidateEditRoute::Unsupported);
-        assert_eq!(candidate_text_edit_route("Improve the signup form accessibility", RequestIntent::Edit), CandidateEditRoute::Legacy);
+        let semantic_text = |role| EditDispatch::Semantic(SemanticEditRoute::ReplaceCandidate { role });
+        assert_eq!(dispatch_edit_request("Change the main page heading to Welcome", RequestIntent::Edit), semantic_text(CandidateRole::HeadingOne));
+        assert_eq!(dispatch_edit_request("Change the page title to OrbitNote", RequestIntent::Edit), semantic_text(CandidateRole::DocumentTitle));
+        assert_eq!(dispatch_edit_request("Replace the introductory paragraph with a clearer welcome", RequestIntent::Edit), semantic_text(CandidateRole::Paragraph));
+        assert_eq!(dispatch_edit_request("Change the button text to Continue", RequestIntent::Edit), semantic_text(CandidateRole::Button));
+        assert_eq!(dispatch_edit_request("Change the link text to Start", RequestIntent::Edit), semantic_text(CandidateRole::Link));
+        assert_eq!(dispatch_edit_request("Rename the list item to Primary", RequestIntent::Edit), semantic_text(CandidateRole::ListItem));
+        assert_eq!(dispatch_edit_request("Change the signup link to point to /register", RequestIntent::Edit), semantic_text(CandidateRole::AttributeHref));
+        assert_eq!(dispatch_edit_request("Change the hero image alt text to Elma at her desk", RequestIntent::Edit), semantic_text(CandidateRole::AttributeAlt));
+        assert_eq!(dispatch_edit_request("Change the email input placeholder to you@example.com", RequestIntent::Edit), semantic_text(CandidateRole::AttributePlaceholder));
+        assert_eq!(dispatch_edit_request("Add a paragraph below the main heading saying Built with AIIDE", RequestIntent::Edit), EditDispatch::Semantic(SemanticEditRoute::InsertRelative { anchor: CandidateRole::HeadingOne, position: repository::CandidatePosition::After, element: repository::InsertedElement::Paragraph }));
+        assert_eq!(dispatch_edit_request("Add a small heading before the intro paragraph saying Join us", RequestIntent::Edit), EditDispatch::Semantic(SemanticEditRoute::InsertRelative { anchor: CandidateRole::Paragraph, position: repository::CandidatePosition::Before, element: repository::InsertedElement::Heading }));
+        assert_eq!(dispatch_edit_request("Add a link after the intro paragraph saying View", RequestIntent::Edit), EditDispatch::Semantic(SemanticEditRoute::InsertRelative { anchor: CandidateRole::Paragraph, position: repository::CandidatePosition::After, element: repository::InsertedElement::Link }));
+        assert_eq!(dispatch_edit_request("Add a small heading before the signup form saying Join us", RequestIntent::Edit), EditDispatch::Semantic(SemanticEditRoute::InsertRelative { anchor: CandidateRole::Form, position: repository::CandidatePosition::Before, element: repository::InsertedElement::Heading }));
+        assert_eq!(dispatch_edit_request("Change the main heading to Welcome but preserve the span", RequestIntent::Edit), EditDispatch::Unsupported);
+        assert_eq!(dispatch_edit_request("Improve the signup form accessibility", RequestIntent::Edit), EditDispatch::Legacy);
+        assert_eq!(dispatch_edit_request("In src/site.css, change the body color to black", RequestIntent::Edit), EditDispatch::Legacy);
+        assert_eq!(dispatch_edit_request("In src/app.ts, rename the function to start", RequestIntent::Edit), EditDispatch::Legacy);
+        assert_eq!(dispatch_edit_request("Add a paragraph to src/index.html", RequestIntent::Edit), EditDispatch::Unsupported);
+        assert_eq!(dispatch_edit_request("Change the main heading to Welcome", RequestIntent::Answer), EditDispatch::NotEdit);
         let root = grounding_fixture("unsupported-heading-markup");
         let provider = StubProvider::new(&["test-model"], &[]);
         let response = tauri::async_runtime::block_on(run_agent_with_provider(
